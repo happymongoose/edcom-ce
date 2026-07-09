@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "proxy": {
-    "/l": {
+    "/@(l)": {
       "target": "http://api:8000"
     },
     "/api": {

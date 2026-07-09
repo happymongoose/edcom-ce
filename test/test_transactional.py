@@ -1,0 +1,88 @@
+import os
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from api.transactional import Log, add_test_txn_log
+
+
+class FakeDB:
+    def __init__(self):
+        self.executed = []
+        self.cid = "cid-123"
+
+    def get_cid(self):
+        return self.cid
+
+    def execute(self, query, *args):
+        self.executed.append((query, args))
+        return []
+
+    def single(self, query, *args):
+        self.executed.append((query, args))
+        return 0
+
+
+class FakeReq:
+    def __init__(self, params, db):
+        self._params = params
+        self.context = {"db": db}
+
+    def get_param(self, name, default=None):
+        return self._params.get(name, default)
+
+
+class FakeResp:
+    pass
+
+
+def test_add_test_txn_log_inserts_expected_transactional_entry():
+    db = FakeDB()
+
+    add_test_txn_log(
+        db,
+        "cid-123",
+        "test@example.com",
+        "Hello there",
+        "mytag",
+        "Sender",
+        "sender@example.com",
+        "Recipient",
+        "route-1",
+        "msg-1",
+    )
+
+    assert len(db.executed) == 1
+    query, args = db.executed[0]
+
+    assert "insert into txnsends" in query
+    assert args[0] is not None
+    assert args[1] == "cid-123"
+    assert args[2] is not None
+    assert args[3] == "msg-1"
+    assert args[4]["event"] == "Injection"
+    assert args[4]["status"] == "Accepted"
+    assert args[4]["to"] == "test@example.com"
+    assert args[4]["subject"] == "Hello there"
+    assert args[4]["tag"] == "mytag"
+    assert args[4]["fromname"] == "Sender"
+    assert args[4]["fromemail"] == "sender@example.com"
+    assert args[4]["toname"] == "Recipient"
+    assert args[4]["route"] == "route-1"
+
+
+def test_log_filters_by_datetime_range():
+    db = FakeDB()
+    handler = Log()
+    req = FakeReq({"start": "2026-07-08T10:00", "end": "2026-07-08T11:00"}, db)
+    resp = FakeResp()
+
+    handler.on_get(req, resp)
+
+    assert len(db.executed) == 2
+    query, args = db.executed[0]
+    assert "where cid = %s" in query
+    assert "and ts >= %s" in query
+    assert "and ts <= %s" in query
+    assert args[0] == db.cid
+    assert args[1].year == 2026
+    assert args[2].year == 2026

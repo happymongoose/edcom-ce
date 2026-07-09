@@ -9,7 +9,7 @@ import traceback
 import csv
 import zipfile
 from datetime import datetime, timedelta
-from dateutil.tz import tzutc
+from dateutil.tz import tzutc, tzlocal
 from email.utils import formataddr, parseaddr
 from jinja2 import Template
 
@@ -34,6 +34,7 @@ from .shared.db import json_iter, open_db, JsonObj
 from .shared.tasks import tasks, LOW_PRIORITY, HIGH_PRIORITY
 from .shared.s3 import s3_write, s3_read, s3_write_stream, s3_delete
 from .shared.log import get_logger
+from .transactional_search import log_matches_search
 
 log = get_logger()
 
@@ -45,30 +46,99 @@ class Log(object):
     def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)
 
-        page = int(req.get_param("page", default=1))
+        page = max(int(req.get_param("page", default=1)), 1)
+        search = req.get_param("search", default="").strip()
+        start = req.get_param("start", default="").strip()
+        end = req.get_param("end", default="").strip()
 
         PAGE_SIZE = 10
 
         db = req.context["db"]
 
-        ret = []
-        for id, ts, data in db.execute(
+        start_dt = None
+        end_dt = None
+        def parse_datetime(value: str, label: str):
+            if not value:
+                return None
+            try:
+                dt = dateutil.parser.parse(value)
+            except Exception:
+                raise falcon.HTTPBadRequest(
+                    title="Invalid parameter",
+                    description=f"The {label} date/time is invalid.",
+                )
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=tzlocal())
+            return dt.astimezone(tzutc()).replace(tzinfo=None)
+
+        if start:
+            start_dt = parse_datetime(start, "start")
+        if end:
+            end_dt = parse_datetime(end, "end")
+        if start_dt is not None and end_dt is not None and start_dt > end_dt:
+            raise falcon.HTTPBadRequest(
+                title="Invalid parameter",
+                description="The start date/time must be before the end date/time.",
+            )
+
+        query = """
+            select id, ts, data from txnsends
+            where cid = %s
+        """
+        params = [db.get_cid()]
+
+        if search:
+            search_term = "%" + search.lower() + "%"
+            query += """
+                and (
+                    lower(coalesce(data->>'to', '')) like %s or
+                    lower(coalesce(data->>'fromemail', '')) like %s or
+                    lower(coalesce(data->>'subject', '')) like %s
+                )
             """
-                select id, ts, data from txnsends
-                where cid = %s
-                order by ts desc
-                limit %s
-                offset %s
-        """,
-            db.get_cid(),
-            PAGE_SIZE,
-            PAGE_SIZE * (page - 1),
-        ):
+            params.extend([search_term, search_term, search_term])
+        if start_dt is not None:
+            query += " and ts >= %s"
+            params.append(start_dt)
+        if end_dt is not None:
+            query += " and ts <= %s"
+            params.append(end_dt)
+
+        query += """
+            order by ts desc
+            limit %s
+            offset %s
+        """
+        params.extend([PAGE_SIZE, PAGE_SIZE * (page - 1)])
+
+        ret = []
+        for id, ts, data in db.execute(query, *params):
+            if search and not log_matches_search(data, search):
+                continue
             data["ts"] = ts.isoformat() + "Z"
             data["id"] = id
             ret.append(data)
 
-        total = db.single("select count(id) from txnsends where cid = %s", db.get_cid())
+        count_query = "select count(id) from txnsends where cid = %s"
+        count_params = [db.get_cid()]
+        if search:
+            count_query += """
+                and (
+                    lower(coalesce(data->>'to', '')) like %s or
+                    lower(coalesce(data->>'fromemail', '')) like %s or
+                    lower(coalesce(data->>'subject', '')) like %s
+                )
+            """
+            count_params.extend([search_term, search_term, search_term])
+        if start_dt is not None:
+            count_query += " and ts >= %s"
+            count_params.append(start_dt)
+        if end_dt is not None:
+            count_query += " and ts <= %s"
+            count_params.append(end_dt)
+
+        total = db.single(count_query, *count_params)
 
         req.context["result"] = {
             "records": ret,
@@ -910,6 +980,38 @@ def replace_vars(html: str, variables: JsonObj) -> str:
     return html
 
 
+def add_test_txn_log(
+    db,
+    cid: str,
+    to: str,
+    subject: str,
+    tag: str,
+    fromname: str,
+    fromemail: str,
+    toname: str | None,
+    route: str | None,
+    msgid: str | None,
+) -> None:
+    db.execute(
+        "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+        shortuuid.uuid(),
+        cid,
+        datetime.utcnow(),
+        msgid,
+        {
+            "event": "Injection",
+            "status": "Accepted",
+            "subject": subject,
+            "tag": tag or "untagged",
+            "fromname": fromname,
+            "fromemail": fromemail,
+            "toname": toname,
+            "to": to,
+            "route": route,
+        },
+    )
+
+
 class TxnTemplateTest(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
@@ -1022,6 +1124,23 @@ class TxnTemplateTest(object):
 
             if t.get("type") != "raw":
                 html = replace_vars(html, jsonvars)
+
+        if doc.get("include_in_log", False):
+            try:
+                add_test_txn_log(
+                    db,
+                    t["cid"],
+                    remove_newlines(doc["to"]),
+                    subject,
+                    t.get("tag") or "untagged",
+                    remove_newlines(t.get("fromname", "")),
+                    remove_newlines(fromemail),
+                    None,
+                    doc.get("route"),
+                    None,
+                )
+            except Exception:
+                log.exception("error logging transactional test send")
 
         try:
             send_backend_mail(

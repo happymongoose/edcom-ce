@@ -77,13 +77,14 @@ class TransactionalTemplate extends Component {
     axios.patch('/api/testemails', emails);
   }
 
-  sendTest = async (to, route, json) => {
+  sendTest = async (to, route, json, includeInLog) => {
     await this.save();
 
     await axios.post('/api/transactional/templates/' + this.props.id + '/test', {
       to: to,
       route: route,
       json: json,
+      include_in_log: includeInLog,
     });
 
     await this.props.reloadUser();
@@ -207,6 +208,7 @@ class TransactionalTemplate extends Component {
                   disabled={this.props.isSaving}
                   onUpdate={this.updateEmails}
                   useJson={true}
+                  showIncludeInLogCheckbox={true}
                 />
               </Col>
             </Row>

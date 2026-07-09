@@ -27,3 +27,31 @@ section#table-sec.white-table-section {
 .table.log-table>thead>tr>th {
   border-bottom: 1px solid #444;
 }
+
+.log-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  margin-bottom: 16px;
+  width: 100%;
+}
+
+.log-search-field {
+  flex: 1 1 320px;
+  min-width: 240px;
+}
+
+.log-date-field {
+  flex: 0 1 220px;
+  min-width: 200px;
+}
+
+.log-toolbar .control-label {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.log-clear-button {
+  flex: 0 0 auto;
+}

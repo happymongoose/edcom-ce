@@ -76,7 +76,7 @@ services:
     volumes:
       - "./data/smtpcert:/cert"
     ports:
-      - "${PLATFORM_IP}:587:587"
+      - "${PLATFORM_IP}:1587:587"
       - "${PLATFORM_IP}:2525:2525"
       - "${PLATFORM_IP}:8025:8025"
   screenshot:
@@ -90,8 +90,8 @@ services:
     container_name: edcom-proxy
     restart: unless-stopped
     ports:
-      - "${PLATFORM_IP}:80:80"
-      - "${PLATFORM_IP}:443:443"
+      - "${PLATFORM_IP}:8081:80"
+      - "${PLATFORM_IP}:8443:443"     
     depends_on:
       - api
     volumes:
