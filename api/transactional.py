@@ -29,6 +29,7 @@ from .shared.send import (
     check_send_limit,
     check_test_limit,
     load_domain_throttles,
+    validate_sender_domains,
 )
 from .shared.db import json_iter, open_db, JsonObj
 from .shared.tasks import tasks, LOW_PRIORITY, HIGH_PRIORITY
@@ -212,6 +213,9 @@ def export_transactional_log(cid: str, exportid: str, path: str) -> None:
                 cid,
             ):
                 formatted_ts = ts.isoformat() + "Z"
+                status = data.get("status", "")
+                if data.get("event") == "Injection" and status == "Accepted":
+                    status = "Queued"
                 writer.writerow(
                     {
                         "Event": data.get("event") or "Delivery",
@@ -222,7 +226,7 @@ def export_transactional_log(cid: str, exportid: str, path: str) -> None:
                         "Subject": data.get("subject", ""),
                         "Tag": data.get("tag") or "untagged",
                         "Date": formatted_ts,
-                        "Status": data.get("status", ""),
+                        "Status": status,
                         "Error": data.get("error", ""),
                         "Opened": "true" if data.get("open") else "",
                         "Clicked": "true" if data.get("click") else "",
@@ -570,6 +574,10 @@ class Send(object):
                 title="Missing parameter", description="No subject specified."
             )
 
+        validate_sender_domains(
+            db, db.get_cid(), doc.get("fromemail"), doc.get("returnpath")
+        )
+
         txnsettings = db.txnsettings.get_singleton()
 
         mycid = db.get_cid()
@@ -679,7 +687,7 @@ class Send(object):
             txnmsgid,
             {
                 "event": "Injection",
-                "status": "Accepted",
+                "status": "Queued",
                 "subject": doc["subject"],
                 "tag": tag,
                 "fromname": doc.get("fromname", ""),
@@ -763,16 +771,44 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
 
             email = addr.strip().lower()
             d = email.split("@")[1]
+            subject = remove_newlines(data["subject"])
+            if variables is not None:
+                subject = replace_vars(subject, variables)
+
+            def log_suppressed(reason: str) -> None:
+                db.execute(
+                    "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+                    shortuuid.uuid(),
+                    mycid,
+                    datetime.utcnow(),
+                    txnmsgid,
+                    {
+                        "event": "Error",
+                        "status": "Suppressed",
+                        "error": reason,
+                        "subject": subject,
+                        "tag": tag,
+                        "fromname": data.get("fromname", ""),
+                        "fromemail": data.get("fromemail", "")
+                        or data.get("returnpath", ""),
+                        "toname": data.get("toname"),
+                        "to": addr,
+                    },
+                )
+
             if db.single(
                 "select email from unsublogs where cid = %s and email = %s and (unsubscribed or complained or bounced)",
                 mycid,
                 email,
             ):
+                reason = "Suppressed because this recipient is unsubscribed, complained, or bounced"
                 log.info(
-                    "Suppressing transactional message to %s for %s due to unsub",
+                    "Suppressing transactional message to %s for %s: %s",
                     email,
                     mycid,
+                    reason,
                 )
+                log_suppressed(reason)
                 return
             if db.single(
                 "select item from exclusions where cid = %s and item in (%s, %s)",
@@ -780,11 +816,14 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 email,
                 d,
             ):
+                reason = "Suppressed because this recipient or domain is excluded"
                 log.info(
-                    "Suppressing transactional message to %s for %s due to exclusion",
+                    "Suppressing transactional message to %s for %s: %s",
                     email,
                     mycid,
+                    reason,
                 )
+                log_suppressed(reason)
                 return
 
             fromname = remove_newlines(data["fromname"])
@@ -794,6 +833,8 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 fromname = replace_vars(fromname, variables)
                 fromemail = replace_vars(fromemail, variables)
                 returnpath = replace_vars(returnpath, variables)
+
+            validate_sender_domains(db, mycid, fromemail, returnpath)
 
             fromdomain = ""
             if "@" in returnpath:
@@ -816,10 +857,7 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
             else:
                 replyto = remove_newlines(data["fromemail"] or data["returnpath"])
 
-            subject = remove_newlines(data["subject"])
-
             if variables is not None:
-                subject = replace_vars(subject, variables)
                 replyto = replace_vars(replyto, variables)
 
                 if bodytemplate.get("type") != "raw":
@@ -844,6 +882,12 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 campid=campid,
                 toname=data["toname"],
                 raise_err=True,
+            )
+            log.info(
+                "Transactional message %s for customer %s processed by backend; delivered=%s",
+                campid,
+                mycid,
+                delivered,
             )
 
             if delivered:
@@ -991,24 +1035,31 @@ def add_test_txn_log(
     toname: str | None,
     route: str | None,
     msgid: str | None,
+    event: str = "Injection",
+    status: str = "Queued",
+    error: str | None = None,
 ) -> None:
+    data = {
+        "event": event,
+        "status": status,
+        "subject": subject,
+        "tag": tag or "untagged",
+        "fromname": fromname,
+        "fromemail": fromemail,
+        "toname": toname,
+        "to": to,
+        "route": route,
+    }
+    if error:
+        data["error"] = error
+
     db.execute(
         "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
         shortuuid.uuid(),
         cid,
         datetime.utcnow(),
         msgid,
-        {
-            "event": "Injection",
-            "status": "Accepted",
-            "subject": subject,
-            "tag": tag or "untagged",
-            "fromname": fromname,
-            "fromemail": fromemail,
-            "toname": toname,
-            "to": to,
-            "route": route,
-        },
+        data,
     )
 
 
@@ -1104,12 +1155,6 @@ class TxnTemplateTest(object):
         if not returnpath:
             returnpath = fromemail
 
-        if "@" in returnpath:
-            fromdomain = returnpath.split("@")[-1].strip().lower()
-        elif "@" in fromemail:
-            fromdomain = fromemail.split("@")[-1].strip().lower()
-        frm = formataddr((remove_newlines(t["fromname"]), remove_newlines(fromemail)))
-
         if t.get("replyto", ""):
             replyto = remove_newlines(t["replyto"])
         else:
@@ -1119,28 +1164,20 @@ class TxnTemplateTest(object):
 
         if jsonvars:
             subject = replace_vars(subject, jsonvars)
-            frm = replace_vars(frm, jsonvars)
+            fromemail = replace_vars(fromemail, jsonvars)
             replyto = replace_vars(replyto, jsonvars)
+            returnpath = replace_vars(returnpath, jsonvars)
 
             if t.get("type") != "raw":
                 html = replace_vars(html, jsonvars)
 
-        if doc.get("include_in_log", False):
-            try:
-                add_test_txn_log(
-                    db,
-                    t["cid"],
-                    remove_newlines(doc["to"]),
-                    subject,
-                    t.get("tag") or "untagged",
-                    remove_newlines(t.get("fromname", "")),
-                    remove_newlines(fromemail),
-                    None,
-                    doc.get("route"),
-                    None,
-                )
-            except Exception:
-                log.exception("error logging transactional test send")
+        validate_sender_domains(db, t["cid"], fromemail, returnpath)
+
+        if "@" in returnpath:
+            fromdomain = returnpath.split("@")[-1].strip().lower()
+        elif "@" in fromemail:
+            fromdomain = fromemail.split("@")[-1].strip().lower()
+        frm = formataddr((remove_newlines(t["fromname"]), remove_newlines(fromemail)))
 
         try:
             send_backend_mail(
@@ -1158,9 +1195,46 @@ class TxnTemplateTest(object):
             )
         except Exception as e:
             traceback.print_exc()
+            if doc.get("include_in_log", False):
+                try:
+                    add_test_txn_log(
+                        db,
+                        t["cid"],
+                        remove_newlines(doc["to"]),
+                        subject,
+                        t.get("tag") or "untagged",
+                        remove_newlines(t.get("fromname", "")),
+                        remove_newlines(fromemail),
+                        None,
+                        doc.get("route"),
+                        None,
+                        event="Error",
+                        status="Error",
+                        error=str(e),
+                    )
+                except Exception:
+                    log.exception("error logging transactional test send failure")
             raise falcon.HTTPBadRequest(
                 title="Error sending test", description="Error sending test: %s" % e
             )
+
+        if doc.get("include_in_log", False):
+            try:
+                add_test_txn_log(
+                    db,
+                    t["cid"],
+                    remove_newlines(doc["to"]),
+                    subject,
+                    t.get("tag") or "untagged",
+                    remove_newlines(t.get("fromname", "")),
+                    remove_newlines(fromemail),
+                    None,
+                    doc.get("route"),
+                    None,
+                    status="Sent",
+                )
+            except Exception:
+                log.exception("error logging transactional test send")
 
 
 class RecentTags(object):

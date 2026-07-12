@@ -86,6 +86,40 @@ def client_domain(db: DB, fromdomain: str, cid: str, objid: str) -> str | None:
     )
 
 
+def sender_domain(value: str | None) -> str:
+    if not value:
+        return ""
+
+    _, addr = parseaddr(value)
+    if not addr:
+        addr = value
+
+    if "@" not in addr:
+        return ""
+
+    return addr.rsplit("@", 1)[1].strip().lower()
+
+
+def validate_sender_domains(db: DB, cid: str, *addresses: str | None) -> None:
+    domains = {sender_domain(address) for address in addresses}
+    domains.discard("")
+
+    for domain in domains:
+        verified = db.single(
+            """select true from clientdkim
+               where cid = %s and data->>'name' = %s
+               and coalesce((data->>'verified')::boolean, false)
+               limit 1""",
+            cid,
+            domain,
+        )
+        if not verified:
+            raise falcon.HTTPBadRequest(
+                title="Sender domain is not verified",
+                description="Add and verify this domain in Custom Domains before sending email from it.",
+            )
+
+
 def send_rate(company: JsonObj) -> Tuple[int, bytes | None]:
     rdb = redis_connect()
 
@@ -869,6 +903,10 @@ def send_backend_mail(
     )
 
     if demo:
+        log.info(
+            "Skipping backend send for customer %s because parent company is in demo mode",
+            usercid,
+        )
         return True
 
     domaingroups = {}
@@ -987,6 +1025,12 @@ def send_backend_mail(
         )
         return True
     elif settingsid == "smtprelay":
+        log.info(
+            "Sending message %s for customer %s through SMTP relay backend %s",
+            campid,
+            usercid,
+            obj["id"],
+        )
         smtprelay_send(
             obj,
             fromaddr,
@@ -1003,6 +1047,13 @@ def send_backend_mail(
         return True
     else:
         url = fix_sink_url(obj["url"])
+        log.info(
+            "Sending message %s for customer %s to local MTA sink %s at %s",
+            campid,
+            usercid,
+            obj["id"],
+            url,
+        )
 
         if obj.get("failed_update", False):
             mtasettings, pauses, warmups, dkim, allips, allsinks = get_settings(db, obj)
@@ -1088,6 +1139,13 @@ def send_backend_mail(
                 timeout=MTA_TIMEOUT,
             )
         r.raise_for_status()
+        log.info(
+            "Local MTA sink %s accepted message %s for customer %s with HTTP %s",
+            obj["id"],
+            campid,
+            usercid,
+            r.status_code,
+        )
 
         return False
 
@@ -1775,6 +1833,13 @@ def do_smtprelay_send(
                 if state["conn"] is not None:
                     return
 
+                log.info(
+                    "Opening SMTP relay connection to %s:%s for backend %s",
+                    smtp["hostname"].strip(),
+                    smtp["port"],
+                    smtp["id"],
+                )
+
                 cls: Type[smtplib.SMTP] | Type[smtplib.SMTP_SSL]
                 if smtp["ssltype"] == "ssl":
                     cls = smtplib.SMTP_SSL
@@ -1796,6 +1861,12 @@ def do_smtprelay_send(
 
                 state["conn"] = newconn
                 state["conn_sent"] = 0
+                log.info(
+                    "SMTP relay connection established to %s:%s for backend %s",
+                    smtp["hostname"].strip(),
+                    smtp["port"],
+                    smtp["id"],
+                )
 
             def do_send() -> None:
                 for info in tolist:
@@ -1840,11 +1911,22 @@ List-Unsubscribe-Post: List-Unsubscribe=One-Click{headers}
                         state["conn"].sendmail(
                             fromaddr, info["address"], msg.getvalue()
                         )
+                        log.info(
+                            "SMTP relay backend %s accepted message %s for %s",
+                            smtp["id"],
+                            campid,
+                            info["address"],
+                        )
 
                         state["conn_sent"] += 1
                         send += 1
                     except Exception as e:
-                        log.error("SMTP Relay Error: %s", e)
+                        log.exception(
+                            "SMTP relay backend %s failed message %s for %s",
+                            smtp["id"],
+                            campid,
+                            info["address"],
+                        )
                         if campid == "test":
                             add_test_log(db, campcid, info["address"], str(e))
                             raise

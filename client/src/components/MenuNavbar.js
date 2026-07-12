@@ -404,6 +404,10 @@ export default class MenuNavbar extends Component {
                           <FrontendDropdownMenuAPISMTPIcon className="dropdown-icon"/>
                           API &amp; SMTP
                         </RouteNavItem>
+                        <RouteNavItem href="/customdomains">
+                          <FrontendDropdownMenuAPISMTPIcon className="dropdown-icon"/>
+                          Custom Domains
+                        </RouteNavItem>
                         <RouteNavItem href="/webhooks">
                           <FrontendDropdownMenuWebhooksIcon className="dropdown-icon"/>
                           Webhooks

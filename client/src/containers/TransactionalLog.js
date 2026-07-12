@@ -104,6 +104,12 @@ export default class TransactionalLog extends Component {
     }
   }
 
+  displayStatus = l => {
+    if (l.error) return l.error;
+    if (l.event === 'Injection' && l.status === 'Accepted') return 'Queued';
+    return l.status || 'OK';
+  }
+
   exportClicked = async () => {
     await axios.post('/api/transactional/log/export');
 
@@ -207,7 +213,7 @@ export default class TransactionalLog extends Component {
                             {moment(l.ts).format('l LTS')}
                           </td>
                           <td>
-                            {l.error || l.status || 'OK'}
+                            {this.displayStatus(l)}
                           </td>
                           <td className="text-center">
                             {l.open ? <i className="fa fa-check-square-o" /> : ''}

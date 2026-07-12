@@ -3,6 +3,9 @@ import re
 import dateutil.parser
 import requests
 import shortuuid
+import random
+import socket
+import struct
 from typing import Dict, List
 from netaddr import IPAddress, IPNetwork, IPRange, IPSet
 from dateutil.tz import tzutc
@@ -30,6 +33,144 @@ from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.log import get_logger
 
 log = get_logger()
+
+
+def _dns_nameservers() -> List[str]:
+    nameservers = []
+    try:
+        with open("/etc/resolv.conf") as fp:
+            for line in fp:
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    nameservers.append(parts[1])
+    except Exception:
+        log.exception("error reading resolv.conf")
+
+    return nameservers or ["1.1.1.1", "8.8.8.8"]
+
+
+def _dns_encode_name(name: str) -> bytes:
+    return b"".join(
+        bytes([len(part)]) + part.encode("ascii")
+        for part in name.rstrip(".").split(".")
+        if part
+    ) + b"\x00"
+
+
+def _dns_read_name(data: bytes, offset: int) -> tuple[str, int]:
+    labels = []
+    jumped = False
+    end = offset
+
+    while True:
+        length = data[offset]
+        if length & 0xC0 == 0xC0:
+            pointer = ((length & 0x3F) << 8) | data[offset + 1]
+            if not jumped:
+                end = offset + 2
+            offset = pointer
+            jumped = True
+            continue
+        if length == 0:
+            if not jumped:
+                end = offset + 1
+            break
+        offset += 1
+        labels.append(data[offset : offset + length].decode("ascii"))
+        offset += length
+
+    return ".".join(labels).lower(), end
+
+
+def _dns_query(name: str, qtype: int) -> List[str]:
+    query_id = random.randint(0, 65535)
+    question = _dns_encode_name(name) + struct.pack("!HH", qtype, 1)
+    packet = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + question
+
+    for nameserver in _dns_nameservers():
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(4)
+                sock.sendto(packet, (nameserver, 53))
+                data, _ = sock.recvfrom(4096)
+
+            (
+                response_id,
+                flags,
+                qdcount,
+                ancount,
+                _nscount,
+                _arcount,
+            ) = struct.unpack("!HHHHHH", data[:12])
+            if response_id != query_id or flags & 0x000F:
+                continue
+
+            offset = 12
+            for _ in range(qdcount):
+                _, offset = _dns_read_name(data, offset)
+                offset += 4
+
+            results = []
+            for _ in range(ancount):
+                _, offset = _dns_read_name(data, offset)
+                rtype, _rclass, _ttl, rdlength = struct.unpack(
+                    "!HHIH", data[offset : offset + 10]
+                )
+                offset += 10
+                rdata = data[offset : offset + rdlength]
+                offset += rdlength
+
+                if rtype != qtype:
+                    continue
+                if qtype == 16:
+                    txt_offset = 0
+                    chunks = []
+                    while txt_offset < len(rdata):
+                        chunk_len = rdata[txt_offset]
+                        txt_offset += 1
+                        chunks.append(rdata[txt_offset : txt_offset + chunk_len])
+                        txt_offset += chunk_len
+                    results.append(b"".join(chunks).decode("utf-8", "replace"))
+                elif qtype == 15:
+                    preference = struct.unpack("!H", rdata[:2])[0]
+                    exchange, _ = _dns_read_name(data, offset - rdlength + 2)
+                    results.append("%s %s" % (preference, exchange.rstrip(".")))
+
+            if results:
+                return results
+        except Exception:
+            log.exception("error querying DNS for %s", name)
+
+    return []
+
+
+def _dns_record_verified(entry: JsonObj) -> bool:
+    record_type = entry["type"].upper()
+    expected_name = entry["name"].strip().lower().rstrip(".")
+    expected_value = entry["value"].strip()
+
+    if record_type == "TXT":
+        values = _dns_query(expected_name, 16)
+        return expected_value in values
+    if record_type == "MX":
+        values = [value.lower().rstrip(".") for value in _dns_query(expected_name, 15)]
+        return expected_value.lower().rstrip(".") in values
+
+    return True
+
+
+def verify_client_dkim_dns(ret: JsonObj) -> None:
+    missing = []
+    for key in ("mgentry", "serverentry", "spfentry", "mx1entry", "mx2entry"):
+        entry = ret.get(key)
+        if entry is not None and not _dns_record_verified(entry):
+            missing.append("%s %s" % (entry["type"], entry["name"]))
+
+    if missing:
+        raise falcon.HTTPBadRequest(
+            title="Unable to verify domain",
+            description="Could not find required DNS records: %s" % ", ".join(missing),
+        )
 
 
 @tasks.task(priority=HIGH_PRIORITY)
@@ -1764,6 +1905,9 @@ class ClientDKIMVerify(object):
                     description="Error verifying domain: %s" % e,
                 )
 
+        if not demo:
+            verify_client_dkim_dns(ret)
+
         db.set_cid(mycid)
 
         db.clientdkim.patch(id, {"verified": True})
@@ -1931,7 +2075,8 @@ class ClientDKIMEntries(object):
                 "value": "10 mx2.%s" % mgtarget["domain"],
             }
 
-        if db.single("select count(id) from sinks where cid = %s", db.get_cid()):
+        has_local_mta = db.single("select count(id) from sinks where cid = %s", db.get_cid())
+        if has_local_mta or mgtarget is None:
             key = RSA.generate(1024)
             public = "v=DKIM1; p=%s" % "".join(
                 key.publickey().exportKey().decode("ascii").split("\n")[1:-1]
@@ -1939,13 +2084,13 @@ class ClientDKIMEntries(object):
             private = key.exportKey().decode("ascii")
 
             mgselector = None
-            selector = ""
             if ret["mgentry"]:
                 mgselector = ret["mgentry"]["name"].split(".")[0]
-            while True:
-                selector += "a"
-                if selector != mgselector:
-                    break
+            selector = "edcom"
+            i = 2
+            while selector == mgselector:
+                selector = "edcom%s" % i
+                i += 1
 
             ret["serverentry"] = {
                 "name": "%s._domainkey.%s" % (selector, name),
@@ -1954,11 +2099,6 @@ class ClientDKIMEntries(object):
                 "private": private,
                 "selector": selector,
             }
-        elif mgtarget is None:
-            raise falcon.HTTPBadRequest(
-                title="Cannot add domains",
-                description="This system is not configured to allow custom domains",
-            )
 
         db.set_cid(mycid)
 

@@ -439,6 +439,17 @@ def erase(db: DB, cid: str, emails: List[str], unsublog: bool = False) -> None:
             )
 
 
+def clear_unsublogs(db: DB, cid: str, emails: List[str]) -> None:
+    if not emails:
+        return
+
+    db.execute(
+        "delete from unsublogs where cid = %s and email = any(%s)",
+        cid,
+        emails,
+    )
+
+
 def overwrite_props(db: DB, cid: str, email: str, props: JsonObj) -> None:
     fixedprops = {}
     for k, v in props.items():
@@ -643,9 +654,7 @@ def feed(
         patch_list(db, otherlist, 0, ob, ou, oc, os, list(d.keys()))
 
     if override:
-        db.execute(
-            """delete from unsublogs where cid = %s and email = %s""", cid, email
-        )
+        clear_unsublogs(db, cid, [email])
     elif unsubscribe:
         db.execute(
             """insert into unsublogs (cid, email, rawhash, unsubscribed, complained, bounced) values (%s, %s, %s, true, false, false)
@@ -1654,11 +1663,7 @@ def write_rows(
                     domaincounts[domain] = domaincount
 
             if len(override_emails):
-                db.execute(
-                    "delete from unsublogs where cid = %s and email = any(%s)",
-                    cid,
-                    override_emails,
-                )
+                clear_unsublogs(db, cid, override_emails)
 
     if len(webhook_msgs):
         send_webhooks(db, cid, webhook_msgs)
