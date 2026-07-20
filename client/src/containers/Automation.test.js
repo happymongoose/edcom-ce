@@ -1,3 +1,5 @@
+import _ from 'underscore';
+
 import {
   automationEnrolmentAction,
   automationHistoryLog,
@@ -67,9 +69,11 @@ describe('automation enrolment display helpers', () => {
           created: '2026-07-20T10:00:00Z',
           contact_email: 'contact@example.com',
           enrolment_id: 'enrolment-1',
-          status: 'ready',
+          status: 'paused_waiting',
           source: 'manual',
           current_node_id: 'node_add_tag_1',
+          paused_at: '2026-07-20T10:02:00Z',
+          remaining_seconds: 180,
           published_revision: 3,
         },
         {
@@ -88,7 +92,9 @@ describe('automation enrolment display helpers', () => {
     });
 
     expect(log).toContain('contact@example.com | enrolment enrolment-1 | enrolled');
-    expect(log).toContain('status=ready');
+    expect(log).toContain('status=paused_waiting');
+    expect(log).toContain('paused_at=2026-07-20T10:02:00Z');
+    expect(log).toContain('remaining_seconds=180');
     expect(log).toContain('step add_tag node_add_tag_1 | "Add history tag" | tag=history-tag');
     expect(log).toContain('revision=3');
   });
@@ -117,6 +123,17 @@ describe('automation enrolment display helpers', () => {
     );
     expect(elapsed.type).toBe('continue_wait');
     expect(elapsed.label).toBe('Continue test');
+  });
+
+  it('does not show run controls for held or paused enrolments', () => {
+    _.each(['held', 'paused_ready', 'paused_waiting'], status => {
+      const action = automationEnrolmentAction(
+        {status: status, wake_at: '2026-07-20T10:05:00Z'},
+        {published: {reentry: 'multiple'}},
+        '2026-07-20T10:06:00Z'
+      );
+      expect(action.type).toBe('none');
+    });
   });
 
   it('includes wait metadata in copy-friendly history text', () => {

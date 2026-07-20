@@ -89,6 +89,18 @@ export function automationHistoryLog(history) {
       parts.push('status=' + (event.status || ''));
       parts.push('source=' + (event.source || ''));
       parts.push('current_node=' + (event.current_node_id || ''));
+      if (event.wake_at) {
+        parts.push('wake_at=' + event.wake_at);
+      }
+      if (event.paused_at) {
+        parts.push('paused_at=' + event.paused_at);
+      }
+      if (event.resumed_at) {
+        parts.push('resumed_at=' + event.resumed_at);
+      }
+      if (event.remaining_seconds !== undefined && event.remaining_seconds !== null) {
+        parts.push('remaining_seconds=' + event.remaining_seconds);
+      }
     } else {
       parts.push('step ' + (event.node_type || '') + ' ' + (event.node_id || ''));
       if (event.action) {
@@ -118,6 +130,14 @@ export function automationHistoryLog(history) {
 }
 
 export function automationEnrolmentAction(enrolment, automation, now) {
+  if (_.contains(['held', 'paused_ready', 'paused_waiting'], enrolment.status)) {
+    return {
+      type: 'none',
+      label: '',
+      disabled: true,
+    };
+  }
+
   if (enrolment.status === 'ready') {
     return {
       type: 'run_next',
@@ -164,6 +184,7 @@ class Automation extends Component {
 
     this.state = {
       isPublishing: false,
+      isPausing: false,
       isEnrolling: false,
       runningEnrolmentId: null,
       reenrollingEnrolmentId: null,
@@ -298,6 +319,36 @@ class Automation extends Component {
     }
   }
 
+  pause = async () => {
+    this.setState({isPausing: true});
+
+    try {
+      await axios.post('/api/automations/' + this.props.id + '/pause');
+      notify.show('Automation paused', 'success');
+      await this.props.reload();
+      await this.props.reloadExtra();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to pause automation'), 'error');
+    } finally {
+      this.setState({isPausing: false});
+    }
+  }
+
+  resume = async () => {
+    this.setState({isPausing: true});
+
+    try {
+      await axios.post('/api/automations/' + this.props.id + '/resume');
+      notify.show('Automation resumed', 'success');
+      await this.props.reload();
+      await this.props.reloadExtra();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to resume automation'), 'error');
+    } finally {
+      this.setState({isPausing: false});
+    }
+  }
+
   enrolContact = async event => {
     event.preventDefault();
 
@@ -372,11 +423,30 @@ class Automation extends Component {
       <div>
         <Button
           bsStyle="primary"
-          disabled={this.props.isSaving || this.state.isPublishing}
+          disabled={this.props.isSaving || this.state.isPublishing || this.state.isPausing}
           onClick={this.publish}
         >
           {this.state.isPublishing ? 'Publishing...' : 'Publish'}
         </Button>
+        {
+          this.props.data.published_at ?
+            <span>
+              {' '}
+              <Button
+                disabled={this.props.isSaving || this.state.isPublishing || this.state.isPausing}
+                onClick={this.props.data.status === 'paused' ? this.resume : this.pause}
+              >
+                {
+                  this.state.isPausing ?
+                    this.props.data.status === 'paused' ? 'Resuming...' : 'Pausing...'
+                  :
+                    this.props.data.status === 'paused' ? 'Resume' : 'Pause'
+                }
+              </Button>
+            </span>
+          :
+            null
+        }
         {' '}
         <LoaderButton
           id="automation-buttons-dropdown"
@@ -635,6 +705,30 @@ class Automation extends Component {
                         {' | '}status={enrolment.status || ''}
                         {' | '}source={enrolment.source || ''}
                         {' | '}current_node={enrolment.current_node_id || ''}
+                        {
+                          enrolment.wake_at ?
+                            ' | wake_at=' + enrolment.wake_at
+                          :
+                            ''
+                        }
+                        {
+                          enrolment.paused_at ?
+                            ' | paused_at=' + formatDebugTime(enrolment.paused_at)
+                          :
+                            ''
+                        }
+                        {
+                          enrolment.resumed_at ?
+                            ' | resumed_at=' + formatDebugTime(enrolment.resumed_at)
+                          :
+                            ''
+                        }
+                        {
+                          enrolment.wait && enrolment.wait.remaining_seconds !== undefined ?
+                            ' | remaining_seconds=' + enrolment.wait.remaining_seconds
+                          :
+                            ''
+                        }
                         {' | '}created={formatDebugTime(enrolment.created)}
                         {' | '}modified={formatDebugTime(enrolment.modified)}
                       </p>

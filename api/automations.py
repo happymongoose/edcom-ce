@@ -258,6 +258,16 @@ def _wake_at(start: datetime, duration: JsonObj) -> str:
     return wake.isoformat() + "Z"
 
 
+def _iso_datetime(value: datetime) -> str:
+    return value.isoformat() + "Z"
+
+
+def _remaining_seconds(wake_at: str | None, now: datetime) -> int:
+    if not wake_at:
+        return 0
+    return max(0, int((_parse_datetime(wake_at) - now).total_seconds()))
+
+
 def _published_snapshot(automation: JsonObj) -> JsonObj:
     if not automation.get("name") or not automation.get("name").strip():
         _validation_error("Automation must have a name before publishing.")
@@ -423,6 +433,179 @@ class AutomationPublish(object):
         req.context["result"] = db.automations.get(id)
 
 
+class AutomationPause(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        if not automation.get("published"):
+            raise falcon.HTTPBadRequest(
+                title="Automation is not published",
+                description="Publish the automation before pausing it.",
+            )
+        if automation.get("status") == "paused":
+            req.context["result"] = automation
+            return
+
+        now_dt = datetime.utcnow()
+        now = _iso_datetime(now_dt)
+
+        rows = [
+            _enrolment_obj(row)
+            for row in db.execute(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from automation_enrolments
+                where cid = %s and automation_id = %s
+                """,
+                cid,
+                id,
+            )
+        ]
+        for enrolment in rows:
+            status = enrolment.get("status")
+            update = None
+            if status == "ready":
+                update = {
+                    "status": "paused_ready",
+                    "paused_at": now,
+                    "modified": now,
+                }
+            elif status == "waiting":
+                wait = copy.deepcopy(enrolment.get("wait") or {})
+                remaining = _remaining_seconds(enrolment.get("wake_at"), now_dt)
+                wait.update(
+                    {
+                        "paused_at": now,
+                        "remaining_seconds": remaining,
+                        "frozen_wake_at": enrolment.get("wake_at"),
+                    }
+                )
+                update = {
+                    "status": "paused_waiting",
+                    "wake_at": None,
+                    "wait": wait,
+                    "paused_at": now,
+                    "modified": now,
+                }
+
+            if update is not None:
+                db.execute(
+                    """
+                    update automation_enrolments
+                    set data = data || %s
+                    where cid = %s and automation_id = %s and id = %s
+                    """,
+                    update,
+                    cid,
+                    id,
+                    enrolment["id"],
+                )
+
+        db.automations.patch(
+            id,
+            {
+                "status": "paused",
+                "paused_at": now,
+                "modified": now,
+            },
+        )
+        user_log(req, "pause", "paused automation ", "automations", id, ".")
+        req.context["result"] = db.automations.get(id)
+
+
+class AutomationResume(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        if not automation.get("published"):
+            raise falcon.HTTPBadRequest(
+                title="Automation is not published",
+                description="Publish the automation before resuming it.",
+            )
+        if automation.get("status") != "paused":
+            req.context["result"] = automation
+            return
+
+        now_dt = datetime.utcnow()
+        now = _iso_datetime(now_dt)
+
+        rows = [
+            _enrolment_obj(row)
+            for row in db.execute(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from automation_enrolments
+                where cid = %s and automation_id = %s
+                """,
+                cid,
+                id,
+            )
+        ]
+        for enrolment in rows:
+            status = enrolment.get("status")
+            update = None
+            if status in ("held", "paused_ready"):
+                update = {
+                    "status": "ready",
+                    "resumed_at": now,
+                    "modified": now,
+                }
+            elif status == "paused_waiting":
+                wait = copy.deepcopy(enrolment.get("wait") or {})
+                remaining = int(wait.get("remaining_seconds", 0) or 0)
+                wake_at = _iso_datetime(now_dt + timedelta(seconds=remaining))
+                wait.update(
+                    {
+                        "wake_at": wake_at,
+                        "resumed_at": now,
+                        "last_remaining_seconds": remaining,
+                    }
+                )
+                update = {
+                    "status": "waiting",
+                    "wake_at": wake_at,
+                    "wait": wait,
+                    "resumed_at": now,
+                    "modified": now,
+                }
+
+            if update is not None:
+                db.execute(
+                    """
+                    update automation_enrolments
+                    set data = data || %s
+                    where cid = %s and automation_id = %s and id = %s
+                    """,
+                    update,
+                    cid,
+                    id,
+                    enrolment["id"],
+                )
+
+        db.automations.patch(
+            id,
+            {
+                "status": "published",
+                "resumed_at": now,
+                "modified": now,
+            },
+        )
+        user_log(req, "play", "resumed automation ", "automations", id, ".")
+        req.context["result"] = db.automations.get(id)
+
+
 class AutomationEnrolments(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
@@ -518,7 +701,7 @@ class AutomationEnrolments(object):
         now = _utc_now()
         enrolment_id = shortuuid.uuid()
         data = {
-            "status": "ready",
+            "status": "held" if automation.get("status") == "paused" else "ready",
             "source": "manual",
             "current_node_id": nodes[0]["id"],
             "published_revision": automation.get("published_revision"),
@@ -632,6 +815,10 @@ class AutomationHistory(object):
                     "status": enrolment.get("status"),
                     "source": enrolment.get("source"),
                     "current_node_id": enrolment.get("current_node_id"),
+                    "wake_at": enrolment.get("wake_at"),
+                    "paused_at": enrolment.get("paused_at"),
+                    "resumed_at": enrolment.get("resumed_at"),
+                    "remaining_seconds": (enrolment.get("wait") or {}).get("remaining_seconds"),
                     "published_revision": enrolment.get("published_revision"),
                 }
             )
@@ -692,6 +879,11 @@ class AutomationEnrolmentRunNext(object):
         automation = db.automations.get(id)
         if automation is None:
             raise falcon.HTTPForbidden()
+        if automation.get("status") == "paused":
+            raise falcon.HTTPBadRequest(
+                title="Automation is paused",
+                description="Resume the automation before running test steps.",
+            )
 
         enrolment = _enrolment_obj(
             db.row(
@@ -739,6 +931,11 @@ class AutomationEnrolmentRunNext(object):
             )
 
         status = enrolment.get("status")
+        if status in ("held", "paused_ready", "paused_waiting"):
+            raise falcon.HTTPBadRequest(
+                title="Enrolment is paused",
+                description="Resume the automation before running this enrolment.",
+            )
         if status not in ("ready", "waiting"):
             raise falcon.HTTPBadRequest(
                 title="Enrolment is not ready",
