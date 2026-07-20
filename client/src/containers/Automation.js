@@ -4,14 +4,18 @@ import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
 import shortid from "shortid";
+import Select2 from "react-select2-wrapper";
 import LoaderButton from "../components/LoaderButton";
 import LoaderPanel from "../components/LoaderPanel";
 import SaveNavbar from "../components/SaveNavbar";
 import withLoadSave from "../components/LoadSave";
 import { FormControlLabel } from "../components/FormControls";
 import { EDFormSection, EDFormBox, EDTable, EDTableRow } from "../components/EDDOM";
+import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
+
+import "react-select2-wrapper/css/select2.css";
 
 function errorMessage(error, fallback) {
   const data = error && error.response && error.response.data;
@@ -68,6 +72,26 @@ class Automation extends Component {
         },
       },
     });
+  }
+
+  nodeTagChange = (index, event) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            draft_tag: {$set: event.params.data.id},
+          },
+        },
+      },
+    });
+  }
+
+  tagData() {
+    const tags = this.props.tags || [];
+    const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
+    const draftTags = _.pluck(_.filter(nodes, node => node.type === 'add_tag' && node.draft_tag), 'draft_tag');
+
+    return _.map(_.uniq(tags.concat(draftTags)), tag => ({id: tag, text: tag}));
   }
 
   addNode = type => {
@@ -173,15 +197,29 @@ class Automation extends Component {
     }
 
     return (
-      <FormControlLabel
-        id="draft_tag"
-        label="Draft tag config"
-        obj={node}
-        onChange={this.nodeChange.bind(this, index)}
-        placeholder="Tag name to add later"
-        help="Draft-only configuration. This is not validated or executable yet."
-        space
-      />
+      <div style={{minWidth: '220px'}}>
+        <Select2
+          data={this.tagData()}
+          value={node.draft_tag || ''}
+          onSelect={this.nodeTagChange.bind(this, index)}
+          style={{width:'100%'}}
+          options={{
+            placeholder: 'Select or create tag',
+            tags: true,
+            createTag: function (params) {
+              const fixed = fixTag(params.term);
+              if (!fixed) {
+                return null;
+              }
+              return {
+                id: fixed,
+                text: fixed,
+              };
+            }
+          }}
+        />
+        <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
+      </div>
     );
   }
 
@@ -303,4 +341,7 @@ export default withLoadSave({
   },
   get: async ({id}) => normalizeAutomation((await axios.get('/api/automations/' + id)).data),
   patch: ({id, data}) => axios.patch('/api/automations/' + id, patchPayload(data)),
+  extra: {
+    tags: async () => (await axios.get('/api/recenttags')).data,
+  },
 });
