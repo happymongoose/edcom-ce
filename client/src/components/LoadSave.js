@@ -24,6 +24,7 @@ export default ({extend: ExtendedComponent, initial, get, extra, extramerge, pos
 
     mergeParams(obj) {
       var p = parse(this);
+      _.extend(p, this.props.match ? this.props.match.params : {});
 
       _.each(p, (v, k) => {
         if (k !== 'id') {
