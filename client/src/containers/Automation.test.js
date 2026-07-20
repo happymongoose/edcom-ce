@@ -1,4 +1,5 @@
 import {
+  automationHistoryLog,
   canReEnrolAutomation,
   displayAutomationEnrolments,
 } from './Automation';
@@ -55,5 +56,39 @@ describe('automation enrolment display helpers', () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe('latest-exit');
+  });
+
+  it('formats automation history as copy-friendly text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'enrolment',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          status: 'ready',
+          source: 'manual',
+          current_node_id: 'node_add_tag_1',
+          published_revision: 3,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:01:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_add_tag_1',
+          node_type: 'add_tag',
+          node_label: 'Add history tag',
+          tag: 'history-tag',
+          status: 'succeeded',
+          published_revision: 3,
+        },
+      ],
+    });
+
+    expect(log).toContain('contact@example.com | enrolment enrolment-1 | enrolled');
+    expect(log).toContain('status=ready');
+    expect(log).toContain('step add_tag node_add_tag_1 | "Add history tag" | tag=history-tag');
+    expect(log).toContain('revision=3');
   });
 });

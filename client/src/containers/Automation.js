@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, FormControl } from "react-bootstrap";
+import { Button, FormControl, Panel } from "react-bootstrap";
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
@@ -65,6 +65,47 @@ export function displayAutomationEnrolments(enrolments) {
     })
     .sortBy(enrolment => moment(enrolment.created || 0).valueOf())
     .value();
+}
+
+function formatDebugTime(value) {
+  return value ? moment(value).format('lll') : '';
+}
+
+export function automationHistoryLog(history) {
+  const events = (history && history.events) || [];
+  if (!events.length) {
+    return 'No automation history yet.';
+  }
+
+  return _.map(events, event => {
+    const parts = [
+      formatDebugTime(event.created),
+      event.contact_email || 'unknown contact',
+      'enrolment ' + event.enrolment_id,
+    ];
+
+    if (event.type === 'enrolment') {
+      parts.push('enrolled');
+      parts.push('status=' + (event.status || ''));
+      parts.push('source=' + (event.source || ''));
+      parts.push('current_node=' + (event.current_node_id || ''));
+    } else {
+      parts.push('step ' + (event.node_type || '') + ' ' + (event.node_id || ''));
+      if (event.node_label) {
+        parts.push('"' + event.node_label + '"');
+      }
+      if (event.tag) {
+        parts.push('tag=' + event.tag);
+      }
+      parts.push('status=' + (event.status || ''));
+      if (event.error) {
+        parts.push('error=' + event.error);
+      }
+    }
+
+    parts.push('revision=' + (event.published_revision || ''));
+    return parts.join(' | ');
+  }).join('\n');
 }
 
 class Automation extends Component {
@@ -428,6 +469,83 @@ class Automation extends Component {
     );
   }
 
+  renderHistory() {
+    const history = this.props.historyData || {};
+    const enrolments = history.enrolments || [];
+    const log = automationHistoryLog(history);
+
+    return (
+      <EDFormBox space>
+        <Panel id="automation-debug-history-panel">
+          <Panel.Heading style={{backgroundColor: 'white'}}>
+            <Panel.Title toggle style={{fontSize: '14px'}}>
+              Debug history
+            </Panel.Title>
+          </Panel.Heading>
+          <Panel.Collapse>
+            <Panel.Body>
+              {
+                enrolments.length ?
+                  _.map(enrolments, enrolment =>
+                    <div key={enrolment.id} className="space-bottom-sm">
+                      <h4>{enrolment.contact_email}</h4>
+                      <p>
+                        Session {enrolment.id}
+                        {' | '}status={enrolment.status || ''}
+                        {' | '}source={enrolment.source || ''}
+                        {' | '}current_node={enrolment.current_node_id || ''}
+                        {' | '}created={formatDebugTime(enrolment.created)}
+                        {' | '}modified={formatDebugTime(enrolment.modified)}
+                      </p>
+                      {
+                        enrolment.step_runs && enrolment.step_runs.length ?
+                          <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
+                            <thead>
+                              <tr>
+                                <th>Created</th>
+                                <th>Node</th>
+                                <th>Type</th>
+                                <th>Label</th>
+                                <th>Tag</th>
+                                <th>Status</th>
+                                <th>Revision</th>
+                              </tr>
+                            </thead>
+                            {
+                              _.map(enrolment.step_runs, (stepRun, index) =>
+                                <EDTableRow key={stepRun.id} index={index}>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{formatDebugTime(stepRun.created)}</h4></td>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_id}</h4></td>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_type}</h4></td>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_label || ''}</h4></td>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.tag || ''}</h4></td>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.status || stepRun.error || ''}</h4></td>
+                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.published_revision || ''}</h4></td>
+                                </EDTableRow>
+                              )
+                            }
+                          </EDTable>
+                        :
+                          <p>No step runs recorded for this session.</p>
+                      }
+                    </div>
+                  )
+                :
+                  <p>No automation history yet.</p>
+              }
+              <FormControl
+                componentClass="textarea"
+                rows={Math.min(Math.max((history.events || []).length + 1, 4), 16)}
+                readOnly
+                value={log}
+              />
+            </Panel.Body>
+          </Panel.Collapse>
+        </Panel>
+      </EDFormBox>
+    );
+  }
+
   render() {
     const data = this.props.data;
     const nodes = (data.draft && data.draft.nodes) || [];
@@ -537,6 +655,7 @@ class Automation extends Component {
               }
             </EDFormBox>
             {this.renderEnrolments()}
+            {this.renderHistory()}
           </EDFormSection>
         </LoaderPanel>
       </SaveNavbar>
@@ -562,5 +681,6 @@ export default withLoadSave({
   extra: {
     tags: async () => (await axios.get('/api/recenttags')).data,
     enrolments: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments')).data,
+    historyData: async ({id}) => (await axios.get('/api/automations/' + id + '/history')).data,
   },
 });

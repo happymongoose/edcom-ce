@@ -3791,6 +3791,7 @@ app.add_route("/api/automations", automations.Automations())
 app.add_route("/api/automations/{id}", automations.Automation())
 app.add_route("/api/automations/{id}/publish", automations.AutomationPublish())
 app.add_route("/api/automations/{id}/enrolments", automations.AutomationEnrolments())
+app.add_route("/api/automations/{id}/history", automations.AutomationHistory())
 app.add_route(
     "/api/automations/{id}/enrolments/{enrolment_id}/run-next",
     automations.AutomationEnrolmentRunNext(),

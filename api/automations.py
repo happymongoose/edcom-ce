@@ -484,6 +484,121 @@ class AutomationEnrolments(object):
         )
 
 
+class AutomationHistory(object):
+
+    ENROLMENT_LIMIT = 100
+    STEP_RUN_LIMIT = 500
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        if db.automations.get(id) is None:
+            raise falcon.HTTPForbidden()
+
+        enrolments = [
+            _enrolment_obj(row)
+            for row in db.execute(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from (
+                    select id, cid, automation_id, contact_id, contact_email, data
+                    from automation_enrolments
+                    where cid = %s and automation_id = %s
+                    order by data->>'created' desc, id desc
+                    limit %s
+                ) e
+                order by data->>'created', id
+                """,
+                cid,
+                id,
+                self.ENROLMENT_LIMIT,
+            )
+        ]
+        enrolment_ids = [enrolment["id"] for enrolment in enrolments]
+
+        step_runs = []
+        if enrolment_ids:
+            step_runs = [
+                _step_run_obj(row)
+                for row in db.execute(
+                    """
+                    select id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data
+                    from (
+                        select id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data
+                        from automation_step_runs
+                        where cid = %s and automation_id = %s and enrolment_id = any(%s)
+                        order by data->>'created' desc, id desc
+                        limit %s
+                    ) s
+                    order by data->>'created', id
+                    """,
+                    cid,
+                    id,
+                    enrolment_ids,
+                    self.STEP_RUN_LIMIT,
+                )
+            ]
+
+        enrolments_by_id = {enrolment["id"]: enrolment for enrolment in enrolments}
+        for enrolment in enrolments:
+            enrolment["step_runs"] = []
+        for step_run in step_runs:
+            enrolment = enrolments_by_id.get(step_run["enrolment_id"])
+            if enrolment is not None:
+                enrolment["step_runs"].append(step_run)
+
+        events = []
+        for enrolment in enrolments:
+            events.append(
+                {
+                    "type": "enrolment",
+                    "created": enrolment.get("created"),
+                    "modified": enrolment.get("modified"),
+                    "enrolment_id": enrolment["id"],
+                    "contact_id": enrolment["contact_id"],
+                    "contact_email": enrolment["contact_email"],
+                    "status": enrolment.get("status"),
+                    "source": enrolment.get("source"),
+                    "current_node_id": enrolment.get("current_node_id"),
+                    "published_revision": enrolment.get("published_revision"),
+                }
+            )
+
+        for step_run in step_runs:
+            enrolment = enrolments_by_id.get(step_run["enrolment_id"], {})
+            events.append(
+                {
+                    "type": "step_run",
+                    "created": step_run.get("created"),
+                    "enrolment_id": step_run["enrolment_id"],
+                    "contact_id": step_run["contact_id"],
+                    "contact_email": enrolment.get("contact_email"),
+                    "node_id": step_run["node_id"],
+                    "node_type": step_run["node_type"],
+                    "node_label": step_run.get("node_label"),
+                    "tag": step_run.get("tag"),
+                    "published_revision": step_run.get("published_revision"),
+                    "status": step_run.get("status"),
+                    "error": step_run.get("error"),
+                }
+            )
+
+        events.sort(key=lambda event: (event.get("created") or "", event["type"]))
+
+        req.context["result"] = {
+            "automation_id": id,
+            "generated_at": _utc_now(),
+            "limits": {
+                "enrolments": self.ENROLMENT_LIMIT,
+                "step_runs": self.STEP_RUN_LIMIT,
+            },
+            "enrolments": enrolments,
+            "events": events,
+        }
+
+
 class AutomationEnrolmentRunNext(object):
 
     def on_post(
