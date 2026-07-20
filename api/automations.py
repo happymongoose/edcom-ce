@@ -1,18 +1,96 @@
 import falcon
 from datetime import datetime
+from jsonschema import validate
 
 from .shared import config as _  # noqa: F401
 from .shared.crud import (
     CRUDCollection,
     CRUDSingle,
     check_noadmin,
-    json_validate,
-    patch_schema,
 )
 from .shared.db import DB, JsonObj
 
 
-AUTOMATION_SCHEMA = {
+NODE_ID_SCHEMA = {
+    "type": "string",
+    "pattern": "^[0-9a-zA-Z_-]{1,64}$",
+}
+
+
+ADD_TAG_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "draft_tag"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["add_tag"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "draft_tag": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+EXIT_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["exit"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+ENTRY_SCHEMA = {
+    "type": "object",
+    "required": ["type"],
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": ["manual"],
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+DRAFT_SCHEMA = {
+    "type": "object",
+    "required": ["nodes"],
+    "properties": {
+        "nodes": {
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    ADD_TAG_NODE_SCHEMA,
+                    EXIT_NODE_SCHEMA,
+                ],
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+AUTOMATION_CREATE_SCHEMA = {
     "type": "object",
     "required": ["name"],
     "properties": {
@@ -28,6 +106,32 @@ AUTOMATION_SCHEMA = {
     },
     "additionalProperties": False,
 }
+
+
+AUTOMATION_PATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "maxLength": 1024,
+            "minLength": 1,
+        },
+        "status": {
+            "type": "string",
+            "enum": ["draft"],
+        },
+        "entry": ENTRY_SCHEMA,
+        "draft": DRAFT_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+
+def _validate_doc(doc: JsonObj, schema: JsonObj) -> None:
+    try:
+        validate(doc, schema)
+    except Exception as e:
+        raise falcon.HTTPBadRequest(title="Input validation error", description=str(e))
 
 
 def _utc_now() -> str:
@@ -64,7 +168,7 @@ class Automations(CRUDCollection):
                 title="Not JSON", description="A valid JSON document is required."
             )
 
-        json_validate(doc, AUTOMATION_SCHEMA)
+        _validate_doc(doc, AUTOMATION_CREATE_SCHEMA)
         _prepare_doc(doc, True)
 
         return CRUDCollection.on_post(self, req, resp)
@@ -89,7 +193,7 @@ class Automation(CRUDSingle):
                 title="Not JSON", description="A valid JSON document is required."
             )
 
-        json_validate(doc, patch_schema(AUTOMATION_SCHEMA))
+        _validate_doc(doc, AUTOMATION_PATCH_SCHEMA)
         _prepare_doc(doc, False)
 
         return CRUDSingle.on_patch(self, req, resp, id)

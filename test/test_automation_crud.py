@@ -55,3 +55,98 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
 
         self.db.automations.remove(automation_id)
+
+    def test_accepts_valid_draft_workflow(self):
+        created = self.user_post("/api/automations", json={"name": "Draft Workflow"})
+        automation_id = created["id"]
+
+        draft = {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add onboarding tag",
+                        "draft_tag": "onboarding",
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
+        patched = self.user_patch("/api/automations/%s" % automation_id, json=draft)
+
+        self.assertEqual(patched["entry"], draft["entry"])
+        self.assertEqual(patched["draft"], draft["draft"])
+
+        found = self.user_get("/api/automations/%s" % automation_id)
+        self.assertEqual(found["draft"]["nodes"][0]["id"], "node_add_tag_1")
+        self.assertEqual(found["draft"]["nodes"][0]["draft_tag"], "onboarding")
+
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_rejects_invalid_draft_node_type(self):
+        created = self.user_post("/api/automations", json={"name": "Bad Node Type"})
+        automation_id = created["id"]
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation_id,
+            json={
+                "entry": {
+                    "type": "manual",
+                },
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_wait_1",
+                            "type": "wait",
+                            "label": "Wait",
+                        },
+                    ],
+                },
+            },
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_rejects_extra_draft_node_fields(self):
+        created = self.user_post("/api/automations", json={"name": "Extra Field"})
+        automation_id = created["id"]
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation_id,
+            json={
+                "entry": {
+                    "type": "manual",
+                },
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                            "next": "unexpected",
+                        },
+                    ],
+                },
+            },
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.user_delete("/api/automations/%s" % automation_id)

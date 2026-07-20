@@ -92,6 +92,7 @@ import FunnelMessage from "./containers/FunnelMessage";
 import FunnelMessageEdit from "./containers/FunnelMessageEdit";
 import FunnelMessageStats from "./containers/FunnelMessageStats";
 import Automations from "./containers/Automations";
+import Automation from "./containers/Automation";
 import Transactional from "./containers/Transactional";
 import TransactionalTag from "./containers/TransactionalTag";
 import TransactionalDomains from "./containers/TransactionalDomains";
@@ -210,6 +211,7 @@ export default ({ childProps }) => {
     <AppliedRoute path="/funnels/message/edit" exact component={FunnelMessageEdit} props={childProps} />
     <AppliedRoute path="/funnels/message/stats" exact component={FunnelMessageStats} props={childProps} />
     <AppliedRoute path="/automations" exact component={Automations} props={childProps} />
+    <AppliedRoute path="/automations/:id" exact component={Automation} props={childProps} />
     <AppliedRoute path="/transactional" exact component={Transactional} props={childProps} />
     <AppliedRoute path="/transactional/tag" exact component={TransactionalTag} props={childProps} />
     <AppliedRoute path="/transactional/domains" exact component={TransactionalDomains} props={childProps} />

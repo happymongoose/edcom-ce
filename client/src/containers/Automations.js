@@ -1,5 +1,6 @@
 import React, { Component } from "react";
 import { Button, FormControl, MenuItem, Modal } from "react-bootstrap";
+import { Link } from "react-router-dom";
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
@@ -48,6 +49,10 @@ class Automations extends Component {
       automationId: automation.id,
       name: automation.name,
     });
+  }
+
+  openClicked = automation => {
+    this.props.history.push('/automations/' + automation.id);
   }
 
   closeNameModal = () => {
@@ -170,7 +175,9 @@ class Automations extends Component {
                           <ul className="list-inline first-tr">
                             <li>
                               <h4 style={{whiteSpace: 'nowrap'}}>
-                                {automation.name}
+                                <Link to={'/automations/' + automation.id}>
+                                  {automation.name}
+                                </Link>
                               </h4>
                             </li>
                           </ul>
@@ -195,6 +202,7 @@ class Automations extends Component {
                             prompt={`Are you sure you wish to delete '${automation.name}'?`}
                             onConfirm={this.deleteConfirmClicked.bind(this, automation)}
                           >
+                            <MenuItem onClick={this.openClicked.bind(this, automation)}>Open</MenuItem>
                             <MenuItem onClick={this.renameClicked.bind(this, automation)}>Rename</MenuItem>
                           </ConfirmDropdown>
                         </td>
