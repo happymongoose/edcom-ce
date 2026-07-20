@@ -86,6 +86,14 @@ class TestAutomationHistory(test_base.TestBase):
             "/api/automations/%s/enrolments/%s/run-next" % (automation_id, enrolment_id),
             headers=self.headers(),
         )
+        self.assertEqual(result.status_code, 200, result.text)
+        return result.json
+
+    def run_next_skip_wait(self, automation_id, enrolment_id):
+        result = self.simulate_post(
+            "/api/automations/%s/enrolments/%s/run-next?skip_wait=true" % (automation_id, enrolment_id),
+            headers=self.headers(),
+        )
         self.assertEqual(result.status_code, 200)
         return result.json
 
@@ -285,5 +293,52 @@ class TestAutomationHistory(test_base.TestBase):
         self.assertEqual(step_events[0]["node_type"], "wait_duration")
         self.assertEqual(step_events[0]["wake_at"], history["enrolments"][0]["step_runs"][0]["wake_at"])
         self.assertEqual(step_events[0]["duration"], {"days": 0, "hours": 0, "minutes": 5})
+
+        self.cleanup(automation["id"])
+
+    def test_history_marks_skipped_wait_completion(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        wait_nodes = [
+            {
+                "id": "node_wait_1",
+                "type": "wait_duration",
+                "label": "Wait",
+                "duration": {
+                    "days": 0,
+                    "hours": 0,
+                    "minutes": 5,
+                },
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit history automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {
+                    "type": "manual",
+                },
+                "reentry": "multiple",
+                "draft": {
+                    "nodes": wait_nodes,
+                },
+            },
+        )
+        automation = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+        enrolment = self.enrol(automation["id"], email)
+        self.run_next(automation["id"], enrolment["id"])
+        self.run_next_skip_wait(automation["id"], enrolment["id"])
+
+        history = self.history(automation["id"])
+        step_events = [event for event in history["events"] if event["type"] == "step_run"]
+        self.assertEqual(step_events[1]["action"], "wait_complete")
+        self.assertEqual(step_events[1]["skipped"], True)
 
         self.cleanup(automation["id"])

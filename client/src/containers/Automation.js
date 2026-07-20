@@ -103,6 +103,9 @@ export function automationHistoryLog(history) {
       if (event.wake_at) {
         parts.push('wake_at=' + event.wake_at);
       }
+      if (event.skipped) {
+        parts.push('skipped=true');
+      }
       parts.push('status=' + (event.status || ''));
       if (event.error) {
         parts.push('error=' + event.error);
@@ -133,9 +136,10 @@ export function automationEnrolmentAction(enrolment, automation, now) {
       };
     }
     return {
-      type: 'waiting',
-      label: 'Waiting until ' + (wakeAt && wakeAt.isValid() ? wakeAt.format('lll') : ''),
-      disabled: true,
+      type: 'skip_wait',
+      label: 'Move to next node',
+      waitLabel: 'Waiting until ' + (wakeAt && wakeAt.isValid() ? wakeAt.format('lll') : ''),
+      disabled: false,
     };
   }
 
@@ -315,12 +319,14 @@ class Automation extends Component {
     }
   }
 
-  runNext = async enrolment => {
+  runNext = async (enrolment, options) => {
     this.setState({runningEnrolmentId: enrolment.id});
 
     try {
-      await axios.post('/api/automations/' + this.props.id + '/enrolments/' + enrolment.id + '/run-next');
-      notify.show('Automation test step ran', 'success');
+      const url = '/api/automations/' + this.props.id + '/enrolments/' + enrolment.id + '/run-next' +
+        (options && options.skip_wait ? '?skip_wait=true' : '');
+      await axios.post(url, options || {});
+      notify.show(options && options.skip_wait ? 'Automation wait skipped' : 'Automation test step ran', 'success');
       await this.props.reloadExtra();
     } catch (error) {
       notify.show(errorMessage(error, 'Unable to run next automation step'), 'error');
@@ -555,8 +561,22 @@ class Automation extends Component {
                                 }
                               </Button>
                             :
-                              action.type === 'waiting' ?
-                                <span>{action.label}</span>
+                              action.type === 'skip_wait' ?
+                                <div>
+                                  <div style={{whiteSpace: 'nowrap', marginBottom: '6px'}}>{action.waitLabel}</div>
+                                  <Button
+                                    bsSize="small"
+                                    disabled={this.state.runningEnrolmentId === enrolment.id}
+                                    onClick={this.runNext.bind(this, enrolment, {skip_wait: true})}
+                                  >
+                                    {
+                                      this.state.runningEnrolmentId === enrolment.id ?
+                                        'Moving...'
+                                      :
+                                        action.label
+                                    }
+                                  </Button>
+                                </div>
                             :
                               action.type === 'reenrol' ?
                                 <Button

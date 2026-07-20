@@ -652,6 +652,7 @@ class AutomationHistory(object):
                     "duration": step_run.get("duration"),
                     "wake_at": step_run.get("wake_at"),
                     "action": step_run.get("action"),
+                    "skipped": step_run.get("skipped"),
                     "published_revision": step_run.get("published_revision"),
                     "status": step_run.get("status"),
                     "error": step_run.get("error"),
@@ -682,6 +683,9 @@ class AutomationEnrolmentRunNext(object):
         enrolment_id: str,
     ) -> None:
         check_noadmin(req)
+
+        body = req.get_media(default_when_empty={}) or {}
+        skip_wait = req.get_param_as_bool("skip_wait") is True or (body or {}).get("skip_wait") is True
 
         db = req.context["db"]
         cid = db.get_cid()
@@ -763,7 +767,7 @@ class AutomationEnrolmentRunNext(object):
                     title="Waiting enrolment is missing wake_at",
                     description="The waiting enrolment cannot continue without wake_at metadata.",
                 )
-            if now_dt < _parse_datetime(wake_at):
+            if now_dt < _parse_datetime(wake_at) and not skip_wait:
                 raise falcon.HTTPBadRequest(
                     title="Wait has not elapsed",
                     description="This enrolment is waiting until %s." % wake_at,
@@ -775,6 +779,7 @@ class AutomationEnrolmentRunNext(object):
                     "action": "wait_complete",
                     "duration": wait.get("duration", node.get("duration")),
                     "wake_at": wake_at,
+                    "skipped": skip_wait and now_dt < _parse_datetime(wake_at),
                 }
             )
 

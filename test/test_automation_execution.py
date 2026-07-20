@@ -99,6 +99,12 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         )
 
+    def run_next_skip_wait(self, automation_id, enrolment_id):
+        return self.simulate_post(
+            "/api/automations/%s/enrolments/%s/run-next?skip_wait=true" % (automation_id, enrolment_id),
+            headers=self.headers(),
+        )
+
     def has_tag(self, contact_id, tag):
         return bool(
             self.db.single(
@@ -381,6 +387,25 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Wait has not elapsed", result.text)
         self.assertIn(started.json["enrolment"]["wake_at"], result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_skip_wait_before_wake_at_advances_for_debugging(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        started = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(started.status_code, 200)
+
+        result = self.run_next_skip_wait(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["enrolment"]["wake_at"], None)
+        self.assertEqual(result.json["step_run"]["action"], "wait_complete")
+        self.assertEqual(result.json["step_run"]["wake_at"], started.json["enrolment"]["wake_at"])
+        self.assertEqual(result.json["step_run"]["skipped"], True)
 
         self.cleanup(automation["id"])
 

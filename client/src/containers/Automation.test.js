@@ -102,9 +102,10 @@ describe('automation enrolment display helpers', () => {
       {published: {reentry: 'multiple'}},
       '2026-07-20T10:00:00Z'
     );
-    expect(waiting.type).toBe('waiting');
-    expect(waiting.disabled).toBe(true);
-    expect(waiting.label).toContain('Waiting until');
+    expect(waiting.type).toBe('skip_wait');
+    expect(waiting.disabled).toBe(false);
+    expect(waiting.label).toBe('Move to next node');
+    expect(waiting.waitLabel).toContain('Waiting until');
 
     const elapsed = automationEnrolmentAction(
       {
@@ -131,6 +132,7 @@ describe('automation enrolment display helpers', () => {
           node_label: 'Wait',
           action: 'wait_start',
           wake_at: '2026-07-20T10:05:00Z',
+          skipped: true,
           status: 'waiting',
           published_revision: 3,
         },
@@ -139,6 +141,7 @@ describe('automation enrolment display helpers', () => {
 
     expect(log).toContain('action=wait_start');
     expect(log).toContain('wake_at=2026-07-20T10:05:00Z');
+    expect(log).toContain('skipped=true');
     expect(log).toContain('status=waiting');
   });
 });
