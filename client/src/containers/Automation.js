@@ -9,7 +9,7 @@ import LoaderButton from "../components/LoaderButton";
 import LoaderPanel from "../components/LoaderPanel";
 import SaveNavbar from "../components/SaveNavbar";
 import withLoadSave from "../components/LoadSave";
-import { FormControlLabel } from "../components/FormControls";
+import { FormControlLabel, SelectLabel } from "../components/FormControls";
 import { EDFormSection, EDFormBox, EDTable, EDTableRow } from "../components/EDDOM";
 import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
@@ -28,6 +28,7 @@ function errorMessage(error, fallback) {
 function normalizeAutomation(automation) {
   automation.entry = automation.entry || {type: 'manual'};
   automation.entry.type = 'manual';
+  automation.reentry = automation.reentry || 'once';
   automation.draft = automation.draft || {};
   automation.draft.nodes = automation.draft.nodes || [];
   return automation;
@@ -39,6 +40,7 @@ function patchPayload(data) {
     entry: {
       type: 'manual',
     },
+    reentry: data.reentry || 'once',
     draft: {
       nodes: data.draft.nodes,
     },
@@ -263,6 +265,17 @@ class Automation extends Component {
             <EDFormBox space>
               <h4>Entry</h4>
               <p>Manual enrolment</p>
+              <SelectLabel
+                id="reentry"
+                label="Contact re-entry"
+                obj={data}
+                onChange={this.handleChange}
+                options={[
+                  {id: 'once', name: 'Enter once'},
+                  {id: 'multiple', name: 'Enter multiple times'},
+                ]}
+                space
+              />
             </EDFormBox>
             <EDFormBox space>
               <div className="flex-items space-between">
@@ -332,6 +345,7 @@ export default withLoadSave({
   initial: {
     name: '',
     status: 'draft',
+    reentry: 'once',
     entry: {
       type: 'manual',
     },

@@ -61,6 +61,12 @@ EXIT_NODE_SCHEMA = {
 }
 
 
+REENTRY_SCHEMA = {
+    "type": "string",
+    "enum": ["once", "multiple"],
+}
+
+
 ENTRY_SCHEMA = {
     "type": "object",
     "required": ["type"],
@@ -105,6 +111,7 @@ AUTOMATION_CREATE_SCHEMA = {
             "type": "string",
             "enum": ["draft"],
         },
+        "reentry": REENTRY_SCHEMA,
     },
     "additionalProperties": False,
 }
@@ -122,6 +129,7 @@ AUTOMATION_PATCH_SCHEMA = {
             "type": "string",
             "enum": ["draft"],
         },
+        "reentry": REENTRY_SCHEMA,
         "entry": ENTRY_SCHEMA,
         "draft": DRAFT_SCHEMA,
     },
@@ -149,6 +157,7 @@ def _prepare_doc(doc: JsonObj, create: bool) -> None:
 
     now = _utc_now()
     doc["status"] = "draft"
+    doc["reentry"] = doc.get("reentry", "once")
     doc["modified"] = now
     if create:
         doc["created"] = now
@@ -180,6 +189,9 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
     if entry.get("type") != "manual":
         _validation_error("Automation entry must be manual.")
 
+    reentry = automation.get("reentry", "once")
+    _validate_doc(reentry, REENTRY_SCHEMA)
+
     draft = automation.get("draft")
     if draft is None:
         _validation_error("Automation draft workflow is required.")
@@ -200,6 +212,7 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
 
     return {
         "entry": copy.deepcopy(entry),
+        "reentry": reentry,
         "nodes": copy.deepcopy(nodes),
     }
 

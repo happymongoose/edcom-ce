@@ -3,8 +3,8 @@ import test_base
 
 class TestAutomationCRUD(test_base.TestBase):
 
-    def valid_workflow(self, label="Add onboarding tag", draft_tag="onboarding"):
-        return {
+    def valid_workflow(self, label="Add onboarding tag", draft_tag="onboarding", reentry=None):
+        workflow = {
             "entry": {
                 "type": "manual",
             },
@@ -23,6 +23,32 @@ class TestAutomationCRUD(test_base.TestBase):
                     },
                 ],
             },
+        }
+
+        if reentry is not None:
+            workflow["reentry"] = reentry
+
+        return workflow
+
+    def valid_published_workflow(self, label="Add onboarding tag", draft_tag="onboarding", reentry="once"):
+        return {
+            "entry": {
+                "type": "manual",
+            },
+            "reentry": reentry,
+            "nodes": [
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": label,
+                    "draft_tag": draft_tag,
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ],
         }
 
     def user_publish(self, automation_id):
@@ -46,6 +72,7 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.assertEqual(created["name"], "Welcome Series")
         self.assertEqual(created["status"], "draft")
+        self.assertEqual(created["reentry"], "once")
         self.assertIn("created", created)
         self.assertIn("modified", created)
 
@@ -54,6 +81,7 @@ class TestAutomationCRUD(test_base.TestBase):
         found = self.user_get("/api/automations/%s" % automation_id)
         self.assertEqual(found["id"], automation_id)
         self.assertEqual(found["name"], "Welcome Series")
+        self.assertEqual(found["reentry"], "once")
 
         automations = self.user_get("/api/automations")
         self.assertTrue(any(a["id"] == automation_id for a in automations))
@@ -64,6 +92,7 @@ class TestAutomationCRUD(test_base.TestBase):
         )
         self.assertEqual(patched["name"], "Updated Welcome Series")
         self.assertEqual(patched["status"], "draft")
+        self.assertEqual(patched["reentry"], "once")
 
         self.user_delete("/api/automations/%s" % automation_id)
 
@@ -187,6 +216,40 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.user_delete("/api/automations/%s" % automation_id)
 
+    def test_accepts_valid_reentry_values(self):
+        created = self.user_post("/api/automations", json={"name": "Reentry Values"})
+        automation_id = created["id"]
+
+        patched = self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json={"reentry": "multiple"},
+        )
+        self.assertEqual(patched["reentry"], "multiple")
+
+        patched = self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json={"reentry": "once"},
+        )
+        self.assertEqual(patched["reentry"], "once")
+
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_rejects_invalid_reentry_value(self):
+        created = self.user_post("/api/automations", json={"name": "Bad Reentry"})
+        automation_id = created["id"]
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation_id,
+            json={"reentry": "sometimes"},
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.user_delete("/api/automations/%s" % automation_id)
+
     def test_blocks_other_account_access(self):
         created = self.user_post("/api/automations", json={"name": "Other Account"})
         automation_id = created["id"]
@@ -241,10 +304,8 @@ class TestAutomationCRUD(test_base.TestBase):
         published = self.user_publish(automation_id)
 
         self.assertEqual(published["status"], "published")
-        self.assertEqual(published["published"], {
-            "entry": draft["entry"],
-            "nodes": draft["draft"]["nodes"],
-        })
+        self.assertEqual(published["reentry"], "once")
+        self.assertEqual(published["published"], self.valid_published_workflow())
         self.assertEqual(published["published_revision"], 1)
         self.assertIn("published_at", published)
         self.assertEqual(published["published_by"], self.user_cookie["uid"])
@@ -295,17 +356,22 @@ class TestAutomationCRUD(test_base.TestBase):
         created = self.user_post("/api/automations", json={"name": "Republish"})
         automation_id = created["id"]
 
-        self.user_patch("/api/automations/%s" % automation_id, json=self.valid_workflow())
+        self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.valid_workflow(reentry="multiple"),
+        )
         first = self.user_publish(automation_id)
 
         self.user_patch(
             "/api/automations/%s" % automation_id,
-            json=self.valid_workflow(label="Add updated tag", draft_tag="updated"),
+            json=self.valid_workflow(label="Add updated tag", draft_tag="updated", reentry="once"),
         )
         second = self.user_publish(automation_id)
 
         self.assertEqual(first["published_revision"], 1)
+        self.assertEqual(first["published"]["reentry"], "multiple")
         self.assertEqual(second["published_revision"], 2)
+        self.assertEqual(second["published"]["reentry"], "once")
         self.assertEqual(second["published"]["nodes"][0]["label"], "Add updated tag")
         self.assertEqual(second["published"]["nodes"][0]["draft_tag"], "updated")
 
@@ -330,6 +396,31 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(found["draft"]["nodes"][0]["label"], "Draft-only change")
 
         self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_invalid_stored_reentry_fails_publish_validation(self):
+        created = self.user_post("/api/automations", json={"name": "Bad Stored Reentry"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.valid_workflow())
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation_id, {"reentry": "sometimes"})
+
+        before_failed_publish = self.db.automations.get(automation_id)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+
+        after_failed_publish = self.db.automations.get(automation_id)
+        self.assertEqual(after_failed_publish, before_failed_publish)
+
         self.db.automations.remove(automation_id)
 
     def test_cross_account_publish_is_blocked(self):
