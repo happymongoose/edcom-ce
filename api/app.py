@@ -53,6 +53,7 @@ from . import campaigns
 from . import funnels
 from . import events
 from . import transactional
+from . import automations
 
 import logging
 
@@ -3786,6 +3787,8 @@ app.add_route("/api/funnels", funnels.Funnels())
 app.add_route("/api/funnels/{id}", funnels.Funnel())
 app.add_route("/api/funnels/{id}/messages", funnels.FunnelMessages())
 app.add_route("/api/funnels/{id}/duplicate", funnels.FunnelDuplicate())
+app.add_route("/api/automations", automations.Automations())
+app.add_route("/api/automations/{id}", automations.Automation())
 app.add_route("/api/messages", funnels.Messages())
 app.add_route("/api/messages/{id}", funnels.Message())
 app.add_route("/api/messages/{id}/duplicate", funnels.MessageDuplicate())
