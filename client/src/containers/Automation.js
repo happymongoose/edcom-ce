@@ -53,6 +53,8 @@ class Automation extends Component {
 
     this.state = {
       isPublishing: false,
+      isEnrolling: false,
+      enrolEmail: '',
     };
   }
 
@@ -62,6 +64,10 @@ class Automation extends Component {
 
   handleChange = event => {
     this.props.update({[event.target.id]: {$set: getvalue(event)}});
+  }
+
+  enrolEmailChange = event => {
+    this.setState({enrolEmail: event.target.value});
   }
 
   nodeChange = (index, event) => {
@@ -149,10 +155,32 @@ class Automation extends Component {
       await axios.post('/api/automations/' + this.props.id + '/publish');
       notify.show('Automation published', 'success');
       await this.props.reload();
+      await this.props.reloadExtra();
     } catch (error) {
       notify.show(errorMessage(error, 'Unable to publish automation'), 'error');
     } finally {
       this.setState({isPublishing: false});
+    }
+  }
+
+  enrolContact = async event => {
+    event.preventDefault();
+
+    const email = this.state.enrolEmail.trim();
+    if (!email) {
+      return;
+    }
+
+    this.setState({isEnrolling: true});
+    try {
+      await axios.post('/api/automations/' + this.props.id + '/enrolments', {email: email});
+      notify.show('Contact enrolled', 'success');
+      this.setState({enrolEmail: ''});
+      await this.props.reloadExtra();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to enrol contact'), 'error');
+    } finally {
+      this.setState({isEnrolling: false});
     }
   }
 
@@ -222,6 +250,88 @@ class Automation extends Component {
         />
         <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
       </div>
+    );
+  }
+
+  renderEnrolments() {
+    const data = this.props.data;
+    const enrolments = this.props.enrolments || [];
+
+    if (!data.published_at) {
+      return (
+        <EDFormBox space>
+          <h4>Enrolments</h4>
+          <p>Publish this automation before contacts can be enrolled.</p>
+        </EDFormBox>
+      );
+    }
+
+    return (
+      <EDFormBox space>
+        <div className="flex-items space-between">
+          <h4>Enrolments</h4>
+          <form className="form-inline" onSubmit={this.enrolContact}>
+            <FormControl
+              type="email"
+              value={this.state.enrolEmail}
+              onChange={this.enrolEmailChange}
+              placeholder="Existing contact email"
+              style={{width: '240px'}}
+              disabled={this.state.isEnrolling}
+            />
+            {' '}
+            <LoaderButton
+              type="submit"
+              bsStyle="primary"
+              text="Enrol Contact"
+              loadingText="Enrolling..."
+              isLoading={this.state.isEnrolling}
+              disabled={this.state.isEnrolling || !this.state.enrolEmail.trim()}
+            />
+          </form>
+        </div>
+        {
+          enrolments.length ?
+            <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
+              <thead>
+                <tr>
+                  <th>Contact</th>
+                  <th>Status</th>
+                  <th>Current Node</th>
+                  <th>Source</th>
+                  <th>Created</th>
+                </tr>
+              </thead>
+              {
+                _.map(enrolments, (enrolment, index) =>
+                  <EDTableRow key={enrolment.id} index={index}>
+                    <td>
+                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
+                    </td>
+                    <td>
+                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.status}</h4>
+                    </td>
+                    <td>
+                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.current_node_id}</h4>
+                    </td>
+                    <td>
+                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.source}</h4>
+                    </td>
+                    <td>
+                      <h4 style={{whiteSpace: 'nowrap'}}>
+                        {enrolment.created ? moment(enrolment.created).format('lll') : ''}
+                      </h4>
+                    </td>
+                  </EDTableRow>
+                )
+              }
+            </EDTable>
+          :
+            <div className="text-center space-top-sm">
+              <h4>No contacts are enrolled yet.</h4>
+            </div>
+        }
+      </EDFormBox>
     );
   }
 
@@ -333,6 +443,7 @@ class Automation extends Component {
                   </div>
               }
             </EDFormBox>
+            {this.renderEnrolments()}
           </EDFormSection>
         </LoaderPanel>
       </SaveNavbar>
@@ -357,5 +468,6 @@ export default withLoadSave({
   patch: ({id, data}) => axios.patch('/api/automations/' + id, patchPayload(data)),
   extra: {
     tags: async () => (await axios.get('/api/recenttags')).data,
+    enrolments: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments')).data,
   },
 });
