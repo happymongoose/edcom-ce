@@ -54,6 +54,7 @@ class Automation extends Component {
     this.state = {
       isPublishing: false,
       isEnrolling: false,
+      runningEnrolmentId: null,
       enrolEmail: '',
     };
   }
@@ -184,6 +185,20 @@ class Automation extends Component {
     }
   }
 
+  runNext = async enrolment => {
+    this.setState({runningEnrolmentId: enrolment.id});
+
+    try {
+      await axios.post('/api/automations/' + this.props.id + '/enrolments/' + enrolment.id + '/run-next');
+      notify.show('Automation test step ran', 'success');
+      await this.props.reloadExtra();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to run next automation step'), 'error');
+    } finally {
+      this.setState({runningEnrolmentId: null});
+    }
+  }
+
   handleSubmit = async event => {
     const isclose = this.props.formClose(event);
 
@@ -300,6 +315,7 @@ class Automation extends Component {
                   <th>Current Node</th>
                   <th>Source</th>
                   <th>Created</th>
+                  <th></th>
                 </tr>
               </thead>
               {
@@ -321,6 +337,25 @@ class Automation extends Component {
                       <h4 style={{whiteSpace: 'nowrap'}}>
                         {enrolment.created ? moment(enrolment.created).format('lll') : ''}
                       </h4>
+                    </td>
+                    <td className="last-cell" style={{minWidth: '120px'}}>
+                      {
+                        enrolment.status === 'ready' ?
+                          <Button
+                            bsSize="small"
+                            disabled={this.state.runningEnrolmentId === enrolment.id}
+                            onClick={this.runNext.bind(this, enrolment)}
+                          >
+                            {
+                              this.state.runningEnrolmentId === enrolment.id ?
+                                'Running...'
+                              :
+                                'Run next test'
+                            }
+                          </Button>
+                        :
+                          null
+                      }
                     </td>
                   </EDTableRow>
                 )
