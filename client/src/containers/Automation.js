@@ -243,23 +243,51 @@ class Automation extends Component {
     });
   }
 
+  nodeTargetChange = (index, event) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            [event.target.id]: {$set: getvalue(event)},
+          },
+        },
+      },
+    });
+  }
+
   tagData() {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
-    const draftTags = _.pluck(_.filter(nodes, node => node.type === 'add_tag' && node.draft_tag), 'draft_tag');
+    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
 
     return _.map(_.uniq(tags.concat(draftTags)), tag => ({id: tag, text: tag}));
+  }
+
+  nodeTargetOptions(node) {
+    const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
+    return _.chain(nodes)
+      .filter(target => target.id !== node.id)
+      .map(target => ({
+        id: target.id,
+        name: (target.label || this.nodeTypeLabel(target.type)) + ' (' + this.nodeTypeLabel(target.type) + ')',
+      }))
+      .value();
   }
 
   addNode = type => {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : 'Exit automation',
     };
 
     if (type === 'add_tag') {
       node.draft_tag = '';
+    }
+    if (type === 'if_has_tag') {
+      node.draft_tag = '';
+      node.yes_node_id = '';
+      node.no_node_id = '';
     }
     if (type === 'wait_duration') {
       node.duration = {
@@ -465,7 +493,7 @@ class Automation extends Component {
   }
 
   renderNodeConfig(node, index) {
-    if (node.type === 'add_tag') {
+    if (node.type === 'add_tag' || node.type === 'if_has_tag') {
       return (
         <div style={{minWidth: '220px'}}>
           <Select2
@@ -489,6 +517,29 @@ class Automation extends Component {
             }}
           />
           <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
+          {
+            node.type === 'if_has_tag' ?
+              <div className="space-top-sm">
+                <SelectLabel
+                  id="yes_node_id"
+                  label="Yes target"
+                  obj={node}
+                  onChange={this.nodeTargetChange.bind(this, index)}
+                  options={this.nodeTargetOptions(node)}
+                  emptyVal="Select target"
+                />
+                <SelectLabel
+                  id="no_node_id"
+                  label="No target"
+                  obj={node}
+                  onChange={this.nodeTargetChange.bind(this, index)}
+                  options={this.nodeTargetOptions(node)}
+                  emptyVal="Select target"
+                />
+              </div>
+            :
+              null
+          }
         </div>
       );
     }
@@ -537,6 +588,9 @@ class Automation extends Component {
     }
     if (type === 'wait_duration') {
       return 'Wait';
+    }
+    if (type === 'if_has_tag') {
+      return 'If has tag';
     }
     return 'Exit';
   }
@@ -840,6 +894,8 @@ class Automation extends Component {
                   <Button onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</Button>
                   {' '}
                   <Button onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</Button>
+                  {' '}
+                  <Button onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</Button>
                   {' '}
                   <Button onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</Button>
                 </div>

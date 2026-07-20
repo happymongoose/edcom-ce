@@ -88,6 +88,37 @@ WAIT_DURATION_NODE_SCHEMA = {
 }
 
 
+IF_HAS_TAG_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "draft_tag", "yes_node_id", "no_node_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["if_has_tag"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "draft_tag": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "yes_node_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+        "no_node_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 EXIT_NODE_SCHEMA = {
     "type": "object",
     "required": ["id", "type", "label"],
@@ -136,6 +167,7 @@ DRAFT_SCHEMA = {
                 "oneOf": [
                     ADD_TAG_NODE_SCHEMA,
                     WAIT_DURATION_NODE_SCHEMA,
+                    IF_HAS_TAG_NODE_SCHEMA,
                     EXIT_NODE_SCHEMA,
                 ],
             },
@@ -290,6 +322,7 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
     nodes = draft.get("nodes") or []
     if not nodes:
         _validation_error("Automation draft must contain at least one node.")
+    node_ids = {node.get("id") for node in nodes}
     for node in nodes:
         if not node.get("id"):
             _validation_error("Every automation node must have a stable ID.")
@@ -297,6 +330,19 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
             _validation_error("Every automation node must have a label.")
         if node.get("type") == "add_tag" and not node.get("draft_tag"):
             _validation_error("Add tag nodes must have draft tag configuration.")
+        if node.get("type") == "if_has_tag":
+            if not node.get("draft_tag"):
+                _validation_error("If has tag nodes must have draft tag configuration.")
+            if not node.get("yes_node_id"):
+                _validation_error("If has tag nodes must have a yes target.")
+            if not node.get("no_node_id"):
+                _validation_error("If has tag nodes must have a no target.")
+            if node.get("yes_node_id") not in node_ids:
+                _validation_error("If has tag yes target must exist in the draft workflow.")
+            if node.get("no_node_id") not in node_ids:
+                _validation_error("If has tag no target must exist in the draft workflow.")
+            if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
+                _validation_error("If has tag nodes cannot target themselves.")
         if node.get("type") == "wait_duration":
             total_minutes = _duration_minutes(node.get("duration", {}))
             if total_minutes < 5:
@@ -924,6 +970,11 @@ class AutomationEnrolmentRunNext(object):
 
         node = nodes[node_index]
         node_type = node.get("type")
+        if node_type == "if_has_tag":
+            raise falcon.HTTPBadRequest(
+                title="Unsupported automation node",
+                description="if_has_tag condition nodes cannot be executed manually yet.",
+            )
         if node_type not in ("add_tag", "wait_duration", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",

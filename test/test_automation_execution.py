@@ -77,6 +77,42 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         ).json
 
+    def create_condition_automation(self):
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_condition_%s" % suffix},
+        )
+        nodes = [
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add branch tag",
+                "draft_tag": "branch-tag",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        return self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
     def enrol(self, automation_id, email):
         result = self.simulate_post(
             "/api/automations/%s/enrolments" % automation_id,
@@ -311,6 +347,17 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertTrue(self.has_tag(contact_id, "published-execution-tag"))
         self.assertFalse(self.has_tag(contact_id, "draft-only-tag"))
         self.assertEqual(result.json["step_run"]["tag"], "published-execution-tag")
+
+        self.cleanup(automation["id"])
+
+    def test_run_next_on_if_has_tag_returns_unsupported_node(self):
+        email, _ = self.create_contact()
+        automation = self.create_condition_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("if_has_tag condition nodes cannot be executed manually yet", result.text)
 
         self.cleanup(automation["id"])
 

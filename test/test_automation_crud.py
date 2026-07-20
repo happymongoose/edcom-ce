@@ -79,6 +79,38 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         }
 
+    def condition_workflow(self, condition=None):
+        if condition is None:
+            condition = {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            }
+        return {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": [
+                    condition,
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add tagged branch",
+                        "draft_tag": "tagged-branch",
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
     def user_publish(self, automation_id):
         result = self.simulate_post(
             "/api/automations/%s/publish" % automation_id,
@@ -581,6 +613,118 @@ class TestAutomationCRUD(test_base.TestBase):
                     "seconds": 1,
                 }
             ),
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_valid_condition_node_publishes(self):
+        created = self.user_post("/api/automations", json={"name": "Condition"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.condition_workflow())
+        published = self.user_publish(automation_id)
+
+        condition = published["published"]["nodes"][0]
+        self.assertEqual(condition["type"], "if_has_tag")
+        self.assertEqual(condition["draft_tag"], "vip")
+        self.assertEqual(condition["yes_node_id"], "node_add_tag_1")
+        self.assertEqual(condition["no_node_id"], "node_exit_1")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def assert_condition_publish_fails(self, condition, message):
+        created = self.user_post("/api/automations", json={"name": "Invalid Condition"})
+        automation_id = created["id"]
+        self.user_patch("/api/automations/%s" % automation_id, json=self.condition_workflow(condition))
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(message, result.text)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_condition_missing_tag_fails_publish_validation(self):
+        condition = {
+            "id": "node_condition_1",
+            "type": "if_has_tag",
+            "label": "If contact has tag",
+            "draft_tag": "",
+            "yes_node_id": "node_add_tag_1",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_condition_publish_fails(condition, "draft tag")
+
+    def test_condition_missing_yes_or_no_target_fails_publish_validation(self):
+        missing_yes = {
+            "id": "node_condition_1",
+            "type": "if_has_tag",
+            "label": "If contact has tag",
+            "draft_tag": "vip",
+            "yes_node_id": "",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_condition_publish_fails(missing_yes, "yes target")
+
+        missing_no = {
+            "id": "node_condition_1",
+            "type": "if_has_tag",
+            "label": "If contact has tag",
+            "draft_tag": "vip",
+            "yes_node_id": "node_add_tag_1",
+            "no_node_id": "",
+        }
+        self.assert_condition_publish_fails(missing_no, "no target")
+
+    def test_condition_target_id_not_found_fails_publish_validation(self):
+        condition = {
+            "id": "node_condition_1",
+            "type": "if_has_tag",
+            "label": "If contact has tag",
+            "draft_tag": "vip",
+            "yes_node_id": "missing_node",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_condition_publish_fails(condition, "yes target")
+
+    def test_condition_self_target_fails_publish_validation(self):
+        condition = {
+            "id": "node_condition_1",
+            "type": "if_has_tag",
+            "label": "If contact has tag",
+            "draft_tag": "vip",
+            "yes_node_id": "node_condition_1",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_condition_publish_fails(condition, "cannot target themselves")
+
+    def test_condition_extra_fields_fail_schema_validation(self):
+        created = self.user_post("/api/automations", json={"name": "Extra Condition Field"})
+        automation_id = created["id"]
+        condition = {
+            "id": "node_condition_1",
+            "type": "if_has_tag",
+            "label": "If contact has tag",
+            "draft_tag": "vip",
+            "yes_node_id": "node_add_tag_1",
+            "no_node_id": "node_exit_1",
+            "extra": True,
+        }
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.condition_workflow(condition),
             headers={
                 "X-Auth-UID": self.user_cookie["uid"],
                 "X-Auth-Cookie": self.user_cookie["id"],
