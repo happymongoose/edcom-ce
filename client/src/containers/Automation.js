@@ -266,10 +266,16 @@ class Automation extends Component {
   nodeTargetOptions(node) {
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
     return _.chain(nodes)
-      .filter(target => target.id !== node.id)
-      .map(target => ({
-        id: target.id,
-        name: (target.label || this.nodeTypeLabel(target.type)) + ' (' + this.nodeTypeLabel(target.type) + ')',
+      .map((target, index) => ({
+        target: target,
+        step: index + 1,
+      }))
+      .filter(option => option.target.id !== node.id)
+      .map(option => ({
+        id: option.target.id,
+        name: 'Step ' + option.step + ' - ' +
+          (option.target.label || this.nodeTypeLabel(option.target.type)) +
+          ' (' + this.nodeTypeLabel(option.target.type) + ')',
       }))
       .value();
   }
