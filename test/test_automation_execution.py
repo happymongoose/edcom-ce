@@ -113,6 +113,31 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         ).json
 
+    def create_no_exit_automation(self, tag="implicit-completion-tag"):
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_no_exit_%s" % suffix},
+        )
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(
+                tag=tag,
+                nodes=[
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add final tag",
+                        "draft_tag": tag,
+                    },
+                ],
+            ),
+        )
+        return self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
     def enrol(self, automation_id, email):
         result = self.simulate_post(
             "/api/automations/%s/enrolments" % automation_id,
@@ -214,6 +239,23 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertTrue(self.has_tag(contact_id, "existing-execution-tag"))
         self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
         self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_linear_automation_without_explicit_exit_completes_at_end(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_no_exit_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(self.has_tag(contact_id, "implicit-completion-tag"))
+        self.assertEqual(result.json["enrolment"]["status"], "completed")
+        self.assertEqual(result.json["step_run"]["node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "add_tag")
+
+        again = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(again.status_code, 400)
 
         self.cleanup(automation["id"])
 

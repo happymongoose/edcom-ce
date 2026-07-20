@@ -349,9 +349,6 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
                 _validation_error("Wait duration nodes must wait at least 5 minutes.")
             if total_minutes > 365 * 24 * 60:
                 _validation_error("Wait duration nodes cannot wait more than 365 days.")
-    if not any(node.get("type") == "exit" for node in nodes):
-        _validation_error("Automation draft must contain an exit node.")
-
     return {
         "entry": copy.deepcopy(entry),
         "reentry": reentry,
