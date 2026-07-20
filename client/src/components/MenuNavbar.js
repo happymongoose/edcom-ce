@@ -31,6 +31,7 @@ import FrontendNavigationCCIcon from '-!svg-react-loader!../svg/menu-icons/front
 import FrontendNavigationIntegrateIcon from '-!svg-react-loader!../svg/menu-icons/frontend-navigation-integrate.svg';
 import FrontendDropdownMenuBroadcastsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-broadcasts.svg';
 import FrontendDropdownMenuFunnelsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-funnels.svg';
+import FrontendDropdownMenuAutomationsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-automations.svg';
 import FrontendDropdownMenuTransactionalIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-transactional.svg';
 import FrontendDropdownMenuContactsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-contacts.svg';
 import FrontendDropdownMenuSegmentsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-segments.svg';
@@ -365,6 +366,10 @@ export default class MenuNavbar extends Component {
                         <RouteNavItem href="/funnels">
                           <FrontendDropdownMenuFunnelsIcon className="dropdown-icon"/>
                           Funnels
+                        </RouteNavItem>
+                        <RouteNavItem href="/automations">
+                          <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                          Automations
                         </RouteNavItem>
                         <RouteNavItem href="/transactional">
                           <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
