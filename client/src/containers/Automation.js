@@ -55,6 +55,7 @@ class Automation extends Component {
       isPublishing: false,
       isEnrolling: false,
       runningEnrolmentId: null,
+      reenrollingEnrolmentId: null,
       enrolEmail: '',
     };
   }
@@ -199,6 +200,25 @@ class Automation extends Component {
     }
   }
 
+  reEnrolContact = async enrolment => {
+    this.setState({reenrollingEnrolmentId: enrolment.id});
+
+    try {
+      await axios.post('/api/automations/' + this.props.id + '/enrolments', {email: enrolment.contact_email});
+      notify.show('Automation test restarted', 'success');
+      await this.props.reloadExtra();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to restart automation test'), 'error');
+    } finally {
+      this.setState({reenrollingEnrolmentId: null});
+    }
+  }
+
+  canReEnrol() {
+    const published = this.props.data.published || {};
+    return published.reentry === 'multiple';
+  }
+
   handleSubmit = async event => {
     const isclose = this.props.formClose(event);
 
@@ -222,13 +242,13 @@ class Automation extends Component {
         {' '}
         <LoaderButton
           id="automation-buttons-dropdown"
-          text="Save and Close"
+          text="Save"
           loadingText="Saving..."
           className="green"
           disabled={this.props.isSaving || this.state.isPublishing}
-          onClick={this.props.formSubmit.bind(null, true)}
+          onClick={this.props.formSubmit}
           splitItems={[
-            { text: 'Save', onClick: this.props.formSubmit },
+            { text: 'Save and Close', onClick: this.props.formSubmit.bind(null, true) },
             { text: 'Cancel', onClick: this.goBack }
           ]}
         />
@@ -353,6 +373,20 @@ class Automation extends Component {
                                 'Run next test'
                             }
                           </Button>
+                        :
+                          this.canReEnrol() ?
+                            <Button
+                              bsSize="small"
+                              disabled={this.state.reenrollingEnrolmentId === enrolment.id}
+                              onClick={this.reEnrolContact.bind(this, enrolment)}
+                            >
+                              {
+                                this.state.reenrollingEnrolmentId === enrolment.id ?
+                                  'Starting...'
+                                :
+                                  'Run test again'
+                              }
+                            </Button>
                         :
                           null
                       }
