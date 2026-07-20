@@ -219,6 +219,21 @@ class Automation extends Component {
     return published.reentry === 'multiple';
   }
 
+  displayEnrolments(enrolments) {
+    return _.chain(enrolments)
+      .groupBy(enrolment => enrolment.contact_id || enrolment.contact_email)
+      .map(group => {
+        const ready = _.filter(group, enrolment => enrolment.status === 'ready');
+        if (ready.length) {
+          return _.max(ready, enrolment => moment(enrolment.created || 0).valueOf());
+        }
+
+        return _.max(group, enrolment => moment(enrolment.created || 0).valueOf());
+      })
+      .sortBy(enrolment => moment(enrolment.created || 0).valueOf())
+      .value();
+  }
+
   handleSubmit = async event => {
     const isclose = this.props.formClose(event);
 
@@ -291,6 +306,7 @@ class Automation extends Component {
   renderEnrolments() {
     const data = this.props.data;
     const enrolments = this.props.enrolments || [];
+    const displayEnrolments = this.displayEnrolments(enrolments);
 
     if (!data.published_at) {
       return (
@@ -326,7 +342,7 @@ class Automation extends Component {
           </form>
         </div>
         {
-          enrolments.length ?
+          displayEnrolments.length ?
             <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
               <thead>
                 <tr>
@@ -339,7 +355,7 @@ class Automation extends Component {
                 </tr>
               </thead>
               {
-                _.map(enrolments, (enrolment, index) =>
+                _.map(displayEnrolments, (enrolment, index) =>
                   <EDTableRow key={enrolment.id} index={index}>
                     <td>
                       <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
