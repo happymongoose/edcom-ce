@@ -219,3 +219,42 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(enrolments[0]["automation_id"], automation["id"])
 
         self.cleanup(automation["id"], other_automation["id"])
+
+    def test_listing_enrolments_excludes_deleted_recreated_contacts(self):
+        email, contact_id, lst = self.create_contact()
+        automation = self.create_automation()
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+
+        self.db.execute(
+            f"""delete from contacts."contacts_{self.user_cookie['cid']}" where contact_id = %s""",
+            contact_id,
+        )
+        self.user_post(
+            "/api/lists/%s/feed" % lst,
+            json={
+                "email": email,
+                "data": {
+                    "First Name": "Automation",
+                },
+            },
+        )
+        new_contact_id = self.db.single(
+            f"""select contact_id from contacts."contacts_{self.user_cookie['cid']}" where email = %s""",
+            email,
+        )
+        self.assertNotEqual(contact_id, new_contact_id)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(enrolments, [])
+
+        second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 201)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(len(enrolments), 1)
+        self.assertEqual(enrolments[0]["id"], second.json["id"])
+        self.assertEqual(enrolments[0]["contact_id"], new_contact_id)
+
+        self.cleanup(automation["id"])

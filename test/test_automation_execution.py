@@ -243,6 +243,21 @@ class TestAutomationExecution(test_base.TestBase):
         )
         self.cleanup(automation["id"])
 
+    def test_execution_for_deleted_contact_is_blocked(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        self.db.execute(
+            f"""delete from contacts."contacts_{self.user_cookie['cid']}" where contact_id = %s""",
+            contact_id,
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 403)
+
+        self.cleanup(automation["id"])
+
     def test_step_run_history_is_recorded(self):
         email, contact_id = self.create_contact()
         automation = self.create_automation(tag="history-tag")

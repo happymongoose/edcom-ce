@@ -359,19 +359,21 @@ class AutomationEnrolments(object):
         check_noadmin(req)
 
         db = req.context["db"]
+        cid = db.get_cid()
         if db.automations.get(id) is None:
             raise falcon.HTTPForbidden()
 
         req.context["result"] = [
             _enrolment_obj(row)
             for row in db.execute(
-                """
-                select id, cid, automation_id, contact_id, contact_email, data
-                from automation_enrolments
-                where cid = %s and automation_id = %s
-                order by data->>'created', id
+                f"""
+                select e.id, e.cid, e.automation_id, e.contact_id, e.contact_email, e.data
+                from automation_enrolments e
+                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+                where e.cid = %s and e.automation_id = %s
+                order by e.data->>'created', e.id
                 """,
-                db.get_cid(),
+                cid,
                 id,
             )
         ]
@@ -501,10 +503,11 @@ class AutomationEnrolmentRunNext(object):
 
         enrolment = _enrolment_obj(
             db.row(
-                """
-                select id, cid, automation_id, contact_id, contact_email, data
-                from automation_enrolments
-                where cid = %s and automation_id = %s and id = %s
+                f"""
+                select e.id, e.cid, e.automation_id, e.contact_id, e.contact_email, e.data
+                from automation_enrolments e
+                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+                where e.cid = %s and e.automation_id = %s and e.id = %s
                 """,
                 cid,
                 id,
