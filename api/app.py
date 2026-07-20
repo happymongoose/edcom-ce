@@ -3791,6 +3791,10 @@ app.add_route("/api/automations", automations.Automations())
 app.add_route("/api/automations/{id}", automations.Automation())
 app.add_route("/api/automations/{id}/publish", automations.AutomationPublish())
 app.add_route("/api/automations/{id}/enrolments", automations.AutomationEnrolments())
+app.add_route(
+    "/api/automations/{id}/enrolments/{enrolment_id}/run-next",
+    automations.AutomationEnrolmentRunNext(),
+)
 app.add_route("/api/messages", funnels.Messages())
 app.add_route("/api/messages/{id}", funnels.Message())
 app.add_route("/api/messages/{id}/duplicate", funnels.MessageDuplicate())

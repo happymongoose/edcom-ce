@@ -5,6 +5,7 @@ from datetime import datetime
 from jsonschema import validate
 
 from .shared import config as _  # noqa: F401
+from .shared import contacts
 from .shared.crud import (
     CRUDCollection,
     CRUDSingle,
@@ -245,6 +246,21 @@ def _enrolment_obj(row) -> JsonObj | None:
     return data
 
 
+def _step_run_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+
+    id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data = row
+    data["id"] = id
+    data["cid"] = cid
+    data["automation_id"] = automation_id
+    data["enrolment_id"] = enrolment_id
+    data["contact_id"] = contact_id
+    data["node_id"] = node_id
+    data["node_type"] = node_type
+    return data
+
+
 class Automations(CRUDCollection):
 
     def __init__(self) -> None:
@@ -464,3 +480,187 @@ class AutomationEnrolments(object):
                 enrolment_id,
             )
         )
+
+
+class AutomationEnrolmentRunNext(object):
+
+    def on_post(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        enrolment_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+
+        enrolment = _enrolment_obj(
+            db.row(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from automation_enrolments
+                where cid = %s and automation_id = %s and id = %s
+                """,
+                cid,
+                id,
+                enrolment_id,
+            )
+        )
+        if enrolment is None:
+            raise falcon.HTTPForbidden()
+
+        if enrolment.get("status") != "ready":
+            raise falcon.HTTPBadRequest(
+                title="Enrolment is not ready",
+                description="Only ready enrolments can run the next automation node.",
+            )
+
+        published = automation.get("published")
+        if not published:
+            raise falcon.HTTPBadRequest(
+                title="Automation is not published",
+                description="Automation execution uses the published workflow snapshot.",
+            )
+
+        nodes = published.get("nodes") or []
+        current_node_id = enrolment.get("current_node_id")
+        node_index = None
+        for i, node in enumerate(nodes):
+            if node.get("id") == current_node_id:
+                node_index = i
+                break
+
+        if node_index is None:
+            raise falcon.HTTPBadRequest(
+                title="Current automation node is missing",
+                description="The enrolment current_node_id was not found in the published workflow.",
+            )
+
+        node = nodes[node_index]
+        node_type = node.get("type")
+        if node_type not in ("add_tag", "exit"):
+            raise falcon.HTTPBadRequest(
+                title="Unsupported automation node",
+                description="Only add_tag and exit nodes can be executed manually.",
+            )
+
+        now = _utc_now()
+        run_id = shortuuid.uuid()
+        run_data = {
+            "status": "succeeded",
+            "node_label": node.get("label"),
+            "published_revision": automation.get("published_revision"),
+            "created": now,
+        }
+
+        if node_type == "add_tag":
+            tag = node.get("draft_tag")
+            if not tag:
+                raise falcon.HTTPBadRequest(
+                    title="Add tag node is missing tag configuration",
+                    description="The published add_tag node does not include a tag.",
+                )
+
+            db.execute(
+                """insert into alltags (cid, tag, added, count) values (%s, %s, now(), 0)
+                on conflict (cid, tag) do nothing""",
+                cid,
+                tag,
+            )
+            tagcounts = {}
+            contacts.add_tag(
+                db,
+                cid,
+                enrolment["contact_email"],
+                enrolment["contact_id"],
+                tag,
+                None,
+                {},
+                tagcounts,
+                [],
+            )
+            for tagname, cnt in tagcounts.items():
+                db.execute(
+                    "update alltags set count = count + %s where cid = %s and tag = %s",
+                    cnt,
+                    cid,
+                    tagname,
+                )
+
+            run_data["tag"] = tag
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        else:
+            enrolment_update = {
+                "status": "exited",
+                "modified": now,
+            }
+
+        db.execute(
+            """
+            insert into automation_step_runs
+                (id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            run_id,
+            cid,
+            id,
+            enrolment_id,
+            enrolment["contact_id"],
+            current_node_id,
+            node_type,
+            run_data,
+        )
+
+        db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            enrolment_update,
+            cid,
+            id,
+            enrolment_id,
+        )
+
+        req.context["result"] = {
+            "enrolment": _enrolment_obj(
+                db.row(
+                    """
+                    select id, cid, automation_id, contact_id, contact_email, data
+                    from automation_enrolments
+                    where cid = %s and automation_id = %s and id = %s
+                    """,
+                    cid,
+                    id,
+                    enrolment_id,
+                )
+            ),
+            "step_run": _step_run_obj(
+                db.row(
+                    """
+                    select id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data
+                    from automation_step_runs
+                    where cid = %s and id = %s
+                    """,
+                    cid,
+                    run_id,
+                )
+            ),
+        }
