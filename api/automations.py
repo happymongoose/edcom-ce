@@ -1,5 +1,6 @@
 import falcon
 import copy
+import shortuuid
 from datetime import datetime
 from jsonschema import validate
 
@@ -11,6 +12,7 @@ from .shared.crud import (
 )
 from .shared.db import DB, JsonObj
 from .shared.utils import user_log
+from .shared.utils import emailre
 
 
 NODE_ID_SCHEMA = {
@@ -137,6 +139,19 @@ AUTOMATION_PATCH_SCHEMA = {
 }
 
 
+AUTOMATION_ENROLMENT_SCHEMA = {
+    "type": "object",
+    "required": ["email"],
+    "properties": {
+        "email": {
+            "type": "string",
+            "minLength": 1,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 def _validate_doc(doc: JsonObj, schema: JsonObj) -> None:
     try:
         validate(doc, schema)
@@ -215,6 +230,19 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
         "reentry": reentry,
         "nodes": copy.deepcopy(nodes),
     }
+
+
+def _enrolment_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+
+    id, cid, automation_id, contact_id, contact_email, data = row
+    data["id"] = id
+    data["cid"] = cid
+    data["automation_id"] = automation_id
+    data["contact_id"] = contact_id
+    data["contact_email"] = contact_email
+    return data
 
 
 class Automations(CRUDCollection):
@@ -307,3 +335,132 @@ class AutomationPublish(object):
         user_log(req, "pencil", "published automation ", "automations", id, ".")
 
         req.context["result"] = db.automations.get(id)
+
+
+class AutomationEnrolments(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        if db.automations.get(id) is None:
+            raise falcon.HTTPForbidden()
+
+        req.context["result"] = [
+            _enrolment_obj(row)
+            for row in db.execute(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from automation_enrolments
+                where cid = %s and automation_id = %s
+                order by data->>'created', id
+                """,
+                db.get_cid(),
+                id,
+            )
+        ]
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc")
+        if not doc:
+            raise falcon.HTTPBadRequest(
+                title="Not JSON", description="A valid JSON document is required."
+            )
+        _validate_doc(doc, AUTOMATION_ENROLMENT_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+
+        published = automation.get("published")
+        if not published:
+            raise falcon.HTTPBadRequest(
+                title="Automation is not published",
+                description="Publish the automation before enrolling contacts.",
+            )
+
+        nodes = published.get("nodes") or []
+        if not nodes:
+            raise falcon.HTTPBadRequest(
+                title="Automation has no published nodes",
+                description="Publish a workflow with at least one node before enrolling contacts.",
+            )
+
+        email = doc["email"].strip().lower()
+        match = emailre.search(email)
+        if not match:
+            raise falcon.HTTPBadRequest(
+                title="Invalid email", description="That email address is invalid"
+            )
+        email = match.group(0)
+
+        contact = db.row(
+            f"""select contact_id, email from contacts."contacts_{cid}" where email = %s""",
+            email,
+        )
+        if contact is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found",
+                description="Contact must exist before it can be enrolled.",
+            )
+        contact_id, contact_email = contact
+
+        reentry = published.get("reentry", automation.get("reentry", "once"))
+        _validate_doc(reentry, REENTRY_SCHEMA)
+        if reentry == "once" and db.single(
+            """
+            select id
+            from automation_enrolments
+            where cid = %s and automation_id = %s and contact_id = %s
+            limit 1
+            """,
+            cid,
+            id,
+            contact_id,
+        ):
+            raise falcon.HTTPBadRequest(
+                title="Contact already enrolled",
+                description="This automation only allows a contact to enter once.",
+            )
+
+        now = _utc_now()
+        enrolment_id = shortuuid.uuid()
+        data = {
+            "status": "ready",
+            "source": "manual",
+            "current_node_id": nodes[0]["id"],
+            "published_revision": automation.get("published_revision"),
+            "created": now,
+            "modified": now,
+        }
+
+        db.execute(
+            """
+            insert into automation_enrolments
+                (id, cid, automation_id, contact_id, contact_email, data)
+            values (%s, %s, %s, %s, %s, %s)
+            """,
+            enrolment_id,
+            cid,
+            id,
+            contact_id,
+            contact_email,
+            data,
+        )
+
+        resp.status = falcon.HTTP_201
+        req.context["result"] = _enrolment_obj(
+            db.row(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from automation_enrolments
+                where cid = %s and id = %s
+                """,
+                cid,
+                enrolment_id,
+            )
+        )
