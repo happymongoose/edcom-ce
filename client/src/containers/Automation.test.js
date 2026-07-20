@@ -161,4 +161,48 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('skipped=true');
     expect(log).toContain('status=waiting');
   });
+
+  it('includes branch and go to metadata in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_condition_1',
+          node_type: 'if_has_tag',
+          node_label: 'Check VIP tag',
+          action: 'branch',
+          tag: 'vip',
+          result: true,
+          branch: 'yes',
+          target_node_id: 'node_yes_1',
+          status: 'succeeded',
+          published_revision: 3,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:01:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_go_to_1',
+          node_type: 'go_to',
+          node_label: 'Go to shared step',
+          action: 'go_to',
+          target_node_id: 'node_shared_1',
+          status: 'succeeded',
+          published_revision: 3,
+        },
+      ],
+    });
+
+    expect(log).toContain('action=branch');
+    expect(log).toContain('tag=vip');
+    expect(log).toContain('result=true');
+    expect(log).toContain('branch=yes');
+    expect(log).toContain('target=node_yes_1');
+    expect(log).toContain('action=go_to');
+    expect(log).toContain('target=node_shared_1');
+  });
 });

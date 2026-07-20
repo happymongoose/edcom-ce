@@ -118,6 +118,15 @@ export function automationHistoryLog(history) {
       if (event.skipped) {
         parts.push('skipped=true');
       }
+      if (event.result !== undefined && event.result !== null) {
+        parts.push('result=' + event.result);
+      }
+      if (event.branch) {
+        parts.push('branch=' + event.branch);
+      }
+      if (event.target_node_id) {
+        parts.push('target=' + event.target_node_id);
+      }
       parts.push('status=' + (event.status || ''));
       if (event.error) {
         parts.push('error=' + event.error);

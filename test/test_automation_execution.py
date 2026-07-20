@@ -62,7 +62,7 @@ class TestAutomationExecution(test_base.TestBase):
             doc["reentry"] = reentry
         return doc
 
-    def create_automation(self, tag="onboarding", reentry=None):
+    def create_automation(self, tag="onboarding", reentry=None, nodes=None):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -70,7 +70,7 @@ class TestAutomationExecution(test_base.TestBase):
         )
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(tag=tag, reentry=reentry),
+            json=self.workflow(tag=tag, nodes=nodes, reentry=reentry),
         )
         return self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
@@ -420,25 +420,176 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_run_next_on_if_has_tag_returns_unsupported_node(self):
+    def test_if_has_tag_true_branch_moves_to_yes_target(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_condition_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            f"""insert into contacts."contact_values_{self.user_cookie['cid']}"
+            (contact_id, type, value) values (%s, 'tag', %s)
+            on conflict (contact_id, type, value) do nothing""",
+            contact_id,
+            "vip",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertFalse(self.has_tag(contact_id, "branch-tag"))
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["node_id"], "node_condition_1")
+        self.assertEqual(step_run["node_type"], "if_has_tag")
+        self.assertEqual(step_run["node_label"], "If contact has tag")
+        self.assertEqual(step_run["tag"], "vip")
+        self.assertEqual(step_run["result"], True)
+        self.assertEqual(step_run["branch"], "yes")
+        self.assertEqual(step_run["target_node_id"], "node_add_tag_1")
+        self.assertEqual(step_run["published_revision"], automation["published_revision"])
+        self.assertEqual(step_run["status"], "succeeded")
+        history = self.user_get("/api/automations/%s/history" % automation["id"])
+        step_events = [event for event in history["events"] if event["type"] == "step_run"]
+        self.assertEqual(step_events[0]["result"], True)
+        self.assertEqual(step_events[0]["branch"], "yes")
+        self.assertEqual(step_events[0]["target_node_id"], "node_add_tag_1")
+
+        self.cleanup(automation["id"])
+
+    def test_if_has_tag_false_branch_moves_to_no_target(self):
         email, _ = self.create_contact()
         automation = self.create_condition_automation()
         enrolment = self.enrol(automation["id"], email)
 
         result = self.run_next(automation["id"], enrolment["id"])
-        self.assertEqual(result.status_code, 400)
-        self.assertIn("if_has_tag condition nodes cannot be executed manually yet", result.text)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["node_type"], "if_has_tag")
+        self.assertEqual(step_run["tag"], "vip")
+        self.assertEqual(step_run["result"], False)
+        self.assertEqual(step_run["branch"], "no")
+        self.assertEqual(step_run["target_node_id"], "node_exit_1")
 
         self.cleanup(automation["id"])
 
-    def test_run_next_on_go_to_returns_unsupported_node(self):
+    def test_if_has_tag_target_missing_is_rejected_clearly(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_condition_automation()
+        published = automation["published"].copy()
+        published["nodes"] = [
+            node for node in published["nodes"] if node["id"] != "node_add_tag_1"
+        ]
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation["id"], {"published": published})
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            f"""insert into contacts."contact_values_{self.user_cookie['cid']}"
+            (contact_id, type, value) values (%s, 'tag', %s)
+            on conflict (contact_id, type, value) do nothing""",
+            contact_id,
+            "vip",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("if_has_tag yes target was not found", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_go_to_moves_to_target_without_executing_it(self):
         email, _ = self.create_contact()
         automation = self.create_go_to_automation()
         enrolment = self.enrol(automation["id"], email)
 
         result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["node_id"], "node_go_to_1")
+        self.assertEqual(step_run["node_type"], "go_to")
+        self.assertEqual(step_run["node_label"], "Go to exit")
+        self.assertEqual(step_run["target_node_id"], "node_exit_1")
+        self.assertEqual(step_run["published_revision"], automation["published_revision"])
+        self.assertEqual(step_run["status"], "succeeded")
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+        history = self.user_get("/api/automations/%s/history" % automation["id"])
+        step_events = [event for event in history["events"] if event["type"] == "step_run"]
+        self.assertEqual(step_events[0]["target_node_id"], "node_exit_1")
+
+        second = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json["enrolment"]["status"], "exited")
+
+        self.cleanup(automation["id"])
+
+    def test_go_to_target_missing_is_rejected_clearly(self):
+        email, _ = self.create_contact()
+        automation = self.create_go_to_automation()
+        published = automation["published"].copy()
+        published["nodes"] = [
+            node for node in published["nodes"] if node["id"] != "node_exit_1"
+        ]
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation["id"], {"published": published})
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
-        self.assertIn("go_to nodes cannot be executed manually yet", result.text)
+        self.assertIn("go_to target was not found", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_tag_added_by_automation_is_detected_by_later_condition(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add detected tag",
+                    "draft_tag": "detected-tag",
+                },
+                {
+                    "id": "node_condition_1",
+                    "type": "if_has_tag",
+                    "label": "Check detected tag",
+                    "draft_tag": "detected-tag",
+                    "yes_node_id": "node_exit_1",
+                    "no_node_id": "node_no_branch_1",
+                },
+                {
+                    "id": "node_no_branch_1",
+                    "type": "add_tag",
+                    "label": "Add no branch tag",
+                    "draft_tag": "no-branch",
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        first = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(self.has_tag(contact_id, "detected-tag"))
+        self.assertEqual(first.json["enrolment"]["current_node_id"], "node_condition_1")
+
+        second = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(second.json["step_run"]["node_type"], "if_has_tag")
+        self.assertEqual(second.json["step_run"]["result"], True)
+        self.assertEqual(second.json["step_run"]["branch"], "yes")
+        self.assertEqual(second.json["step_run"]["target_node_id"], "node_exit_1")
+        self.assertFalse(self.has_tag(contact_id, "no-branch"))
 
         self.cleanup(automation["id"])
 

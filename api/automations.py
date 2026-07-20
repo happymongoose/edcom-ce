@@ -324,6 +324,26 @@ def _remaining_seconds(wake_at: str | None, now: datetime) -> int:
     return max(0, int((_parse_datetime(wake_at) - now).total_seconds()))
 
 
+def _node_by_id(nodes: list[JsonObj], node_id: str | None) -> JsonObj | None:
+    for node in nodes:
+        if node.get("id") == node_id:
+            return node
+    return None
+
+
+def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
+    return bool(
+        db.single(
+            f"""select contact_id
+            from contacts."contact_values_{cid}"
+            where contact_id = %s and type = 'tag' and value = %s
+            limit 1""",
+            contact_id,
+            tag,
+        )
+    )
+
+
 def _published_snapshot(automation: JsonObj) -> JsonObj:
     if not automation.get("name") or not automation.get("name").strip():
         _validation_error("Automation must have a name before publishing.")
@@ -918,6 +938,9 @@ class AutomationHistory(object):
                     "wake_at": step_run.get("wake_at"),
                     "action": step_run.get("action"),
                     "skipped": step_run.get("skipped"),
+                    "result": step_run.get("result"),
+                    "branch": step_run.get("branch"),
+                    "target_node_id": step_run.get("target_node_id"),
                     "published_revision": step_run.get("published_revision"),
                     "status": step_run.get("status"),
                     "error": step_run.get("error"),
@@ -1002,20 +1025,10 @@ class AutomationEnrolmentRunNext(object):
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type == "if_has_tag":
+        if node_type not in ("add_tag", "wait_duration", "if_has_tag", "go_to", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
-                description="if_has_tag condition nodes cannot be executed manually yet.",
-            )
-        if node_type == "go_to":
-            raise falcon.HTTPBadRequest(
-                title="Unsupported automation node",
-                description="go_to nodes cannot be executed manually yet.",
-            )
-        if node_type not in ("add_tag", "wait_duration", "exit"):
-            raise falcon.HTTPBadRequest(
-                title="Unsupported automation node",
-                description="Only add_tag, wait_duration and exit nodes can be executed manually.",
+                description="Only add_tag, wait_duration, if_has_tag, go_to and exit nodes can be executed manually.",
             )
 
         status = enrolment.get("status")
@@ -1152,6 +1165,56 @@ class AutomationEnrolmentRunNext(object):
                     "wake_at": wake_at,
                     "published_revision": automation.get("published_revision"),
                 },
+                "modified": now,
+            }
+        elif node_type == "if_has_tag":
+            tag = node.get("draft_tag")
+            if not tag:
+                raise falcon.HTTPBadRequest(
+                    title="If has tag node is missing tag configuration",
+                    description="The published if_has_tag node does not include a tag.",
+                )
+
+            result = _contact_has_tag(db, cid, enrolment["contact_id"], tag)
+            branch = "yes" if result else "no"
+            target_node_id = node.get("yes_node_id") if result else node.get("no_node_id")
+            if _node_by_id(nodes, target_node_id) is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation branch target is missing",
+                    description="The published if_has_tag %s target was not found in the published workflow." % branch,
+                )
+
+            run_data.update(
+                {
+                    "action": "branch",
+                    "tag": tag,
+                    "result": result,
+                    "branch": branch,
+                    "target_node_id": target_node_id,
+                }
+            )
+            enrolment_update = {
+                "status": "ready",
+                "current_node_id": target_node_id,
+                "modified": now,
+            }
+        elif node_type == "go_to":
+            target_node_id = node.get("target_node_id")
+            if _node_by_id(nodes, target_node_id) is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation go to target is missing",
+                    description="The published go_to target was not found in the published workflow.",
+                )
+
+            run_data.update(
+                {
+                    "action": "go_to",
+                    "target_node_id": target_node_id,
+                }
+            )
+            enrolment_update = {
+                "status": "ready",
+                "current_node_id": target_node_id,
                 "modified": now,
             }
         else:
