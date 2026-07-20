@@ -25,6 +25,7 @@ from .db import json_iter, json_obj, JsonObj, DB
 from .s3 import s3_write, s3_size
 from . import jsnotify
 from . import foundation
+from .html_sanitizer import sanitize_email_html
 from .log import get_logger
 
 log = get_logger()
@@ -1185,10 +1186,29 @@ def parts_to_html(
             % (html_escape(preheader, quote=True),)
         )
 
+    def part_contains_html(part: JsonObj) -> bool:
+        if part.get("type") == "HTML":
+            return True
+        if part.get("type") != "Columns":
+            return False
+        for subparts in part.get("parts", []):
+            if not subparts:
+                continue
+            if isinstance(subparts, list):
+                for subpart in subparts:
+                    if subpart and part_contains_html(subpart):
+                        return True
+            elif part_contains_html(subparts):
+                return True
+        return False
+
     for part in parts:
         if part["type"] == "Invisible":
             continue
-        html.write("%s\n" % part["html"])
+        part_html = part["html"]
+        if part_contains_html(part):
+            part_html = sanitize_email_html(part_html)
+        html.write("%s\n" % part_html)
 
     basehtml = html.getvalue()
 

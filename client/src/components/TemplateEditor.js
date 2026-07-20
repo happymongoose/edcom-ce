@@ -1,5 +1,6 @@
 import React, { Component } from "react";
 import ReactDOM from "react-dom";
+import { Controlled as CodeMirror } from "react-codemirror2";
 import { Tabs, Tab, Row, Col, ControlLabel, PanelGroup, Panel, Modal, MenuItem, DropdownButton, FormControl, Glyphicon, Button, ButtonGroup, ButtonToolbar, Overlay, Popover, Dropdown, InputGroup } from "react-bootstrap";
 import update from 'immutability-helper';
 import _ from "underscore";
@@ -14,12 +15,17 @@ import shortid from "shortid";
 import axios from "axios";
 import notify from "../utils/notify";
 import { insertPopups, popupCSS, getHTML } from "../utils/template-utils";
+import sanitizeHTML from "../utils/sanitize-html";
 import createStyles from "draft-js-custom-styles";
 import { stateToHTML } from "draft-js-export-html";
 import Toggle from "react-toggle";
 import moment from "moment";
 import Select2 from "react-select2-wrapper";
 
+import "codemirror/mode/xml/xml";
+import "codemirror/mode/css/css";
+import "codemirror/mode/htmlmixed/htmlmixed";
+import "codemirror/lib/codemirror.css";
 import "../../node_modules/draft-js/dist/Draft.css";
 import "font-awesome/css/font-awesome.css";
 import "./TemplateEditor.css";
@@ -295,6 +301,8 @@ function createPart(form, incols, part, txt, props) {
     txt = txt || 'A text block which can contain different styles and links.';
     newPart.align = 'left';
     newPart.content = convertToRaw(ContentState.createFromText(txt));
+  } else if (part === 'HTML') {
+    newPart.customHtml = txt || '<p>Enter your HTML here.</p>';
   } else if (part === 'Divider') {
     newPart.size = 3;
     newPart.top = 20;
@@ -1642,6 +1650,11 @@ class ColumnPlaceholder extends Component {
             <Button onClick={this.props.addPart.bind(null, 'Image')}>
               <img src="/img/dnd/Image.png" alt="Img" />
             </Button>
+            { !this.props.form &&
+            <Button onClick={this.props.addPart.bind(null, 'HTML')}>
+              <img src="/img/dnd/HTML.svg" alt="HTML" />
+            </Button>
+            }
             <Button onClick={this.props.addPart.bind(null, 'Button')}>
               <img src="/img/dnd/Button.png" alt="Button" />
             </Button>
@@ -2245,6 +2258,133 @@ class SpacerPartDisplay extends Component {
 
 }
 
+class HTMLPartDisplay extends Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      showModal: false,
+      value: props.customHtml || '',
+    };
+
+    this.editorRef = null;
+  }
+
+  componentWillReceiveProps(props) {
+    if (props.customHtml !== this.props.customHtml) {
+      this.setState({value: props.customHtml || ''});
+    }
+  }
+
+  handleChange = event => {
+    this.props.updatePart(this.props.id, {[event.target.id]: getvalue(event)});
+  }
+
+  handleColorChange = (prop, color) => {
+    this.props.updatePart(this.props.id, {[prop]: color.hex});
+  }
+
+  openModal = () => {
+    this.setState({showModal: true, value: this.props.customHtml || ''});
+  }
+
+  closeModal = () => {
+    this.setState({showModal: false});
+  }
+
+  saveModal = () => {
+    this.props.updatePart(this.props.id, {customHtml: this.state.value}, () => {
+      this.setState({showModal: false});
+    });
+  }
+
+  setEditorRef = ref => {
+    this.editorRef = ref;
+  }
+
+  insertText = txt => {
+    if (this.editorRef) {
+      this.editorRef.replaceSelection(txt);
+    } else {
+      this.setState({value: this.state.value + txt});
+    }
+  }
+
+  render() {
+    var p = this.props;
+    const style = p.getPartStyles(p);
+    const {selected, selectedCol, displayOnly} = style;
+    const f = p.getPartStylesDisplay(p);
+    const cleanHtml = sanitizeHTML(this.props.customHtml || '', {proxyImages: true});
+    const displayHtml = cleanHtml || (displayOnly ? '' : '<p style="margin:0; color:#999999">Empty HTML block</p>');
+    const body = (
+      <Wrapper style={{
+                   ...marginStyle(f),
+                   ...paddingStyle(f),
+                   ...borderStyle(f),
+                   ...backgroundStyle(f),
+                   }} outerStyle={widthStyle(f)} isInCol={this.props.isInCol}>
+        <DivTable innerHTML={{__html: displayHtml}}/>
+      </Wrapper>
+    );
+
+    if (displayOnly) {
+      return body;
+    }
+
+    return (
+      <div>
+        <InnerPartDisplay form={this.props.form} isInCol={this.props.isInCol} popupToolbarLeft={this.props.popupToolbarLeft} onBorderSelect={this.props.onBorderSelect} disabled={this.props.disabled} selected={selected} selectedCol={selectedCol} displayOnly={displayOnly} toolbar={
+          <EditToolbar {...style} isInCol={this.props.isInCol}>
+            <ButtonGroup>
+              <Button onClick={this.openModal}>Edit HTML</Button>
+            </ButtonGroup>
+          </EditToolbar>
+        } panels={[
+          {name: 'Background', body: <BackgroundPanel obj={style} onChange={this.handleChange} onColorChange={this.handleColorChange.bind(null, 'backgroundColor')} /> },
+          {name: 'Padding', body: <SpacerPanel type="padding" obj={style} onChange={this.handleChange} /> },
+          {name: 'Margin', body: <SpacerPanel type="margin" obj={style} onChange={this.handleChange} /> },
+          {name: 'Border', body: <BorderPanel obj={style} onChange={this.handleChange} onColorChange={this.handleColorChange.bind(this, 'borderColor')} /> },
+          {name: 'Width', body: <WidthPanel obj={style} onChange={this.handleChange} /> }
+        ]}>
+          {body}
+        </InnerPartDisplay>
+        {
+          this.state.showModal &&
+          <Modal show={true} onHide={this.closeModal} bsSize="large">
+            <Modal.Header closeButton>
+              <Modal.Title>Edit HTML</Modal.Title>
+            </Modal.Header>
+            <Modal.Body>
+              <div style={{border: '1px solid #ddd', borderRadius: '4px'}}>
+                <CodeMirror
+                  value={this.state.value}
+                  onBeforeChange={(editor, data, value) => {
+                    this.setState({value: value});
+                  }}
+                  options={{
+                    mode: 'htmlmixed',
+                    lineNumbers: true,
+                    viewportMargin: Infinity,
+                  }}
+                  editorDidMount={this.setEditorRef}
+                />
+              </div>
+              <div className="space20"/>
+              <ControlLabel>Sanitized Preview</ControlLabel>
+              <div style={{border: '1px solid #ddd', borderRadius: '4px', padding: '10px', minHeight: '60px'}} dangerouslySetInnerHTML={{__html: sanitizeHTML(this.state.value, {proxyImages: true}) || '<p style="margin:0; color:#999999">Empty HTML block</p>'}} />
+            </Modal.Body>
+            <Modal.Footer>
+              <Button onClick={this.saveModal} bsStyle="primary">Save HTML</Button>
+              <Button onClick={this.closeModal}>Cancel</Button>
+            </Modal.Footer>
+          </Modal>
+        }
+      </div>
+    );
+  }
+}
+
 class SocialPartDisplay extends Component {
   handleChange = event => {
     this.props.updatePart(this.props.id, {[event.target.id]: getvalue(event)});
@@ -2814,6 +2954,7 @@ class PartDisplay extends Component {
       Headline: <TextPartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
       Image: <ImagePartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
       Text: <TextPartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
+      HTML: <HTMLPartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
       Divider: <DividerPartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
       Button: <ButtonPartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
       Columns: <ColumnsPartDisplay {...p} onBorderSelect={this.onBorderSelect} />,
@@ -3420,9 +3561,10 @@ class Part extends Component {
 
   render() {
     const props = this.props;
+    const src = props.text === 'HTML' ? '/img/dnd/HTML.svg' : '/img/dnd/' + props.text + '.png';
     return (
       <img className="part" draggable="true" onDragStart={this.onDragStart}
-          src={'/img/dnd/' + props.text + '.png'}
+          src={src}
           alt={props.text}
       />
     );
@@ -3540,7 +3682,9 @@ class PartDrawer extends Component {
             <Part text="Text" clearSelection={this.props.clearSelection} setNextPart={this.props.setNextPart} />
             <Part text="Button" clearSelection={this.props.clearSelection} setNextPart={this.props.setNextPart} />
             <br/>
+            <Part text="HTML" clearSelection={this.props.clearSelection} setNextPart={this.props.setNextPart} />
             <Part text="Columns" clearSelection={this.props.clearSelection} setNextPart={this.props.setNextPart} />
+            <br/>
             <Part text="Divider" clearSelection={this.props.clearSelection} setNextPart={this.props.setNextPart} />
             <br/>
             <Part text="Spacer" clearSelection={this.props.clearSelection} setNextPart={this.props.setNextPart} />

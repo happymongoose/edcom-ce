@@ -8,6 +8,7 @@ import shortuuid
 import hashlib
 import requests
 import urllib
+import socket
 from typing import Any, Dict, List, cast
 from datetime import datetime, timedelta
 import dateutil.parser
@@ -194,6 +195,7 @@ allowedpaths = [
     re.compile(r"^/api/trackform/"),
     re.compile(r"^/api/postform/"),
     re.compile(r"^/api/loginfrontend"),
+    re.compile(r"^/api/htmlpreviewimage$"),
     re.compile(r"^/signup/"),
     re.compile(r"^/api/signupaction/"),
 ]
@@ -3240,6 +3242,135 @@ class ImageImport(object):
         }
 
 
+class HTMLPreviewImage(object):
+
+    MAX_BYTES = 5 * 1024 * 1024
+
+    def _check_auth(self, req: falcon.Request) -> None:
+        uid = req.get_param("uid")
+        cookieid = req.get_param("cookieid")
+        impersonateid = req.get_param("impersonate")
+
+        if not uid or not cookieid:
+            raise falcon.HTTPUnauthorized(
+                title="Invalid login", description="Please log in again"
+            )
+
+        db = DB()
+        cookie = db.cookies.get(cookieid)
+        if cookie is None or cookie["uid"] != uid:
+            raise falcon.HTTPUnauthorized(
+                title="Invalid login", description="Please log in again"
+            )
+
+        if impersonateid:
+            if not cookie["admin"]:
+                raise falcon.HTTPUnauthorized(
+                    title="Invalid login", description="Please log in again"
+                )
+            customer = db.companies.get(impersonateid)
+            if (
+                customer is None
+                or customer["admin"]
+                or customer["cid"] != cookie["cid"]
+            ):
+                raise falcon.HTTPUnauthorized(
+                    title="Invalid login", description="User not found"
+                )
+
+    def _validate_url(self, url: str) -> None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL",
+                description="Only http and https image URLs can be previewed.",
+            )
+
+        try:
+            infos = socket.getaddrinfo(parsed.hostname, parsed.port or None)
+        except socket.gaierror:
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL",
+                description="Image host could not be resolved.",
+            )
+
+        for info in infos:
+            ip = IPAddress(info[4][0])
+            if (
+                ip.is_private()
+                or ip.is_loopback()
+                or ip.is_link_local()
+                or ip.is_multicast()
+                or ip.is_reserved()
+            ):
+                raise falcon.HTTPBadRequest(
+                    title="Invalid image URL",
+                    description="Private network image URLs cannot be previewed.",
+                )
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        self._check_auth(req)
+
+        url = req.get_param("url")
+        if not url:
+            raise falcon.HTTPBadRequest(
+                title="Missing image URL", description="No image URL was provided."
+            )
+
+        current_url = url
+        response = None
+        for _ in range(4):
+            self._validate_url(current_url)
+            response = requests.get(
+                current_url,
+                headers={"User-Agent": "EmailDelivery.com HTML preview image proxy"},
+                timeout=10,
+                stream=True,
+                allow_redirects=False,
+            )
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    break
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+            break
+
+        if response is None:
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL", description="Image URL could not be loaded."
+            )
+
+        content_type = response.headers.get("Content-Type", "")
+        if response.status_code < 200 or response.status_code >= 300:
+            resp.status = falcon.HTTP_502
+            resp.text = "Image preview request failed."
+            response.close()
+            return
+        if not content_type.lower().startswith("image/"):
+            response.close()
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL", description="Preview URL did not return an image."
+            )
+
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > self.MAX_BYTES:
+                response.close()
+                raise falcon.HTTPBadRequest(
+                    title="Image too large",
+                    description="Preview images must be 5 MB or smaller.",
+                )
+            chunks.append(chunk)
+        response.close()
+
+        resp.content_type = content_type
+        resp.data = b"".join(chunks)
+
+
 class OpenTicket(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
@@ -3717,6 +3848,7 @@ app.add_route("/api/uploadfile", UploadFile())
 app.add_route("/api/uploadlogfile", UploadLogFile())
 app.add_route("/api/imageimport", ImageImport())
 app.add_route("/api/imageupload", ImageUpload())
+app.add_route("/api/htmlpreviewimage", HTMLPreviewImage())
 app.add_route("/api/beefreeauth", BeeFreeAuth())
 app.add_route("/api/beefreemerge", BeeFreeMerge())
 app.add_route("/api/lists/{id}/import", lists.ListImport())
