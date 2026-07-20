@@ -47,6 +47,26 @@ function patchPayload(data) {
   };
 }
 
+export function canReEnrolAutomation(data) {
+  const published = data.published || {};
+  return published.reentry === 'multiple';
+}
+
+export function displayAutomationEnrolments(enrolments) {
+  return _.chain(enrolments)
+    .groupBy(enrolment => enrolment.contact_id || enrolment.contact_email)
+    .map(group => {
+      const ready = _.filter(group, enrolment => enrolment.status === 'ready');
+      if (ready.length) {
+        return _.max(ready, enrolment => moment(enrolment.created || 0).valueOf());
+      }
+
+      return _.max(group, enrolment => moment(enrolment.created || 0).valueOf());
+    })
+    .sortBy(enrolment => moment(enrolment.created || 0).valueOf())
+    .value();
+}
+
 class Automation extends Component {
   constructor(props) {
     super(props);
@@ -215,23 +235,11 @@ class Automation extends Component {
   }
 
   canReEnrol() {
-    const published = this.props.data.published || {};
-    return published.reentry === 'multiple';
+    return canReEnrolAutomation(this.props.data);
   }
 
   displayEnrolments(enrolments) {
-    return _.chain(enrolments)
-      .groupBy(enrolment => enrolment.contact_id || enrolment.contact_email)
-      .map(group => {
-        const ready = _.filter(group, enrolment => enrolment.status === 'ready');
-        if (ready.length) {
-          return _.max(ready, enrolment => moment(enrolment.created || 0).valueOf());
-        }
-
-        return _.max(group, enrolment => moment(enrolment.created || 0).valueOf());
-      })
-      .sortBy(enrolment => moment(enrolment.created || 0).valueOf())
-      .value();
+    return displayAutomationEnrolments(enrolments);
   }
 
   handleSubmit = async event => {

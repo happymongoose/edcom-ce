@@ -33,7 +33,7 @@ class TestAutomationExecution(test_base.TestBase):
         )
         return email, contact_id
 
-    def workflow(self, tag="onboarding", nodes=None):
+    def workflow(self, tag="onboarding", nodes=None, reentry=None):
         if nodes is None:
             nodes = [
                 {
@@ -48,7 +48,7 @@ class TestAutomationExecution(test_base.TestBase):
                     "label": "Exit automation",
                 },
             ]
-        return {
+        doc = {
             "entry": {
                 "type": "manual",
             },
@@ -56,8 +56,11 @@ class TestAutomationExecution(test_base.TestBase):
                 "nodes": nodes,
             },
         }
+        if reentry is not None:
+            doc["reentry"] = reentry
+        return doc
 
-    def create_automation(self, tag="onboarding"):
+    def create_automation(self, tag="onboarding", reentry=None):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -65,7 +68,7 @@ class TestAutomationExecution(test_base.TestBase):
         )
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(tag=tag),
+            json=self.workflow(tag=tag, reentry=reentry),
         )
         return self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
@@ -80,6 +83,13 @@ class TestAutomationExecution(test_base.TestBase):
         )
         self.assertEqual(result.status_code, 201)
         return result.json
+
+    def enrol_response(self, automation_id, email):
+        return self.simulate_post(
+            "/api/automations/%s/enrolments" % automation_id,
+            json={"email": email},
+            headers=self.headers(),
+        )
 
     def run_next(self, automation_id, enrolment_id):
         return self.simulate_post(
@@ -293,5 +303,42 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertTrue(self.has_tag(contact_id, "published-execution-tag"))
         self.assertFalse(self.has_tag(contact_id, "draft-only-tag"))
         self.assertEqual(result.json["step_run"]["tag"], "published-execution-tag")
+
+        self.cleanup(automation["id"])
+
+    def test_once_does_not_allow_running_again_after_exit(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(reentry="once")
+        enrolment = self.enrol(automation["id"], email)
+
+        self.assertEqual(self.run_next(automation["id"], enrolment["id"]).status_code, 200)
+        exited = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(exited.status_code, 200)
+        self.assertEqual(exited.json["enrolment"]["status"], "exited")
+
+        again = self.enrol_response(automation["id"], email)
+        self.assertEqual(again.status_code, 400)
+
+        self.cleanup(automation["id"])
+
+    def test_multiple_allows_running_again_after_exit_and_preserves_history(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(tag="repeat-tag", reentry="multiple")
+        first_enrolment = self.enrol(automation["id"], email)
+
+        self.assertEqual(self.run_next(automation["id"], first_enrolment["id"]).status_code, 200)
+        exited = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(exited.status_code, 200)
+        self.assertEqual(exited.json["enrolment"]["status"], "exited")
+        first_runs = self.step_runs(automation["id"], first_enrolment["id"])
+        self.assertEqual(len(first_runs), 2)
+
+        second_enrolment = self.enrol(automation["id"], email)
+        self.assertNotEqual(first_enrolment["id"], second_enrolment["id"])
+        self.assertEqual(second_enrolment["status"], "ready")
+        self.assertEqual(second_enrolment["current_node_id"], "node_add_tag_1")
+
+        self.assertEqual(len(self.step_runs(automation["id"], first_enrolment["id"])), 2)
+        self.assertEqual(self.step_runs(automation["id"], second_enrolment["id"]), [])
 
         self.cleanup(automation["id"])
