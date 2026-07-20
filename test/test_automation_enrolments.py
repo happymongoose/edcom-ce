@@ -82,6 +82,18 @@ class TestAutomationEnrolments(test_base.TestBase):
             headers=self.headers(),
         )
 
+    def set_enrolment_status(self, enrolment_id, status):
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {"status": status},
+            self.user_cookie["cid"],
+            enrolment_id,
+        )
+
     def list_enrolments(self, automation_id):
         return self.user_get("/api/automations/%s/enrolments" % automation_id)
 
@@ -143,18 +155,124 @@ class TestAutomationEnrolments(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_multiple_allows_duplicate_enrolment(self):
+    def test_once_blocks_after_completed_or_exited_enrolment(self):
+        email, _, _ = self.create_contact()
+        completed_automation = self.create_automation(reentry="once")
+        completed = self.enrol(completed_automation["id"], email)
+        self.assertEqual(completed.status_code, 201)
+        self.set_enrolment_status(completed.json["id"], "completed")
+
+        again = self.enrol(completed_automation["id"], email)
+        self.assertEqual(again.status_code, 400)
+        self.assertIn("only allows a contact to enter once", again.text)
+
+        exited_automation = self.create_automation(reentry="once")
+        exited = self.enrol(exited_automation["id"], email)
+        self.assertEqual(exited.status_code, 201)
+        self.set_enrolment_status(exited.json["id"], "exited")
+
+        again = self.enrol(exited_automation["id"], email)
+        self.assertEqual(again.status_code, 400)
+        self.assertIn("only allows a contact to enter once", again.text)
+
+        self.cleanup(completed_automation["id"], exited_automation["id"])
+
+    def test_multiple_blocks_duplicate_ready_enrolment(self):
         email, _, _ = self.create_contact()
         automation = self.create_automation(reentry="multiple")
 
         first = self.enrol(automation["id"], email)
         self.assertEqual(first.status_code, 201)
         second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 400)
+        self.assertIn("active enrolment", second.text)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(len(enrolments), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_multiple_blocks_duplicate_waiting_enrolment(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="multiple")
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.set_enrolment_status(first.json["id"], "waiting")
+
+        second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 400)
+        self.assertIn("active enrolment", second.text)
+
+        self.cleanup(automation["id"])
+
+    def test_multiple_blocks_duplicate_held_or_paused_enrolment(self):
+        for status in ("held", "paused_ready", "paused_waiting"):
+            email, _, _ = self.create_contact()
+            automation = self.create_automation(reentry="multiple")
+
+            first = self.enrol(automation["id"], email)
+            self.assertEqual(first.status_code, 201)
+            self.set_enrolment_status(first.json["id"], status)
+
+            second = self.enrol(automation["id"], email)
+            self.assertEqual(second.status_code, 400)
+            self.assertIn("active enrolment", second.text)
+
+            self.cleanup(automation["id"])
+
+    def test_multiple_allows_new_enrolment_after_completed(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="multiple")
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.set_enrolment_status(first.json["id"], "completed")
+
+        second = self.enrol(automation["id"], email)
         self.assertEqual(second.status_code, 201)
 
         enrolments = self.list_enrolments(automation["id"])
         self.assertEqual(len(enrolments), 2)
 
+        self.cleanup(automation["id"])
+
+    def test_multiple_allows_new_enrolment_after_exited(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="multiple")
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.set_enrolment_status(first.json["id"], "exited")
+
+        second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 201)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(len(enrolments), 2)
+
+        self.cleanup(automation["id"])
+
+    def test_multiple_active_pass_check_is_scoped_by_cid(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="multiple")
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.db.execute(
+            "update automation_enrolments set cid = %s where id = %s",
+            "other-account-cid",
+            first.json["id"],
+        )
+
+        second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 201)
+
+        self.db.execute(
+            "delete from automation_enrolments where id = %s and cid = %s",
+            first.json["id"],
+            "other-account-cid",
+        )
         self.cleanup(automation["id"])
 
     def test_enrolments_are_scoped_by_cid(self):

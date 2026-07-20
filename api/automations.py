@@ -166,6 +166,8 @@ REENTRY_SCHEMA = {
     "enum": ["once", "multiple"],
 }
 
+TERMINAL_ENROLMENT_STATUSES = ("completed", "exited", "cancelled")
+
 
 ENTRY_SCHEMA = {
     "type": "object",
@@ -780,7 +782,7 @@ class AutomationEnrolments(object):
 
         reentry = published.get("reentry", automation.get("reentry", "once"))
         _validate_doc(reentry, REENTRY_SCHEMA)
-        if reentry == "once" and db.single(
+        existing_enrolment_id = db.single(
             """
             select id
             from automation_enrolments
@@ -790,10 +792,30 @@ class AutomationEnrolments(object):
             cid,
             id,
             contact_id,
-        ):
+        )
+        if reentry == "once" and existing_enrolment_id:
             raise falcon.HTTPBadRequest(
                 title="Contact already enrolled",
                 description="This automation only allows a contact to enter once.",
+            )
+        if reentry == "multiple" and db.single(
+            """
+            select id
+            from automation_enrolments
+            where cid = %s
+                and automation_id = %s
+                and contact_id = %s
+                and coalesce(data->>'status', '') <> all(%s)
+            limit 1
+            """,
+            cid,
+            id,
+            contact_id,
+            list(TERMINAL_ENROLMENT_STATUSES),
+        ):
+            raise falcon.HTTPBadRequest(
+                title="Contact already has an active automation pass",
+                description="This contact already has an active enrolment in this automation.",
             )
 
         now = _utc_now()
