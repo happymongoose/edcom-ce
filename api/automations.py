@@ -1,7 +1,9 @@
 import falcon
 import copy
 import shortuuid
-from datetime import datetime
+import dateutil.parser
+from datetime import datetime, timedelta
+from dateutil.tz import tzutc
 from jsonschema import validate
 
 from .shared import config as _  # noqa: F401
@@ -206,6 +208,13 @@ def _utc_now() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 
+def _parse_datetime(value: str) -> datetime:
+    parsed = dateutil.parser.parse(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(tzutc()).replace(tzinfo=None)
+    return parsed
+
+
 def _prepare_doc(doc: JsonObj, create: bool) -> None:
     if doc.get("status", "draft") != "draft":
         raise falcon.HTTPBadRequest(
@@ -242,6 +251,11 @@ def _duration_minutes(duration: JsonObj) -> int:
         + int(duration.get("hours", 0)) * 60
         + int(duration.get("minutes", 0))
     )
+
+
+def _wake_at(start: datetime, duration: JsonObj) -> str:
+    wake = start + timedelta(minutes=_duration_minutes(duration))
+    return wake.isoformat() + "Z"
 
 
 def _published_snapshot(automation: JsonObj) -> JsonObj:
@@ -635,6 +649,9 @@ class AutomationHistory(object):
                     "node_type": step_run["node_type"],
                     "node_label": step_run.get("node_label"),
                     "tag": step_run.get("tag"),
+                    "duration": step_run.get("duration"),
+                    "wake_at": step_run.get("wake_at"),
+                    "action": step_run.get("action"),
                     "published_revision": step_run.get("published_revision"),
                     "status": step_run.get("status"),
                     "error": step_run.get("error"),
@@ -688,12 +705,6 @@ class AutomationEnrolmentRunNext(object):
         if enrolment is None:
             raise falcon.HTTPForbidden()
 
-        if enrolment.get("status") != "ready":
-            raise falcon.HTTPBadRequest(
-                title="Enrolment is not ready",
-                description="Only ready enrolments can run the next automation node.",
-            )
-
         published = automation.get("published")
         if not published:
             raise falcon.HTTPBadRequest(
@@ -717,13 +728,26 @@ class AutomationEnrolmentRunNext(object):
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "exit"):
+        if node_type not in ("add_tag", "wait_duration", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
-                description="Only add_tag and exit nodes can be executed manually.",
+                description="Only add_tag, wait_duration and exit nodes can be executed manually.",
             )
 
-        now = _utc_now()
+        status = enrolment.get("status")
+        if status not in ("ready", "waiting"):
+            raise falcon.HTTPBadRequest(
+                title="Enrolment is not ready",
+                description="Only ready or elapsed waiting enrolments can run the next automation node.",
+            )
+        if status == "waiting" and node_type != "wait_duration":
+            raise falcon.HTTPBadRequest(
+                title="Enrolment wait state is invalid",
+                description="Waiting enrolments must remain on a wait_duration node.",
+            )
+
+        now_dt = datetime.utcnow()
+        now = now_dt.isoformat() + "Z"
         run_id = shortuuid.uuid()
         run_data = {
             "status": "succeeded",
@@ -732,7 +756,44 @@ class AutomationEnrolmentRunNext(object):
             "created": now,
         }
 
-        if node_type == "add_tag":
+        if status == "waiting":
+            wake_at = enrolment.get("wake_at")
+            if not wake_at:
+                raise falcon.HTTPBadRequest(
+                    title="Waiting enrolment is missing wake_at",
+                    description="The waiting enrolment cannot continue without wake_at metadata.",
+                )
+            if now_dt < _parse_datetime(wake_at):
+                raise falcon.HTTPBadRequest(
+                    title="Wait has not elapsed",
+                    description="This enrolment is waiting until %s." % wake_at,
+                )
+
+            wait = enrolment.get("wait") or {}
+            run_data.update(
+                {
+                    "action": "wait_complete",
+                    "duration": wait.get("duration", node.get("duration")),
+                    "wake_at": wake_at,
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "wake_at": None,
+                    "wait": None,
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "wake_at": None,
+                    "wait": None,
+                    "modified": now,
+                }
+        elif node_type == "add_tag":
             tag = node.get("draft_tag")
             if not tag:
                 raise falcon.HTTPBadRequest(
@@ -779,6 +840,30 @@ class AutomationEnrolmentRunNext(object):
                     "status": "completed",
                     "modified": now,
                 }
+        elif node_type == "wait_duration":
+            duration = node.get("duration") or {}
+            wake_at = _wake_at(now_dt, duration)
+            run_data.update(
+                {
+                    "status": "waiting",
+                    "action": "wait_start",
+                    "duration": duration,
+                    "wake_at": wake_at,
+                }
+            )
+            enrolment_update = {
+                "status": "waiting",
+                "current_node_id": current_node_id,
+                "wake_at": wake_at,
+                "wait": {
+                    "node_id": current_node_id,
+                    "duration": duration,
+                    "started_at": now,
+                    "wake_at": wake_at,
+                    "published_revision": automation.get("published_revision"),
+                },
+                "modified": now,
+            }
         else:
             enrolment_update = {
                 "status": "exited",

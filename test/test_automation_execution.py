@@ -1,4 +1,6 @@
 import shortuuid
+import dateutil.parser
+from datetime import datetime, timedelta
 
 import test_base
 
@@ -306,8 +308,7 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_run_next_on_wait_duration_returns_unsupported_node(self):
-        email, _ = self.create_contact()
+    def wait_nodes(self, final=False):
         nodes = [
             {
                 "id": "node_wait_1",
@@ -319,26 +320,152 @@ class TestAutomationExecution(test_base.TestBase):
                     "minutes": 5,
                 },
             },
-            {
-                "id": "node_exit_1",
-                "type": "exit",
-                "label": "Exit automation",
-            },
         ]
+        if not final:
+            nodes.append(
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                }
+            )
+        return nodes
+
+    def create_wait_automation(self, final=False):
         automation = self.create_automation()
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(nodes=nodes),
+            json=self.workflow(nodes=self.wait_nodes(final)),
         )
-        automation = self.simulate_post(
+        return self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
             headers=self.headers(),
         ).json
+
+    def test_ready_enrolment_on_wait_duration_becomes_waiting(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
         enrolment = self.enrol(automation["id"], email)
 
         result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        updated = result.json["enrolment"]
+        step_run = result.json["step_run"]
+
+        self.assertEqual(updated["status"], "waiting")
+        self.assertEqual(updated["current_node_id"], "node_wait_1")
+        self.assertIn("wake_at", updated)
+        self.assertEqual(updated["wait"]["node_id"], "node_wait_1")
+        self.assertEqual(updated["wait"]["duration"], {"days": 0, "hours": 0, "minutes": 5})
+        self.assertEqual(step_run["node_id"], "node_wait_1")
+        self.assertEqual(step_run["node_type"], "wait_duration")
+        self.assertEqual(step_run["status"], "waiting")
+        self.assertEqual(step_run["action"], "wait_start")
+        self.assertEqual(step_run["duration"], {"days": 0, "hours": 0, "minutes": 5})
+
+        created = dateutil.parser.parse(step_run["created"])
+        wake_at = dateutil.parser.parse(updated["wake_at"])
+        self.assertEqual(int((wake_at - created).total_seconds()), 5 * 60)
+
+        self.cleanup(automation["id"])
+
+    def test_run_next_before_wake_at_is_rejected_clearly(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        started = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(started.status_code, 200)
+
+        result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
-        self.assertIn("Only add_tag and exit nodes can be executed manually", result.text)
+        self.assertIn("Wait has not elapsed", result.text)
+        self.assertIn(started.json["enrolment"]["wake_at"], result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_run_next_after_wake_at_records_wait_complete_and_advances(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
+        enrolment = self.enrol(automation["id"], email)
+        started = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(started.status_code, 200)
+
+        past = (datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where id = %s
+            """,
+            {
+                "wake_at": past,
+                "wait": {
+                    "node_id": "node_wait_1",
+                    "duration": {"days": 0, "hours": 0, "minutes": 5},
+                    "started_at": started.json["enrolment"]["wait"]["started_at"],
+                    "wake_at": past,
+                    "published_revision": automation["published_revision"],
+                },
+            },
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["enrolment"]["wake_at"], None)
+        self.assertEqual(result.json["step_run"]["node_type"], "wait_duration")
+        self.assertEqual(result.json["step_run"]["status"], "succeeded")
+        self.assertEqual(result.json["step_run"]["action"], "wait_complete")
+
+        runs = self.step_runs(automation["id"], enrolment["id"])
+        self.assertEqual([run[7]["action"] for run in runs], ["wait_start", "wait_complete"])
+
+        self.cleanup(automation["id"])
+
+    def test_wait_as_final_node_completes_after_elapsed(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
+        automation["published"]["nodes"] = self.wait_nodes(final=True)
+        self.db.automations.patch(
+            automation["id"],
+            {
+                "published": automation["published"],
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        started = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(started.status_code, 200)
+
+        past = (datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where id = %s
+            """,
+            {
+                "wake_at": past,
+                "wait": {
+                    "node_id": "node_wait_1",
+                    "duration": {"days": 0, "hours": 0, "minutes": 5},
+                    "started_at": started.json["enrolment"]["wait"]["started_at"],
+                    "wake_at": past,
+                    "published_revision": automation["published_revision"],
+                },
+            },
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "completed")
+        self.assertEqual(result.json["step_run"]["action"], "wait_complete")
+
+        again = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(again.status_code, 400)
 
         self.cleanup(automation["id"])
 

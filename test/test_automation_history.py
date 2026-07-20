@@ -1,4 +1,5 @@
 import shortuuid
+from datetime import datetime, timedelta
 
 import test_base
 
@@ -215,5 +216,74 @@ class TestAutomationHistory(test_base.TestBase):
 
         self.assertEqual(after_enrolments, before_enrolments)
         self.assertEqual(after_step_runs, before_step_runs)
+
+        self.cleanup(automation["id"])
+
+    def test_history_includes_wait_start_and_complete(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        wait_nodes = [
+            {
+                "id": "node_wait_1",
+                "type": "wait_duration",
+                "label": "Wait",
+                "duration": {
+                    "days": 0,
+                    "hours": 0,
+                    "minutes": 5,
+                },
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit history automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {
+                    "type": "manual",
+                },
+                "reentry": "multiple",
+                "draft": {
+                    "nodes": wait_nodes,
+                },
+            },
+        )
+        automation = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+        enrolment = self.enrol(automation["id"], email)
+        self.run_next(automation["id"], enrolment["id"])
+
+        past = (datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where id = %s
+            """,
+            {
+                "wake_at": past,
+                "wait": {
+                    "node_id": "node_wait_1",
+                    "duration": {"days": 0, "hours": 0, "minutes": 5},
+                    "started_at": past,
+                    "wake_at": past,
+                    "published_revision": automation["published_revision"],
+                },
+            },
+            enrolment["id"],
+        )
+        self.run_next(automation["id"], enrolment["id"])
+
+        history = self.history(automation["id"])
+        step_events = [event for event in history["events"] if event["type"] == "step_run"]
+        self.assertEqual([event["action"] for event in step_events], ["wait_start", "wait_complete"])
+        self.assertEqual(step_events[0]["node_type"], "wait_duration")
+        self.assertEqual(step_events[0]["wake_at"], history["enrolments"][0]["step_runs"][0]["wake_at"])
+        self.assertEqual(step_events[0]["duration"], {"days": 0, "hours": 0, "minutes": 5})
 
         self.cleanup(automation["id"])

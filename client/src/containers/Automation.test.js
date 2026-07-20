@@ -1,4 +1,5 @@
 import {
+  automationEnrolmentAction,
   automationHistoryLog,
   canReEnrolAutomation,
   displayAutomationEnrolments,
@@ -90,5 +91,54 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('status=ready');
     expect(log).toContain('step add_tag node_add_tag_1 | "Add history tag" | tag=history-tag');
     expect(log).toContain('revision=3');
+  });
+
+  it('shows waiting and continue actions for waiting enrolments', () => {
+    const waiting = automationEnrolmentAction(
+      {
+        status: 'waiting',
+        wake_at: '2026-07-20T10:05:00Z',
+      },
+      {published: {reentry: 'multiple'}},
+      '2026-07-20T10:00:00Z'
+    );
+    expect(waiting.type).toBe('waiting');
+    expect(waiting.disabled).toBe(true);
+    expect(waiting.label).toContain('Waiting until');
+
+    const elapsed = automationEnrolmentAction(
+      {
+        status: 'waiting',
+        wake_at: '2026-07-20T10:05:00Z',
+      },
+      {published: {reentry: 'multiple'}},
+      '2026-07-20T10:06:00Z'
+    );
+    expect(elapsed.type).toBe('continue_wait');
+    expect(elapsed.label).toBe('Continue test');
+  });
+
+  it('includes wait metadata in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_wait_1',
+          node_type: 'wait_duration',
+          node_label: 'Wait',
+          action: 'wait_start',
+          wake_at: '2026-07-20T10:05:00Z',
+          status: 'waiting',
+          published_revision: 3,
+        },
+      ],
+    });
+
+    expect(log).toContain('action=wait_start');
+    expect(log).toContain('wake_at=2026-07-20T10:05:00Z');
+    expect(log).toContain('status=waiting');
   });
 });

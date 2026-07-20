@@ -91,11 +91,17 @@ export function automationHistoryLog(history) {
       parts.push('current_node=' + (event.current_node_id || ''));
     } else {
       parts.push('step ' + (event.node_type || '') + ' ' + (event.node_id || ''));
+      if (event.action) {
+        parts.push('action=' + event.action);
+      }
       if (event.node_label) {
         parts.push('"' + event.node_label + '"');
       }
       if (event.tag) {
         parts.push('tag=' + event.tag);
+      }
+      if (event.wake_at) {
+        parts.push('wake_at=' + event.wake_at);
       }
       parts.push('status=' + (event.status || ''));
       if (event.error) {
@@ -106,6 +112,46 @@ export function automationHistoryLog(history) {
     parts.push('revision=' + (event.published_revision || ''));
     return parts.join(' | ');
   }).join('\n');
+}
+
+export function automationEnrolmentAction(enrolment, automation, now) {
+  if (enrolment.status === 'ready') {
+    return {
+      type: 'run_next',
+      label: 'Run next test',
+      disabled: false,
+    };
+  }
+
+  if (enrolment.status === 'waiting') {
+    const wakeAt = enrolment.wake_at && moment(enrolment.wake_at);
+    if (wakeAt && wakeAt.isValid() && wakeAt.isSameOrBefore(now || moment())) {
+      return {
+        type: 'continue_wait',
+        label: 'Continue test',
+        disabled: false,
+      };
+    }
+    return {
+      type: 'waiting',
+      label: 'Waiting until ' + (wakeAt && wakeAt.isValid() ? wakeAt.format('lll') : ''),
+      disabled: true,
+    };
+  }
+
+  if (canReEnrolAutomation(automation)) {
+    return {
+      type: 'reenrol',
+      label: 'Run automation again',
+      disabled: false,
+    };
+  }
+
+  return {
+    type: 'none',
+    label: '',
+    disabled: true,
+  };
 }
 
 class Automation extends Component {
@@ -472,58 +518,66 @@ class Automation extends Component {
               </thead>
               {
                 _.map(displayEnrolments, (enrolment, index) =>
-                  <EDTableRow key={enrolment.id} index={index}>
-                    <td>
-                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
-                    </td>
-                    <td>
-                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.status}</h4>
-                    </td>
-                    <td>
-                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.current_node_id}</h4>
-                    </td>
-                    <td>
-                      <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.source}</h4>
-                    </td>
-                    <td>
-                      <h4 style={{whiteSpace: 'nowrap'}}>
-                        {enrolment.created ? moment(enrolment.created).format('lll') : ''}
-                      </h4>
-                    </td>
-                    <td className="last-cell" style={{minWidth: '120px'}}>
-                      {
-                        enrolment.status === 'ready' ?
-                          <Button
-                            bsSize="small"
-                            disabled={this.state.runningEnrolmentId === enrolment.id}
-                            onClick={this.runNext.bind(this, enrolment)}
-                          >
-                            {
-                              this.state.runningEnrolmentId === enrolment.id ?
-                                'Running...'
-                              :
-                                'Run next test'
-                            }
-                          </Button>
-                        :
-                          this.canReEnrol() ?
-                            <Button
-                              bsSize="small"
-                              disabled={this.state.reenrollingEnrolmentId === enrolment.id}
-                              onClick={this.reEnrolContact.bind(this, enrolment)}
-                            >
-                              {
-                                this.state.reenrollingEnrolmentId === enrolment.id ?
-                                  'Starting...'
-                                :
-                                  'Run automation again'
-                              }
-                            </Button>
-                        :
-                          null
-                      }
-                    </td>
-                  </EDTableRow>
+                  {
+                    const action = automationEnrolmentAction(enrolment, data);
+                    return (
+                      <EDTableRow key={enrolment.id} index={index}>
+                        <td>
+                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
+                        </td>
+                        <td>
+                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.status}</h4>
+                        </td>
+                        <td>
+                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.current_node_id}</h4>
+                        </td>
+                        <td>
+                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.source}</h4>
+                        </td>
+                        <td>
+                          <h4 style={{whiteSpace: 'nowrap'}}>
+                            {enrolment.created ? moment(enrolment.created).format('lll') : ''}
+                          </h4>
+                        </td>
+                        <td className="last-cell" style={{minWidth: '150px'}}>
+                          {
+                            action.type === 'run_next' || action.type === 'continue_wait' ?
+                              <Button
+                                bsSize="small"
+                                disabled={this.state.runningEnrolmentId === enrolment.id}
+                                onClick={this.runNext.bind(this, enrolment)}
+                              >
+                                {
+                                  this.state.runningEnrolmentId === enrolment.id ?
+                                    'Running...'
+                                  :
+                                    action.label
+                                }
+                              </Button>
+                            :
+                              action.type === 'waiting' ?
+                                <span>{action.label}</span>
+                            :
+                              action.type === 'reenrol' ?
+                                <Button
+                                  bsSize="small"
+                                  disabled={this.state.reenrollingEnrolmentId === enrolment.id}
+                                  onClick={this.reEnrolContact.bind(this, enrolment)}
+                                >
+                                  {
+                                    this.state.reenrollingEnrolmentId === enrolment.id ?
+                                      'Starting...'
+                                    :
+                                      action.label
+                                  }
+                                </Button>
+                            :
+                              null
+                          }
+                        </td>
+                      </EDTableRow>
+                    );
+                  }
                 )
               }
             </EDTable>
