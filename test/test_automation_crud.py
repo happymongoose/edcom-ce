@@ -111,6 +111,36 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         }
 
+    def go_to_workflow(self, go_to=None):
+        if go_to is None:
+            go_to = {
+                "id": "node_go_to_1",
+                "type": "go_to",
+                "label": "Go to shared step",
+                "target_node_id": "node_exit_1",
+            }
+        return {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add branch tag",
+                        "draft_tag": "branch-tag",
+                    },
+                    go_to,
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
     def user_publish(self, automation_id):
         result = self.simulate_post(
             "/api/automations/%s/publish" % automation_id,
@@ -673,6 +703,127 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.db.set_cid(self.user_cookie["cid"])
         self.db.automations.remove(automation_id)
+
+    def test_valid_go_to_node_publishes(self):
+        created = self.user_post("/api/automations", json={"name": "Go To"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.go_to_workflow())
+        published = self.user_publish(automation_id)
+
+        go_to = published["published"]["nodes"][1]
+        self.assertEqual(go_to["type"], "go_to")
+        self.assertEqual(go_to["label"], "Go to shared step")
+        self.assertEqual(go_to["target_node_id"], "node_exit_1")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_go_to_target_can_point_to_explicit_exit(self):
+        created = self.user_post("/api/automations", json={"name": "Go To Exit Target"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.go_to_workflow())
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][1]["target_node_id"], "node_exit_1")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_condition_branch_target_can_point_to_go_to_node(self):
+        created = self.user_post("/api/automations", json={"name": "Condition Go To Target"})
+        automation_id = created["id"]
+        workflow = {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_condition_1",
+                        "type": "if_has_tag",
+                        "label": "If contact has tag",
+                        "draft_tag": "vip",
+                        "yes_node_id": "node_go_to_1",
+                        "no_node_id": "node_exit_1",
+                    },
+                    {
+                        "id": "node_go_to_1",
+                        "type": "go_to",
+                        "label": "Go to exit",
+                        "target_node_id": "node_exit_1",
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][0]["yes_node_id"], "node_go_to_1")
+        self.assertEqual(published["published"]["nodes"][1]["type"], "go_to")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def assert_go_to_publish_fails(self, go_to, message):
+        created = self.user_post("/api/automations", json={"name": "Invalid Go To"})
+        automation_id = created["id"]
+        self.user_patch("/api/automations/%s" % automation_id, json=self.go_to_workflow(go_to))
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(message, result.text)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_go_to_missing_target_fails_publish_validation(self):
+        go_to = {
+            "id": "node_go_to_1",
+            "type": "go_to",
+            "label": "Go to shared step",
+            "target_node_id": "",
+        }
+        self.assert_go_to_publish_fails(go_to, "target")
+
+    def test_go_to_unknown_target_fails_publish_validation(self):
+        go_to = {
+            "id": "node_go_to_1",
+            "type": "go_to",
+            "label": "Go to shared step",
+            "target_node_id": "missing_node",
+        }
+        self.assert_go_to_publish_fails(go_to, "target must exist")
+
+    def test_go_to_self_target_fails_publish_validation(self):
+        go_to = {
+            "id": "node_go_to_1",
+            "type": "go_to",
+            "label": "Go to shared step",
+            "target_node_id": "node_go_to_1",
+        }
+        self.assert_go_to_publish_fails(go_to, "cannot target themselves")
+
+    def test_go_to_backward_target_fails_publish_validation(self):
+        go_to = {
+            "id": "node_go_to_1",
+            "type": "go_to",
+            "label": "Go to previous step",
+            "target_node_id": "node_add_tag_1",
+        }
+        self.assert_go_to_publish_fails(go_to, "later node")
 
     def assert_condition_publish_fails(self, condition, message):
         created = self.user_post("/api/automations", json={"name": "Invalid Condition"})

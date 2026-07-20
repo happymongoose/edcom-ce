@@ -113,6 +113,34 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         ).json
 
+    def create_go_to_automation(self):
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_go_to_%s" % suffix},
+        )
+        nodes = [
+            {
+                "id": "node_go_to_1",
+                "type": "go_to",
+                "label": "Go to exit",
+                "target_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        return self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
     def create_no_exit_automation(self, tag="implicit-completion-tag"):
         suffix = self.unique()
         automation = self.user_post(
@@ -400,6 +428,17 @@ class TestAutomationExecution(test_base.TestBase):
         result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
         self.assertIn("if_has_tag condition nodes cannot be executed manually yet", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_run_next_on_go_to_returns_unsupported_node(self):
+        email, _ = self.create_contact()
+        automation = self.create_go_to_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("go_to nodes cannot be executed manually yet", result.text)
 
         self.cleanup(automation["id"])
 

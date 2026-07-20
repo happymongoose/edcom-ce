@@ -278,7 +278,7 @@ class Automation extends Component {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : 'Exit automation',
     };
 
     if (type === 'add_tag') {
@@ -295,6 +295,9 @@ class Automation extends Component {
         hours: 0,
         minutes: 5,
       };
+    }
+    if (type === 'go_to') {
+      node.target_node_id = '';
     }
 
     this.props.update({
@@ -579,6 +582,21 @@ class Automation extends Component {
       );
     }
 
+    if (node.type === 'go_to') {
+      return (
+        <div style={{minWidth: '220px'}}>
+          <SelectLabel
+            id="target_node_id"
+            label="Target"
+            obj={node}
+            onChange={this.nodeTargetChange.bind(this, index)}
+            options={this.nodeTargetOptions(node)}
+            emptyVal="Select target"
+          />
+        </div>
+      );
+    }
+
     return null;
   }
 
@@ -591,6 +609,9 @@ class Automation extends Component {
     }
     if (type === 'if_has_tag') {
       return 'If has tag';
+    }
+    if (type === 'go_to') {
+      return 'Go to';
     }
     return 'Exit';
   }
@@ -896,6 +917,8 @@ class Automation extends Component {
                   <Button onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</Button>
                   {' '}
                   <Button onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</Button>
+                  {' '}
+                  <Button onClick={this.addNode.bind(this, 'go_to')}>Go To Node</Button>
                   {' '}
                   <Button onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</Button>
                 </div>
