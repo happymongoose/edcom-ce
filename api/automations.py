@@ -45,6 +45,47 @@ ADD_TAG_NODE_SCHEMA = {
 }
 
 
+WAIT_DURATION_SCHEMA = {
+    "type": "object",
+    "required": ["days", "hours", "minutes"],
+    "properties": {
+        "days": {
+            "type": "integer",
+            "minimum": 0,
+        },
+        "hours": {
+            "type": "integer",
+            "minimum": 0,
+        },
+        "minutes": {
+            "type": "integer",
+            "minimum": 0,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+WAIT_DURATION_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "duration"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["wait_duration"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "duration": WAIT_DURATION_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+
 EXIT_NODE_SCHEMA = {
     "type": "object",
     "required": ["id", "type", "label"],
@@ -92,6 +133,7 @@ DRAFT_SCHEMA = {
             "items": {
                 "oneOf": [
                     ADD_TAG_NODE_SCHEMA,
+                    WAIT_DURATION_NODE_SCHEMA,
                     EXIT_NODE_SCHEMA,
                 ],
             },
@@ -194,6 +236,14 @@ def _validation_error(message: str) -> None:
     raise falcon.HTTPBadRequest(title="Automation publish validation failed", description=message)
 
 
+def _duration_minutes(duration: JsonObj) -> int:
+    return (
+        int(duration.get("days", 0)) * 24 * 60
+        + int(duration.get("hours", 0)) * 60
+        + int(duration.get("minutes", 0))
+    )
+
+
 def _published_snapshot(automation: JsonObj) -> JsonObj:
     if not automation.get("name") or not automation.get("name").strip():
         _validation_error("Automation must have a name before publishing.")
@@ -223,6 +273,12 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
             _validation_error("Every automation node must have a label.")
         if node.get("type") == "add_tag" and not node.get("draft_tag"):
             _validation_error("Add tag nodes must have draft tag configuration.")
+        if node.get("type") == "wait_duration":
+            total_minutes = _duration_minutes(node.get("duration", {}))
+            if total_minutes < 5:
+                _validation_error("Wait duration nodes must wait at least 5 minutes.")
+            if total_minutes > 365 * 24 * 60:
+                _validation_error("Wait duration nodes cannot wait more than 365 days.")
     if not any(node.get("type") == "exit" for node in nodes):
         _validation_error("Automation draft must contain an exit node.")
 

@@ -306,6 +306,42 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_run_next_on_wait_duration_returns_unsupported_node(self):
+        email, _ = self.create_contact()
+        nodes = [
+            {
+                "id": "node_wait_1",
+                "type": "wait_duration",
+                "label": "Wait",
+                "duration": {
+                    "days": 0,
+                    "hours": 0,
+                    "minutes": 5,
+                },
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        automation = self.create_automation()
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        automation = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Only add_tag and exit nodes can be executed manually", result.text)
+
+        self.cleanup(automation["id"])
+
     def test_once_does_not_allow_running_again_after_exit(self):
         email, _ = self.create_contact()
         automation = self.create_automation(reentry="once")

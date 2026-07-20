@@ -157,6 +157,21 @@ class Automation extends Component {
     });
   }
 
+  nodeDurationChange = (index, event) => {
+    const value = parseInt(event.target.value, 10);
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            duration: {
+              [event.target.id]: {$set: isNaN(value) ? 0 : value},
+            },
+          },
+        },
+      },
+    });
+  }
+
   tagData() {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
@@ -169,11 +184,18 @@ class Automation extends Component {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : 'Exit automation',
     };
 
     if (type === 'add_tag') {
       node.draft_tag = '';
+    }
+    if (type === 'wait_duration') {
+      node.duration = {
+        days: 0,
+        hours: 0,
+        minutes: 5,
+      };
     }
 
     this.props.update({
@@ -321,35 +343,80 @@ class Automation extends Component {
   }
 
   renderNodeConfig(node, index) {
-    if (node.type !== 'add_tag') {
-      return null;
+    if (node.type === 'add_tag') {
+      return (
+        <div style={{minWidth: '220px'}}>
+          <Select2
+            data={this.tagData()}
+            value={node.draft_tag || ''}
+            onSelect={this.nodeTagChange.bind(this, index)}
+            style={{width:'100%'}}
+            options={{
+              placeholder: 'Select or create tag',
+              tags: true,
+              createTag: function (params) {
+                const fixed = fixTag(params.term);
+                if (!fixed) {
+                  return null;
+                }
+                return {
+                  id: fixed,
+                  text: fixed,
+                };
+              }
+            }}
+          />
+          <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
+        </div>
+      );
     }
 
-    return (
-      <div style={{minWidth: '220px'}}>
-        <Select2
-          data={this.tagData()}
-          value={node.draft_tag || ''}
-          onSelect={this.nodeTagChange.bind(this, index)}
-          style={{width:'100%'}}
-          options={{
-            placeholder: 'Select or create tag',
-            tags: true,
-            createTag: function (params) {
-              const fixed = fixTag(params.term);
-              if (!fixed) {
-                return null;
-              }
-              return {
-                id: fixed,
-                text: fixed,
-              };
-            }
-          }}
-        />
-        <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
-      </div>
-    );
+    if (node.type === 'wait_duration') {
+      const duration = node.duration || {};
+      return (
+        <div className="form-inline" style={{minWidth: '280px'}}>
+          <FormControl
+            id="days"
+            type="number"
+            min="0"
+            value={duration.days || 0}
+            onChange={this.nodeDurationChange.bind(this, index)}
+            style={{width: '70px'}}
+          />
+          {' '}days{' '}
+          <FormControl
+            id="hours"
+            type="number"
+            min="0"
+            value={duration.hours || 0}
+            onChange={this.nodeDurationChange.bind(this, index)}
+            style={{width: '70px'}}
+          />
+          {' '}hours{' '}
+          <FormControl
+            id="minutes"
+            type="number"
+            min="0"
+            value={duration.minutes || 0}
+            onChange={this.nodeDurationChange.bind(this, index)}
+            style={{width: '70px'}}
+          />
+          {' '}minutes
+        </div>
+      );
+    }
+
+    return null;
+  }
+
+  nodeTypeLabel(type) {
+    if (type === 'add_tag') {
+      return 'Add tag';
+    }
+    if (type === 'wait_duration') {
+      return 'Wait';
+    }
+    return 'Exit';
   }
 
   renderEnrolments() {
@@ -604,6 +671,8 @@ class Automation extends Component {
                 <div>
                   <Button onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</Button>
                   {' '}
+                  <Button onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</Button>
+                  {' '}
                   <Button onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</Button>
                 </div>
               </div>
@@ -627,7 +696,7 @@ class Automation extends Component {
                           </td>
                           <td>
                             <h4 style={{whiteSpace: 'nowrap'}}>
-                              {node.type === 'add_tag' ? 'Add tag' : 'Exit'}
+                              {this.nodeTypeLabel(node.type)}
                             </h4>
                           </td>
                           <td>

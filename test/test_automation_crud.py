@@ -51,6 +51,34 @@ class TestAutomationCRUD(test_base.TestBase):
             ],
         }
 
+    def wait_workflow(self, duration=None):
+        if duration is None:
+            duration = {
+                "days": 0,
+                "hours": 0,
+                "minutes": 5,
+            }
+        return {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_wait_1",
+                        "type": "wait_duration",
+                        "label": "Wait",
+                        "duration": duration,
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
     def user_publish(self, automation_id):
         result = self.simulate_post(
             "/api/automations/%s/publish" % automation_id,
@@ -470,6 +498,89 @@ class TestAutomationCRUD(test_base.TestBase):
                     ],
                 },
             },
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_valid_wait_duration_publishes(self):
+        created = self.user_post("/api/automations", json={"name": "Wait Duration"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.wait_workflow())
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][0]["type"], "wait_duration")
+        self.assertEqual(
+            published["published"]["nodes"][0]["duration"],
+            {
+                "days": 0,
+                "hours": 0,
+                "minutes": 5,
+            },
+        )
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_wait_duration_below_five_minutes_fails_publish_validation(self):
+        created = self.user_post("/api/automations", json={"name": "Short Wait"})
+        automation_id = created["id"]
+
+        self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.wait_workflow({"days": 0, "hours": 0, "minutes": 4}),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("at least 5 minutes", result.text)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_wait_duration_above_365_days_fails_publish_validation(self):
+        created = self.user_post("/api/automations", json={"name": "Long Wait"})
+        automation_id = created["id"]
+
+        self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.wait_workflow({"days": 365, "hours": 0, "minutes": 1}),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("365 days", result.text)
+        self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_wait_duration_rejects_extra_duration_fields(self):
+        created = self.user_post("/api/automations", json={"name": "Bad Wait Duration"})
+        automation_id = created["id"]
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.wait_workflow(
+                {
+                    "days": 0,
+                    "hours": 0,
+                    "minutes": 5,
+                    "seconds": 1,
+                }
+            ),
             headers={
                 "X-Auth-UID": self.user_cookie["uid"],
                 "X-Auth-Cookie": self.user_cookie["id"],
