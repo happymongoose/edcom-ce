@@ -90,6 +90,34 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(found["draft"]["nodes"][0]["id"], "node_add_tag_1")
         self.assertEqual(found["draft"]["nodes"][0]["draft_tag"], "onboarding")
 
+        patched = self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json={
+                "entry": {
+                    "type": "manual",
+                },
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_add_tag_1",
+                            "type": "add_tag",
+                            "label": "Add renamed onboarding tag",
+                            "draft_tag": "onboarding",
+                        },
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit renamed automation",
+                        },
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(patched["draft"]["nodes"][0]["id"], "node_add_tag_1")
+        self.assertEqual(patched["draft"]["nodes"][0]["label"], "Add renamed onboarding tag")
+        self.assertEqual(patched["draft"]["nodes"][1]["id"], "node_exit_1")
+
         self.user_delete("/api/automations/%s" % automation_id)
 
     def test_rejects_invalid_draft_node_type(self):
@@ -120,6 +148,50 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.assertEqual(result.status_code, 400)
         self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_blocks_other_account_access(self):
+        created = self.user_post("/api/automations", json={"name": "Other Account"})
+        automation_id = created["id"]
+        other_cid = "other-account-cid"
+
+        self.db.execute(
+            "update automations set cid = %s where id = %s",
+            other_cid,
+            automation_id,
+        )
+
+        automations = self.user_get("/api/automations")
+        self.assertFalse(any(a["id"] == automation_id for a in automations))
+
+        headers = {
+            "X-Auth-UID": self.user_cookie["uid"],
+            "X-Auth-Cookie": self.user_cookie["id"],
+        }
+
+        result = self.simulate_get(
+            "/api/automations/%s" % automation_id,
+            headers=headers,
+        )
+        self.assertEqual(result.status_code, 403)
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation_id,
+            json={"name": "Should Not Update"},
+            headers=headers,
+        )
+        self.assertEqual(result.status_code, 403)
+
+        result = self.simulate_delete(
+            "/api/automations/%s" % automation_id,
+            headers=headers,
+        )
+        self.assertEqual(result.status_code, 403)
+
+        self.db.execute(
+            "delete from automations where id = %s and cid = %s",
+            automation_id,
+            other_cid,
+        )
 
     def test_rejects_extra_draft_node_fields(self):
         created = self.user_post("/api/automations", json={"name": "Extra Field"})
