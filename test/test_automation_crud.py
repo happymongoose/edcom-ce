@@ -3,6 +3,44 @@ import test_base
 
 class TestAutomationCRUD(test_base.TestBase):
 
+    def valid_workflow(self, label="Add onboarding tag", draft_tag="onboarding"):
+        return {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": label,
+                        "draft_tag": draft_tag,
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
+    def user_publish(self, automation_id):
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        if result.status_code < 200 or result.status_code >= 300:
+            print(result.status)
+            print(result.text)
+            assert False, "API request failed"
+
+        return result.json
+
     def test_draft_lifecycle(self):
         created = self.user_post("/api/automations", json={"name": "Welcome Series"})
 
@@ -184,6 +222,133 @@ class TestAutomationCRUD(test_base.TestBase):
         result = self.simulate_delete(
             "/api/automations/%s" % automation_id,
             headers=headers,
+        )
+        self.assertEqual(result.status_code, 403)
+
+        self.db.execute(
+            "delete from automations where id = %s and cid = %s",
+            automation_id,
+            other_cid,
+        )
+
+    def test_successful_publish(self):
+        created = self.user_post("/api/automations", json={"name": "Publish Me"})
+        automation_id = created["id"]
+
+        draft = self.valid_workflow()
+        self.user_patch("/api/automations/%s" % automation_id, json=draft)
+
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["status"], "published")
+        self.assertEqual(published["published"], {
+            "entry": draft["entry"],
+            "nodes": draft["draft"]["nodes"],
+        })
+        self.assertEqual(published["published_revision"], 1)
+        self.assertIn("published_at", published)
+        self.assertEqual(published["published_by"], self.user_cookie["uid"])
+
+        result = self.simulate_delete(
+            "/api/automations/%s" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_publish_validation_failure_does_not_modify_existing_published_data(self):
+        created = self.user_post("/api/automations", json={"name": "Publish Failure"})
+        automation_id = created["id"]
+
+        draft = self.valid_workflow()
+        self.user_patch("/api/automations/%s" % automation_id, json=draft)
+        published = self.user_publish(automation_id)
+
+        invalid_draft = self.valid_workflow(draft_tag="")
+        self.user_patch("/api/automations/%s" % automation_id, json=invalid_draft)
+        before_failed_publish = self.user_get("/api/automations/%s" % automation_id)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+
+        found = self.user_get("/api/automations/%s" % automation_id)
+        self.assertEqual(found, before_failed_publish)
+        self.assertEqual(found["published"], published["published"])
+        self.assertEqual(found["published_revision"], published["published_revision"])
+        self.assertEqual(found["published_at"], published["published_at"])
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_republish_increments_revision(self):
+        created = self.user_post("/api/automations", json={"name": "Republish"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.valid_workflow())
+        first = self.user_publish(automation_id)
+
+        self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.valid_workflow(label="Add updated tag", draft_tag="updated"),
+        )
+        second = self.user_publish(automation_id)
+
+        self.assertEqual(first["published_revision"], 1)
+        self.assertEqual(second["published_revision"], 2)
+        self.assertEqual(second["published"]["nodes"][0]["label"], "Add updated tag")
+        self.assertEqual(second["published"]["nodes"][0]["draft_tag"], "updated")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_published_snapshot_is_not_mutated_by_later_draft_edits(self):
+        created = self.user_post("/api/automations", json={"name": "Snapshot"})
+        automation_id = created["id"]
+
+        self.user_patch("/api/automations/%s" % automation_id, json=self.valid_workflow())
+        published = self.user_publish(automation_id)
+
+        self.user_patch(
+            "/api/automations/%s" % automation_id,
+            json=self.valid_workflow(label="Draft-only change", draft_tag="draft-only"),
+        )
+
+        found = self.user_get("/api/automations/%s" % automation_id)
+        self.assertEqual(found["published"], published["published"])
+        self.assertEqual(found["published"]["nodes"][0]["label"], "Add onboarding tag")
+        self.assertEqual(found["draft"]["nodes"][0]["label"], "Draft-only change")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_cross_account_publish_is_blocked(self):
+        created = self.user_post("/api/automations", json={"name": "No Publish Access"})
+        automation_id = created["id"]
+        other_cid = "other-account-cid"
+
+        self.db.execute(
+            "update automations set cid = %s where id = %s",
+            other_cid,
+            automation_id,
+        )
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
         )
         self.assertEqual(result.status_code, 403)
 

@@ -2,6 +2,7 @@ import React, { Component } from "react";
 import { Button, FormControl } from "react-bootstrap";
 import axios from "axios";
 import _ from "underscore";
+import moment from "moment";
 import shortid from "shortid";
 import LoaderButton from "../components/LoaderButton";
 import LoaderPanel from "../components/LoaderPanel";
@@ -41,6 +42,14 @@ function patchPayload(data) {
 }
 
 class Automation extends Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      isPublishing: false,
+    };
+  }
+
   goBack = () => {
     this.props.history.push('/automations');
   }
@@ -102,6 +111,25 @@ class Automation extends Component {
     }
   }
 
+  publish = async () => {
+    this.setState({isPublishing: true});
+
+    try {
+      const saved = await this.save();
+      if (!saved) {
+        return;
+      }
+
+      await axios.post('/api/automations/' + this.props.id + '/publish');
+      notify.show('Automation published', 'success');
+      await this.props.reload();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to publish automation'), 'error');
+    } finally {
+      this.setState({isPublishing: false});
+    }
+  }
+
   handleSubmit = async event => {
     const isclose = this.props.formClose(event);
 
@@ -114,18 +142,28 @@ class Automation extends Component {
 
   navbarButtons = () => {
     return (
-      <LoaderButton
-        id="automation-buttons-dropdown"
-        text="Save and Close"
-        loadingText="Saving..."
-        className="green"
-        disabled={this.props.isSaving}
-        onClick={this.props.formSubmit.bind(null, true)}
-        splitItems={[
-          { text: 'Save', onClick: this.props.formSubmit },
-          { text: 'Cancel', onClick: this.goBack }
-        ]}
-      />
+      <div>
+        <Button
+          bsStyle="primary"
+          disabled={this.props.isSaving || this.state.isPublishing}
+          onClick={this.publish}
+        >
+          {this.state.isPublishing ? 'Publishing...' : 'Publish'}
+        </Button>
+        {' '}
+        <LoaderButton
+          id="automation-buttons-dropdown"
+          text="Save and Close"
+          loadingText="Saving..."
+          className="green"
+          disabled={this.props.isSaving || this.state.isPublishing}
+          onClick={this.props.formSubmit.bind(null, true)}
+          splitItems={[
+            { text: 'Save', onClick: this.props.formSubmit },
+            { text: 'Cancel', onClick: this.goBack }
+          ]}
+        />
+      </div>
     );
   }
 
@@ -171,6 +209,18 @@ class Automation extends Component {
                 roph
                 space
               />
+            </EDFormBox>
+            <EDFormBox space>
+              <h4>Published Definition</h4>
+              {
+                data.published_at ?
+                  <p>
+                    Published {moment(data.published_at).format('lll')}
+                    {data.published_revision ? ' (revision ' + data.published_revision + ')' : ''}
+                  </p>
+                :
+                  <p>Not published</p>
+              }
             </EDFormBox>
             <EDFormBox space>
               <h4>Entry</h4>

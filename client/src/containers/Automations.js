@@ -20,6 +20,13 @@ function errorMessage(error, fallback) {
   return fallback;
 }
 
+function statusLabel(automation) {
+  if (automation.status === 'published' || automation.published_at) {
+    return 'Published';
+  }
+  return 'Draft';
+}
+
 class Automations extends Component {
   constructor(props) {
     super(props);
@@ -184,7 +191,7 @@ class Automations extends Component {
                         </td>
                         <td>
                           <h4 style={{whiteSpace: 'nowrap'}}>
-                            Draft
+                            {statusLabel(automation)}
                           </h4>
                         </td>
                         <td>

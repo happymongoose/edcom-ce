@@ -1,4 +1,5 @@
 import falcon
+import copy
 from datetime import datetime
 from jsonschema import validate
 
@@ -9,6 +10,7 @@ from .shared.crud import (
     check_noadmin,
 )
 from .shared.db import DB, JsonObj
+from .shared.utils import user_log
 
 
 NODE_ID_SCHEMA = {
@@ -152,6 +154,56 @@ def _prepare_doc(doc: JsonObj, create: bool) -> None:
         doc["created"] = now
 
 
+def _prepare_patch_doc(doc: JsonObj) -> None:
+    if "status" in doc and doc["status"] != "draft":
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation status",
+            description="Only publishing can update an automation to published.",
+        )
+
+    doc.pop("status", None)
+    doc["modified"] = _utc_now()
+
+
+def _validation_error(message: str) -> None:
+    raise falcon.HTTPBadRequest(title="Automation publish validation failed", description=message)
+
+
+def _published_snapshot(automation: JsonObj) -> JsonObj:
+    if not automation.get("name") or not automation.get("name").strip():
+        _validation_error("Automation must have a name before publishing.")
+
+    entry = automation.get("entry")
+    if entry is None:
+        _validation_error("Automation entry is required.")
+    _validate_doc(entry, ENTRY_SCHEMA)
+    if entry.get("type") != "manual":
+        _validation_error("Automation entry must be manual.")
+
+    draft = automation.get("draft")
+    if draft is None:
+        _validation_error("Automation draft workflow is required.")
+    _validate_doc(draft, DRAFT_SCHEMA)
+
+    nodes = draft.get("nodes") or []
+    if not nodes:
+        _validation_error("Automation draft must contain at least one node.")
+    for node in nodes:
+        if not node.get("id"):
+            _validation_error("Every automation node must have a stable ID.")
+        if not node.get("label") or not node.get("label").strip():
+            _validation_error("Every automation node must have a label.")
+        if node.get("type") == "add_tag" and not node.get("draft_tag"):
+            _validation_error("Add tag nodes must have draft tag configuration.")
+    if not any(node.get("type") == "exit" for node in nodes):
+        _validation_error("Automation draft must contain an exit node.")
+
+    return {
+        "entry": copy.deepcopy(entry),
+        "nodes": copy.deepcopy(nodes),
+    }
+
+
 class Automations(CRUDCollection):
 
     def __init__(self) -> None:
@@ -194,9 +246,10 @@ class Automation(CRUDSingle):
             )
 
         _validate_doc(doc, AUTOMATION_PATCH_SCHEMA)
-        _prepare_doc(doc, False)
+        _prepare_patch_doc(doc)
 
-        return CRUDSingle.on_patch(self, req, resp, id)
+        CRUDSingle.on_patch(self, req, resp, id)
+        req.context["result"] = req.context["db"].automations.get(id)
 
     def del_check(self, db: DB, id: str) -> None:
         automation = db.automations.get(id)
@@ -212,3 +265,32 @@ class Automation(CRUDSingle):
                 title="Automation cannot be deleted",
                 description="Only draft automations that have never been published or enrolled can be deleted.",
             )
+
+
+class AutomationPublish(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+
+        published = _published_snapshot(automation)
+        now = _utc_now()
+        revision = int(automation.get("published_revision", 0) or 0) + 1
+
+        doc = {
+            "status": "published",
+            "published": published,
+            "published_at": now,
+            "published_by": req.context["uid"],
+            "published_revision": revision,
+            "modified": now,
+        }
+
+        db.automations.patch(id, doc)
+        user_log(req, "pencil", "published automation ", "automations", id, ".")
+
+        req.context["result"] = db.automations.get(id)
