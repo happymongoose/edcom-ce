@@ -400,7 +400,7 @@ class Automation extends Component {
                                 this.state.reenrollingEnrolmentId === enrolment.id ?
                                   'Starting...'
                                 :
-                                  'Run test again'
+                                  'Run automation again'
                               }
                             </Button>
                         :
