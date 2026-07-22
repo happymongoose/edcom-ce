@@ -3927,6 +3927,8 @@ app.add_route("/api/automations/{id}/resume", automations.AutomationResume())
 app.add_route("/api/automations/{id}/enrolments", automations.AutomationEnrolments())
 app.add_route("/api/automations/{id}/enrolments/list", automations.AutomationListEnrolments())
 app.add_route("/api/automation-list-enrolments/{id}", automations.AutomationListEnrolmentStatus())
+app.add_route("/api/automations/{id}/enrolments/segment", automations.AutomationSegmentEnrolments())
+app.add_route("/api/automation-segment-enrolments/{id}", automations.AutomationSegmentEnrolmentStatus())
 app.add_route("/api/automations/{id}/history", automations.AutomationHistory())
 app.add_route(
     "/api/automations/{id}/enrolments/{enrolment_id}/run-next",

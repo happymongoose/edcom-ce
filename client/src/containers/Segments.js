@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Modal, Button, MenuItem, Row, Col } from "react-bootstrap";
+import { Modal, Button, FormControl, MenuItem, Row, Col } from "react-bootstrap";
 import { Link } from "react-router-dom";
 import axios from "axios";
 import _ from "underscore";
@@ -18,6 +18,20 @@ import Select2 from "react-select2-wrapper";
 import "react-select2-wrapper/css/select2.css";
 import './Segments.css';
 
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function errorMessage(error, fallback) {
+  const data = error && error.response && error.response.data;
+  if (data) {
+    return data.description || data.title || fallback;
+  }
+  return fallback;
+}
+
+function automationIsEnrollable(automation) {
+  return automation.status === 'published' || (automation.status === 'paused' && (automation.published || automation.published_at));
+}
+
 class Segments extends Component {
   state = {
     searchTerm: '',
@@ -27,6 +41,10 @@ class Segments extends Component {
     tagging: false,
     tags: [],
     tagName: '',
+    bulkSegment: null,
+    bulkAutomationId: '',
+    bulkEnrolling: false,
+    bulkResult: null,
   }
 
   createClicked = () => {
@@ -91,7 +109,99 @@ class Segments extends Component {
     notify.show('Download your export file from the Data Exports page', "success");
   }
 
+  automationOptions = () => {
+    return _.map(
+      _.sortBy(
+        _.filter(this.props.automations || [], automationIsEnrollable),
+        automation => (automation.name || '').toLowerCase()
+      ),
+      automation => ({
+        id: automation.id,
+        name: automation.name || automation.id,
+      })
+    );
+  }
+
+  addToAutomationClicked = segment => {
+    const options = this.automationOptions();
+    this.setState({
+      bulkSegment: segment,
+      bulkAutomationId: options.length ? options[0].id : '',
+      bulkEnrolling: false,
+      bulkResult: null,
+    });
+  }
+
+  closeBulkEnrolmentModal = () => {
+    if (this.state.bulkEnrolling) {
+      return;
+    }
+
+    this.setState({
+      bulkSegment: null,
+      bulkAutomationId: '',
+      bulkResult: null,
+    });
+  }
+
+  handleBulkAutomationChange = event => {
+    this.setState({bulkAutomationId: event.target.value});
+  }
+
+  pollBulkEnrolment = async gatherId => {
+    while (!this._unmounted) {
+      await delay(2000);
+      const response = (await axios.get('/api/automation-segment-enrolments/' + gatherId)).data;
+      if (response.error) {
+        throw new Error(response.error);
+      }
+      if (response.complete) {
+        return response.result;
+      }
+    }
+    return null;
+  }
+
+  bulkEnrolmentResultText = result => {
+    if (!result) {
+      return '';
+    }
+    return this.num(result.enrolled_count) + ' enrolled, ' +
+      this.num(result.skipped_count) + ' skipped, ' +
+      this.num(result.error_count) + ' errors';
+  }
+
+  confirmBulkEnrolment = async () => {
+    const segment = this.state.bulkSegment;
+    const automationId = this.state.bulkAutomationId;
+    if (!segment || !automationId) {
+      return;
+    }
+
+    this.setState({bulkEnrolling: true, bulkResult: null});
+    try {
+      const response = (await axios.post('/api/automations/' + automationId + '/enrolments/segment', {
+        segment_id: segment.id,
+      })).data;
+      const result = response.result || (response.id ? await this.pollBulkEnrolment(response.id) : null);
+      if (!result) {
+        return;
+      }
+
+      this.setState({bulkResult: result});
+      notify.show('Automation enrolment complete: ' + this.bulkEnrolmentResultText(result), result.error_count ? 'warning' : 'success', 15000);
+      await this.props.reload();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to add segment to automation'), 'error');
+    } finally {
+      if (!this._unmounted) {
+        this.setState({bulkEnrolling: false});
+      }
+    }
+  }
+
   componentDidMount() {
+    this._unmounted = false;
     this._interval = setInterval(() => {
       if (_.find(this.props.data, l => !_.isNumber(l.count) && l.count.startsWith("Loading"))) {
         this.props.reload();
@@ -100,6 +210,7 @@ class Segments extends Component {
   }
 
   componentWillUnmount() {
+    this._unmounted = true;
     clearInterval(this._interval);
   }
 
@@ -114,10 +225,125 @@ class Segments extends Component {
     })
   }
 
+  num(n) {
+    if (!n) n = 0;
+    return n.toLocaleString();
+  }
+
+  segmentCountText(segment) {
+    if (!segment) {
+      return '';
+    }
+    if (_.isNumber(segment.count)) {
+      return this.num(segment.count);
+    }
+    return segment.count || 'Unknown';
+  }
+
   render() {
+    const automationOptions = this.automationOptions();
+    const bulkSegment = this.state.bulkSegment;
+    const bulkResult = this.state.bulkResult;
+
     return (
       <div className="segments">
         <MenuNavbar {...this.props}>
+        <Modal show={!!bulkSegment} onHide={this.closeBulkEnrolmentModal}>
+          <Modal.Header closeButton={!this.state.bulkEnrolling}>
+            <Modal.Title>Add Segment to Automation</Modal.Title>
+          </Modal.Header>
+          <Modal.Body>
+            {
+              bulkSegment &&
+              <div>
+                <p>
+                  <strong>Segment:</strong> {bulkSegment.name}
+                </p>
+                <p>
+                  <strong>Estimated contacts:</strong> {this.segmentCountText(bulkSegment)}
+                </p>
+                {
+                  automationOptions.length ?
+                    <div>
+                      <label className="control-label" htmlFor="bulkAutomationId">Automation</label>
+                      {' '}
+                      <FormControl
+                        id="bulkAutomationId"
+                        componentClass="select"
+                        value={this.state.bulkAutomationId}
+                        onChange={this.handleBulkAutomationChange}
+                        disabled={this.state.bulkEnrolling}
+                      >
+                        {
+                          _.map(automationOptions, automation =>
+                            <option key={automation.id} value={automation.id}>{automation.name}</option>
+                          )
+                        }
+                      </FormControl>
+                      <p className="help-block">
+                        Re-entry rules may skip contacts that have already entered this automation or already have an active pass.
+                      </p>
+                    </div>
+                  :
+                    <p>No published automations are available.</p>
+                }
+                {
+                  this.state.bulkEnrolling &&
+                  <p className="text-info">Adding contacts to automation...</p>
+                }
+                {
+                  bulkResult &&
+                  <div>
+                    <hr />
+                    <h4>Result</h4>
+                    <p>{this.bulkEnrolmentResultText(bulkResult)}</p>
+                    {
+                      bulkResult.skipped && bulkResult.skipped.length > 0 &&
+                      <div>
+                        <h5>Skipped</h5>
+                        <ul>
+                          {
+                            _.map(bulkResult.skipped.slice(0, 5), (skipped, index) =>
+                              <li key={index}>{skipped.contact_email || skipped.contact_id}: {skipped.description || skipped.reason}</li>
+                            )
+                          }
+                        </ul>
+                      </div>
+                    }
+                    {
+                      bulkResult.errors && bulkResult.errors.length > 0 &&
+                      <div>
+                        <h5>Errors</h5>
+                        <ul>
+                          {
+                            _.map(bulkResult.errors.slice(0, 5), (error, index) =>
+                              <li key={index}>{error.contact_email || error.contact_id || 'Error'}: {error.description || error.reason || error.message}</li>
+                            )
+                          }
+                        </ul>
+                      </div>
+                    }
+                  </div>
+                }
+              </div>
+            }
+          </Modal.Body>
+          <Modal.Footer>
+            <Button onClick={this.closeBulkEnrolmentModal} disabled={this.state.bulkEnrolling}>
+              {bulkResult ? 'Close' : 'Cancel'}
+            </Button>
+            {
+              !bulkResult &&
+              <Button
+                bsStyle="primary"
+                onClick={this.confirmBulkEnrolment}
+                disabled={this.state.bulkEnrolling || !this.state.bulkAutomationId || !automationOptions.length}
+              >
+                {this.state.bulkEnrolling ? 'Adding...' : 'Add to automation'}
+              </Button>
+            }
+          </Modal.Footer>
+        </Modal>
         <TitlePage title="Segments" button={
           <Button bsStyle="primary" onClick={this.createClicked}>Create Segment</Button>
         } />
@@ -213,6 +439,7 @@ class Segments extends Component {
                           <MenuItem onClick={() => this.props.history.push('/segments/edit?id=' + s.id)}>Edit</MenuItem>
                           <MenuItem onClick={this.tagClicked.bind(this, s.id)}>Tag</MenuItem>
                           <MenuItem onClick={this.untagClicked.bind(this, s.id)}>Untag</MenuItem>
+                          <MenuItem onClick={this.addToAutomationClicked.bind(this, s)}>Add to Automation</MenuItem>
                           {
                           this.props.user && !this.props.user.nodataexport &&
                           <MenuItem onClick={this.exportClicked.bind(this, s.id)}>Export</MenuItem>
@@ -244,5 +471,6 @@ export default withLoadSave({
   get: async () => _.sortBy((await axios.get('/api/segments')).data, s => s.modified).reverse(),
   extra: {
     tags: async() => (await axios.get('/api/recenttags')).data,
+    automations: async () => (await axios.get('/api/automations')).data,
   },
 });

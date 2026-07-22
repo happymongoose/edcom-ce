@@ -5,7 +5,7 @@ import dateutil.parser
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
 from jsonschema import validate
-from typing import List
+from typing import Dict, List
 
 from .shared import config as _  # noqa: F401
 from .shared import contacts
@@ -19,6 +19,15 @@ from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
+from .shared.segments import (
+    Cache,
+    segment_get_segments,
+    segment_get_campaignids,
+    segment_get_params,
+    get_segment_sentrows,
+    get_segment_rows,
+    segment_eval_parts,
+)
 
 
 NODE_ID_SCHEMA = {
@@ -262,6 +271,18 @@ AUTOMATION_LIST_ENROLMENT_SCHEMA = {
     "required": ["list_id"],
     "properties": {
         "list_id": {
+            "type": "string",
+            "minLength": 1,
+        },
+    },
+    "additionalProperties": False,
+}
+
+AUTOMATION_SEGMENT_ENROLMENT_SCHEMA = {
+    "type": "object",
+    "required": ["segment_id"],
+    "properties": {
+        "segment_id": {
             "type": "string",
             "minLength": 1,
         },
@@ -1200,6 +1221,213 @@ class AutomationListEnrolments(object):
 
 
 class AutomationListEnrolmentStatus(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        db.set_cid(None)
+
+        data = gather_check(db, id)
+        if data is None:
+            req.context["result"] = {}
+        else:
+            req.context["result"] = _finish_bulk_list_enrolment(data)
+
+
+def _bulk_enrol_segment_bucket(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    segment_id: str,
+    hashval: int,
+    listfactors: List[str],
+    hashlimit: int,
+    campaignids: List[str],
+) -> JsonObj:
+    result = _empty_bulk_result()
+    db.set_cid(cid)
+
+    automation = db.automations.get(automation_id)
+    if automation is None:
+        result["error_count"] = 1
+        result["errors"].append({
+            "description": "Automation was not found for this account.",
+        })
+        return result
+    _published_enrolment_context(automation)
+
+    segment = db.segments.get(segment_id)
+    if segment is None:
+        result["error_count"] = 1
+        result["errors"].append({
+            "description": "Segment was not found for this account.",
+        })
+        return result
+
+    segments: Dict[str, JsonObj] = {}
+    segment_get_segments(db, segment["parts"], segments)
+    sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+    rows = get_segment_rows(db, cid, hashval, listfactors, hashlimit)
+
+    cache = Cache()
+    segcounts: Dict[str, int] = {}
+    numrows = len(rows)
+    emails = []
+    for row in rows:
+        if segment_eval_parts(
+            segment["parts"],
+            segment["operator"],
+            row,
+            segcounts,
+            numrows,
+            segments,
+            sentrows,
+            segment,
+            hashlimit,
+            cache,
+        ):
+            emails.append(row["Email"][0])
+
+    if not emails:
+        return result
+
+    contact_rows = db.execute(
+        f"""
+        select contact_id, email
+        from contacts."contacts_{cid}"
+        where email = any(%s)
+            and ({hashlimit} = 1 or mod(contact_id, {hashlimit}) = %s)
+        order by contact_id
+        """,
+        emails,
+        hashval,
+    ).fetchall()
+
+    for contact_id, contact_email in contact_rows:
+        try:
+            outcome = _create_enrolment_for_contact(
+                db,
+                cid,
+                automation_id,
+                automation,
+                contact_id,
+                contact_email,
+                "segment:%s" % segment_id,
+            )
+            _record_bulk_outcome(result, outcome)
+        except Exception as e:
+            _record_bulk_outcome(result, {
+                "status": "error",
+                "contact_id": contact_id,
+                "contact_email": contact_email,
+                "description": str(e),
+            })
+
+    return result
+
+
+@tasks.task(priority=HIGH_PRIORITY)
+def bulk_enrol_segment_bucket(
+    cid: str,
+    automation_id: str,
+    segment_id: str,
+    hashval: int,
+    listfactors: List[str],
+    hashlimit: int,
+    campaignids: List[str],
+    gatherid: str,
+) -> None:
+    with open_db() as db:
+        try:
+            result = _bulk_enrol_segment_bucket(
+                db,
+                cid,
+                automation_id,
+                segment_id,
+                hashval,
+                listfactors,
+                hashlimit,
+                campaignids,
+            )
+            gather_complete(db, gatherid, result, False)
+        except Exception as e:
+            gather_complete(
+                db,
+                gatherid,
+                {
+                    "enrolled_count": 0,
+                    "skipped_count": 0,
+                    "error_count": 1,
+                    "skipped": [],
+                    "errors": [{"description": str(e)}],
+                },
+                False,
+            )
+
+
+class AutomationSegmentEnrolments(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc")
+        if not doc:
+            raise falcon.HTTPBadRequest(
+                title="Not JSON", description="A valid JSON document is required."
+            )
+        _validate_doc(doc, AUTOMATION_SEGMENT_ENROLMENT_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        _published_enrolment_context(automation)
+
+        segment_id = doc["segment_id"]
+        segment = db.segments.get(segment_id)
+        if segment is None:
+            raise falcon.HTTPForbidden()
+
+        segments: Dict[str, JsonObj] = {}
+        segment_get_segments(db, segment["parts"], segments)
+        campaignids = segment_get_campaignids(segment, list(segments.values()))
+        hashlimit, listfactors = segment_get_params(db, cid, segment)
+
+        if hashlimit == 1:
+            result = _bulk_enrol_segment_bucket(
+                db,
+                cid,
+                id,
+                segment_id,
+                0,
+                listfactors,
+                hashlimit,
+                campaignids,
+            )
+            req.context["result"] = _finish_bulk_list_enrolment([result])
+            return
+
+        gatherid = gather_init(db, "automation_segment_enrolment", hashlimit)
+        for hashval in range(hashlimit):
+            run_task(
+                bulk_enrol_segment_bucket,
+                cid,
+                id,
+                segment_id,
+                hashval,
+                listfactors,
+                hashlimit,
+                campaignids,
+                gatherid,
+            )
+
+        req.context["result"] = {"id": gatherid}
+
+
+class AutomationSegmentEnrolmentStatus(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
