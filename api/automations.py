@@ -350,6 +350,64 @@ def _node_by_id(nodes: list[JsonObj], node_id: str | None) -> JsonObj | None:
     return None
 
 
+def _node_display(node: JsonObj, node_positions: dict[str, int]) -> str:
+    node_id = node.get("id", "")
+    step = node_positions.get(node_id, -1) + 1
+    label = (node.get("label") or node.get("type") or node_id).strip()
+    if step > 0:
+        return "Step %s %s" % (step, label)
+    return label
+
+
+def _workflow_edges(nodes: list[JsonObj]) -> dict[str, list[str]]:
+    edges = {}
+    for index, node in enumerate(nodes):
+        node_id = node.get("id")
+        node_type = node.get("type")
+        if node_type == "exit":
+            edges[node_id] = []
+        elif node_type == "go_to":
+            edges[node_id] = [node.get("target_node_id")]
+        elif node_type == "if_has_tag":
+            edges[node_id] = [node.get("yes_node_id"), node.get("no_node_id")]
+        elif index + 1 < len(nodes):
+            edges[node_id] = [nodes[index + 1].get("id")]
+        else:
+            edges[node_id] = []
+    return edges
+
+
+def _validate_no_workflow_cycles(nodes: list[JsonObj], node_positions: dict[str, int]) -> None:
+    node_map = {node.get("id"): node for node in nodes}
+    edges = _workflow_edges(nodes)
+    states: dict[str, str] = {}
+    stack: list[str] = []
+
+    def visit(node_id: str) -> None:
+        state = states.get(node_id)
+        if state == "visited":
+            return
+        if state == "visiting":
+            start = stack.index(node_id)
+            cycle_ids = stack[start:] + [node_id]
+            cycle = " -> ".join(
+                _node_display(node_map[cycle_id], node_positions)
+                for cycle_id in cycle_ids
+            )
+            _validation_error("Workflow contains a cycle: %s." % cycle)
+
+        states[node_id] = "visiting"
+        stack.append(node_id)
+        for target_id in edges.get(node_id, []):
+            if target_id in node_map:
+                visit(target_id)
+        stack.pop()
+        states[node_id] = "visited"
+
+    for node in nodes:
+        visit(node.get("id"))
+
+
 def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
     return bool(
         db.single(
@@ -423,6 +481,7 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
                 _validation_error("Wait duration nodes must wait at least 5 minutes.")
             if total_minutes > 365 * 24 * 60:
                 _validation_error("Wait duration nodes cannot wait more than 365 days.")
+    _validate_no_workflow_cycles(nodes, node_positions)
     return {
         "entry": copy.deepcopy(entry),
         "reentry": reentry,

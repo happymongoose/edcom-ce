@@ -111,6 +111,16 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         }
 
+    def workflow_with_nodes(self, nodes):
+        return {
+            "entry": {
+                "type": "manual",
+            },
+            "draft": {
+                "nodes": nodes,
+            },
+        }
+
     def go_to_workflow(self, go_to=None):
         if go_to is None:
             go_to = {
@@ -769,6 +779,164 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(published["published"]["nodes"][0]["yes_node_id"], "node_go_to_1")
         self.assertEqual(published["published"]["nodes"][1]["type"], "go_to")
 
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def assert_publish_fails(self, workflow, message):
+        created = self.user_post("/api/automations", json={"name": "Invalid Workflow"})
+        automation_id = created["id"]
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(message, result.text)
+        self.user_delete("/api/automations/%s" % automation_id)
+        return result
+
+    def test_condition_yes_branch_cycle_fails_publish_validation(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add before condition",
+                "draft_tag": "before-condition",
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        result = self.assert_publish_fails(workflow, "Workflow contains a cycle")
+        self.assertIn("Step 1 Add before condition", result.text)
+        self.assertIn("Step 2 If contact has tag", result.text)
+
+    def test_condition_no_branch_cycle_fails_publish_validation(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add before condition",
+                "draft_tag": "before-condition",
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_exit_1",
+                "no_node_id": "node_add_tag_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+
+    def test_linear_progression_is_counted_in_cycle_detection(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_wait_1",
+                "type": "wait_duration",
+                "label": "Wait before condition",
+                "duration": {
+                    "days": 0,
+                    "hours": 0,
+                    "minutes": 5,
+                },
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_wait_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+
+    def test_exit_breaks_cycle_detection_paths(self):
+        created = self.user_post("/api/automations", json={"name": "Exit Breaks Paths"})
+        automation_id = created["id"]
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add before exit",
+                "draft_tag": "before-exit",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+        ])
+
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][2]["yes_node_id"], "node_add_tag_1")
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_implicit_completion_has_no_outgoing_cycle_edge(self):
+        created = self.user_post("/api/automations", json={"name": "Implicit Completion No Cycle"})
+        automation_id = created["id"]
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_add_tag_1",
+            },
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add final tag",
+                "draft_tag": "final-tag",
+            },
+        ])
+
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][-1]["id"], "node_add_tag_1")
         self.db.set_cid(self.user_cookie["cid"])
         self.db.automations.remove(automation_id)
 
