@@ -5,6 +5,7 @@ import dateutil.parser
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
 from jsonschema import validate
+from typing import List
 
 from .shared import config as _  # noqa: F401
 from .shared import contacts
@@ -13,9 +14,11 @@ from .shared.crud import (
     CRUDSingle,
     check_noadmin,
 )
-from .shared.db import DB, JsonObj
+from .shared.db import DB, JsonObj, open_db
+from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
+from .shared.utils import gather_init, gather_complete, gather_check, run_task
 
 
 NODE_ID_SCHEMA = {
@@ -254,6 +257,20 @@ AUTOMATION_ENROLMENT_SCHEMA = {
     "additionalProperties": False,
 }
 
+AUTOMATION_LIST_ENROLMENT_SCHEMA = {
+    "type": "object",
+    "required": ["list_id"],
+    "properties": {
+        "list_id": {
+            "type": "string",
+            "minLength": 1,
+        },
+    },
+    "additionalProperties": False,
+}
+
+BULK_DETAIL_LIMIT = 100
+
 
 def _validate_doc(doc: JsonObj, schema: JsonObj) -> None:
     try:
@@ -424,6 +441,167 @@ def _enrolment_obj(row) -> JsonObj | None:
     data["contact_id"] = contact_id
     data["contact_email"] = contact_email
     return data
+
+
+def _published_enrolment_context(automation: JsonObj) -> tuple[JsonObj, List[JsonObj], str]:
+    published = automation.get("published")
+    if not published:
+        raise falcon.HTTPBadRequest(
+            title="Automation is not published",
+            description="Publish the automation before enrolling contacts.",
+        )
+
+    nodes = published.get("nodes") or []
+    if not nodes:
+        raise falcon.HTTPBadRequest(
+            title="Automation has no published nodes",
+            description="Publish a workflow with at least one node before enrolling contacts.",
+        )
+
+    reentry = published.get("reentry", automation.get("reentry", "once"))
+    _validate_doc(reentry, REENTRY_SCHEMA)
+    return published, nodes, reentry
+
+
+def _create_enrolment_for_contact(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    automation: JsonObj,
+    contact_id: int,
+    contact_email: str,
+    source: str,
+) -> JsonObj:
+    _, nodes, reentry = _published_enrolment_context(automation)
+
+    existing_enrolment_id = db.single(
+        """
+        select id
+        from automation_enrolments
+        where cid = %s and automation_id = %s and contact_id = %s
+        limit 1
+        """,
+        cid,
+        automation_id,
+        contact_id,
+    )
+    if reentry == "once" and existing_enrolment_id:
+        return {
+            "status": "skipped",
+            "reason": "once",
+            "title": "Contact already enrolled",
+            "description": "This automation only allows a contact to enter once.",
+            "contact_id": contact_id,
+            "contact_email": contact_email,
+            "existing_enrolment_id": existing_enrolment_id,
+        }
+
+    if reentry == "multiple":
+        active_enrolment_id = db.single(
+            """
+            select id
+            from automation_enrolments
+            where cid = %s
+                and automation_id = %s
+                and contact_id = %s
+                and coalesce(data->>'status', '') <> all(%s)
+            limit 1
+            """,
+            cid,
+            automation_id,
+            contact_id,
+            list(TERMINAL_ENROLMENT_STATUSES),
+        )
+        if active_enrolment_id:
+            return {
+                "status": "skipped",
+                "reason": "active_pass",
+                "title": "Contact already has an active automation pass",
+                "description": "This contact already has an active enrolment in this automation.",
+                "contact_id": contact_id,
+                "contact_email": contact_email,
+                "existing_enrolment_id": active_enrolment_id,
+            }
+
+    now = _utc_now()
+    enrolment_id = shortuuid.uuid()
+    data = {
+        "status": "held" if automation.get("status") == "paused" else "ready",
+        "source": source,
+        "current_node_id": nodes[0]["id"],
+        "published_revision": automation.get("published_revision"),
+        "created": now,
+        "modified": now,
+    }
+
+    db.execute(
+        """
+        insert into automation_enrolments
+            (id, cid, automation_id, contact_id, contact_email, data)
+        values (%s, %s, %s, %s, %s, %s)
+        """,
+        enrolment_id,
+        cid,
+        automation_id,
+        contact_id,
+        contact_email,
+        data,
+    )
+
+    return {
+        "status": "enrolled",
+        "enrolment_id": enrolment_id,
+        "contact_id": contact_id,
+        "contact_email": contact_email,
+    }
+
+
+def _empty_bulk_result() -> JsonObj:
+    return {
+        "enrolled_count": 0,
+        "skipped_count": 0,
+        "error_count": 0,
+        "skipped": [],
+        "errors": [],
+    }
+
+
+def _record_bulk_outcome(result: JsonObj, outcome: JsonObj) -> None:
+    if outcome.get("status") == "enrolled":
+        result["enrolled_count"] += 1
+    elif outcome.get("status") == "skipped":
+        result["skipped_count"] += 1
+        if len(result["skipped"]) < BULK_DETAIL_LIMIT:
+            result["skipped"].append({
+                "contact_id": outcome.get("contact_id"),
+                "contact_email": outcome.get("contact_email"),
+                "reason": outcome.get("reason"),
+                "description": outcome.get("description"),
+                "existing_enrolment_id": outcome.get("existing_enrolment_id"),
+            })
+    else:
+        result["error_count"] += 1
+        if len(result["errors"]) < BULK_DETAIL_LIMIT:
+            result["errors"].append(outcome)
+
+
+def _finish_bulk_list_enrolment(data: List[JsonObj]) -> JsonObj:
+    result = _empty_bulk_result()
+    for item in data:
+        result["enrolled_count"] += int(item.get("enrolled_count", 0) or 0)
+        result["skipped_count"] += int(item.get("skipped_count", 0) or 0)
+        result["error_count"] += int(item.get("error_count", 0) or 0)
+        for skipped in item.get("skipped", []):
+            if len(result["skipped"]) < BULK_DETAIL_LIMIT:
+                result["skipped"].append(skipped)
+        for error in item.get("errors", []):
+            if len(result["errors"]) < BULK_DETAIL_LIMIT:
+                result["errors"].append(error)
+
+    return {
+        "complete": True,
+        "result": result,
+    }
 
 
 def _step_run_obj(row) -> JsonObj | None:
@@ -747,19 +925,7 @@ class AutomationEnrolments(object):
         if automation is None:
             raise falcon.HTTPForbidden()
 
-        published = automation.get("published")
-        if not published:
-            raise falcon.HTTPBadRequest(
-                title="Automation is not published",
-                description="Publish the automation before enrolling contacts.",
-            )
-
-        nodes = published.get("nodes") or []
-        if not nodes:
-            raise falcon.HTTPBadRequest(
-                title="Automation has no published nodes",
-                description="Publish a workflow with at least one node before enrolling contacts.",
-            )
+        _published_enrolment_context(automation)
 
         email = doc["email"].strip().lower()
         match = emailre.search(email)
@@ -780,68 +946,25 @@ class AutomationEnrolments(object):
             )
         contact_id, contact_email = contact
 
-        reentry = published.get("reentry", automation.get("reentry", "once"))
-        _validate_doc(reentry, REENTRY_SCHEMA)
-        existing_enrolment_id = db.single(
-            """
-            select id
-            from automation_enrolments
-            where cid = %s and automation_id = %s and contact_id = %s
-            limit 1
-            """,
+        outcome = _create_enrolment_for_contact(
+            db,
             cid,
             id,
-            contact_id,
-        )
-        if reentry == "once" and existing_enrolment_id:
-            raise falcon.HTTPBadRequest(
-                title="Contact already enrolled",
-                description="This automation only allows a contact to enter once.",
-            )
-        if reentry == "multiple" and db.single(
-            """
-            select id
-            from automation_enrolments
-            where cid = %s
-                and automation_id = %s
-                and contact_id = %s
-                and coalesce(data->>'status', '') <> all(%s)
-            limit 1
-            """,
-            cid,
-            id,
-            contact_id,
-            list(TERMINAL_ENROLMENT_STATUSES),
-        ):
-            raise falcon.HTTPBadRequest(
-                title="Contact already has an active automation pass",
-                description="This contact already has an active enrolment in this automation.",
-            )
-
-        now = _utc_now()
-        enrolment_id = shortuuid.uuid()
-        data = {
-            "status": "held" if automation.get("status") == "paused" else "ready",
-            "source": "manual",
-            "current_node_id": nodes[0]["id"],
-            "published_revision": automation.get("published_revision"),
-            "created": now,
-            "modified": now,
-        }
-
-        db.execute(
-            """
-            insert into automation_enrolments
-                (id, cid, automation_id, contact_id, contact_email, data)
-            values (%s, %s, %s, %s, %s, %s)
-            """,
-            enrolment_id,
-            cid,
-            id,
+            automation,
             contact_id,
             contact_email,
-            data,
+            "manual",
         )
+        if outcome.get("status") == "skipped" and outcome.get("reason") == "once":
+            raise falcon.HTTPBadRequest(
+                title=outcome["title"],
+                description=outcome["description"],
+            )
+        if outcome.get("status") == "skipped" and outcome.get("reason") == "active_pass":
+            raise falcon.HTTPBadRequest(
+                title=outcome["title"],
+                description=outcome["description"],
+            )
 
         resp.status = falcon.HTTP_201
         req.context["result"] = _enrolment_obj(
@@ -852,9 +975,184 @@ class AutomationEnrolments(object):
                 where cid = %s and id = %s
                 """,
                 cid,
-                enrolment_id,
+                outcome["enrolment_id"],
             )
         )
+
+
+def _bulk_enrol_list_bucket(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    list_id: str,
+    hashval: int,
+    hashlimit: int,
+) -> JsonObj:
+    result = _empty_bulk_result()
+    db.set_cid(cid)
+
+    automation = db.automations.get(automation_id)
+    if automation is None:
+        result["error_count"] = 1
+        result["errors"].append({
+            "description": "Automation was not found for this account.",
+        })
+        return result
+    _published_enrolment_context(automation)
+
+    lst = db.lists.get(list_id)
+    if lst is None:
+        result["error_count"] = 1
+        result["errors"].append({
+            "description": "Contact list was not found for this account.",
+        })
+        return result
+
+    rows = db.execute(
+        f"""
+        select distinct c.contact_id, c.email
+        from contacts."contacts_{cid}" c
+        join contacts."contact_lists_{cid}" l on l.contact_id = c.contact_id
+        where l.list_id = %s
+            and ({hashlimit} = 1 or mod(c.contact_id, {hashlimit}) = %s)
+            and ({hashlimit} = 1 or mod(l.contact_id, {hashlimit}) = %s)
+        order by c.contact_id
+        """,
+        list_id,
+        hashval,
+        hashval,
+    ).fetchall()
+
+    for contact_id, contact_email in rows:
+        try:
+            outcome = _create_enrolment_for_contact(
+                db,
+                cid,
+                automation_id,
+                automation,
+                contact_id,
+                contact_email,
+                "list:%s" % list_id,
+            )
+            _record_bulk_outcome(result, outcome)
+        except Exception as e:
+            _record_bulk_outcome(result, {
+                "status": "error",
+                "contact_id": contact_id,
+                "contact_email": contact_email,
+                "description": str(e),
+            })
+
+    return result
+
+
+@tasks.task(priority=HIGH_PRIORITY)
+def bulk_enrol_list_bucket(
+    cid: str,
+    automation_id: str,
+    list_id: str,
+    hashval: int,
+    hashlimit: int,
+    gatherid: str,
+) -> None:
+    with open_db() as db:
+        try:
+            result = _bulk_enrol_list_bucket(
+                db,
+                cid,
+                automation_id,
+                list_id,
+                hashval,
+                hashlimit,
+            )
+            gather_complete(db, gatherid, result, False)
+        except Exception as e:
+            gather_complete(
+                db,
+                gatherid,
+                {
+                    "enrolled_count": 0,
+                    "skipped_count": 0,
+                    "error_count": 1,
+                    "skipped": [],
+                    "errors": [{"description": str(e)}],
+                },
+                False,
+            )
+
+
+class AutomationListEnrolments(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc")
+        if not doc:
+            raise falcon.HTTPBadRequest(
+                title="Not JSON", description="A valid JSON document is required."
+            )
+        _validate_doc(doc, AUTOMATION_LIST_ENROLMENT_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        _published_enrolment_context(automation)
+
+        list_id = doc["list_id"]
+        lst = db.lists.get(list_id)
+        if lst is None:
+            raise falcon.HTTPForbidden()
+
+        contact_count = db.single(
+            f"""
+            select count(distinct c.contact_id)
+            from contacts."contacts_{cid}" c
+            join contacts."contact_lists_{cid}" l on l.contact_id = c.contact_id
+            where l.list_id = %s
+            """,
+            list_id,
+        )
+        if not contact_count:
+            req.context["result"] = _finish_bulk_list_enrolment([_empty_bulk_result()])
+            return
+
+        hashlimit = contacts.get_hashlimit(db, cid, [lst])
+        if hashlimit == 1:
+            result = _bulk_enrol_list_bucket(db, cid, id, list_id, 0, hashlimit)
+            req.context["result"] = _finish_bulk_list_enrolment([result])
+            return
+
+        gatherid = gather_init(db, "automation_list_enrolment", hashlimit)
+        for hashval in range(hashlimit):
+            run_task(
+                bulk_enrol_list_bucket,
+                cid,
+                id,
+                list_id,
+                hashval,
+                hashlimit,
+                gatherid,
+            )
+
+        req.context["result"] = {"id": gatherid}
+
+
+class AutomationListEnrolmentStatus(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        db.set_cid(None)
+
+        data = gather_check(db, id)
+        if data is None:
+            req.context["result"] = {}
+        else:
+            req.context["result"] = _finish_bulk_list_enrolment(data)
 
 
 class AutomationHistory(object):

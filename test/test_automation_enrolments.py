@@ -5,6 +5,81 @@ import test_base
 
 class TestAutomationEnrolments(test_base.TestBase):
 
+    def setUp(self):
+        super(TestAutomationEnrolments, self).setUp()
+        self.created_automation_ids = []
+        self.created_list_ids = []
+        self.created_emails = []
+        self.created_gather_ids = []
+
+    def tearDown(self):
+        cid = self.user_cookie["cid"]
+        if self.created_automation_ids:
+            self.db.execute(
+                "delete from automation_step_runs where automation_id = any(%s)",
+                self.created_automation_ids,
+            )
+            self.db.execute(
+                "delete from automation_enrolments where automation_id = any(%s)",
+                self.created_automation_ids,
+            )
+            self.db.execute(
+                "delete from automations where id = any(%s) and cid = %s",
+                self.created_automation_ids,
+                cid,
+            )
+        if self.created_emails:
+            contact_ids = [
+                row[0]
+                for row in self.db.execute(
+                    f"""select contact_id from contacts."contacts_{cid}" where email = any(%s)""",
+                    self.created_emails,
+                )
+            ]
+            if contact_ids:
+                self.db.execute(
+                    "delete from automation_step_runs where contact_id = any(%s) and cid = %s",
+                    contact_ids,
+                    cid,
+                )
+                self.db.execute(
+                    "delete from automation_enrolments where contact_id = any(%s) and cid = %s",
+                    contact_ids,
+                    cid,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_values_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_lists_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+            self.db.execute(
+                f"""delete from contacts."contacts_{cid}" where email = any(%s)""",
+                self.created_emails,
+            )
+        if self.created_list_ids:
+            self.db.execute(
+                f"""delete from contacts."contact_lists_{cid}" where list_id = any(%s)""",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from lists where id = any(%s) and cid = %s",
+                self.created_list_ids,
+                cid,
+            )
+        if self.created_gather_ids:
+            self.db.execute(
+                "delete from taskgatherdata where data->>'gatherid' = any(%s)",
+                self.created_gather_ids,
+            )
+            self.db.execute(
+                "delete from taskgather where id = any(%s)",
+                self.created_gather_ids,
+            )
+        super(TestAutomationEnrolments, self).tearDown()
+
     def unique(self):
         return shortuuid.uuid().lower()
 
@@ -18,6 +93,7 @@ class TestAutomationEnrolments(test_base.TestBase):
         suffix = self.unique()
         email = "automation-%s@example.com" % suffix
         lst = self.user_post("/api/lists", json={"name": "automation_enrolments_%s" % suffix})
+        self.created_list_ids.append(lst["id"])
         self.user_post(
             "/api/lists/%s/feed" % lst["id"],
             json={
@@ -31,7 +107,32 @@ class TestAutomationEnrolments(test_base.TestBase):
             f"""select contact_id from contacts."contacts_{self.user_cookie['cid']}" where email = %s""",
             email,
         )
+        self.created_emails.append(email)
         return email, contact_id, lst["id"]
+
+    def create_list_with_contacts(self, count):
+        suffix = self.unique()
+        lst = self.user_post("/api/lists", json={"name": "automation_bulk_%s" % suffix})
+        self.created_list_ids.append(lst["id"])
+        contacts = []
+        for index in range(count):
+            email = "automation-bulk-%s-%s@example.com" % (suffix, index)
+            self.user_post(
+                "/api/lists/%s/feed" % lst["id"],
+                json={
+                    "email": email,
+                    "data": {
+                        "First Name": "Bulk",
+                    },
+                },
+            )
+            contact_id = self.db.single(
+                f"""select contact_id from contacts."contacts_{self.user_cookie['cid']}" where email = %s""",
+                email,
+            )
+            self.created_emails.append(email)
+            contacts.append((email, contact_id))
+        return lst["id"], contacts
 
     def workflow(self, reentry=None):
         doc = {
@@ -64,6 +165,7 @@ class TestAutomationEnrolments(test_base.TestBase):
             "/api/automations",
             json={"name": "automation_enrolments_%s" % suffix},
         )
+        self.created_automation_ids.append(automation["id"])
         self.user_patch(
             "/api/automations/%s" % automation["id"],
             json=self.workflow(reentry),
@@ -81,6 +183,24 @@ class TestAutomationEnrolments(test_base.TestBase):
             json={"email": email},
             headers=self.headers(),
         )
+
+    def bulk_enrol(self, automation_id, list_id):
+        return self.simulate_post(
+            "/api/automations/%s/enrolments/list" % automation_id,
+            json={"list_id": list_id},
+            headers=self.headers(),
+        )
+
+    def bulk_result(self, response):
+        self.assertEqual(response.status_code, 200)
+        payload = response.json
+        if "id" in payload:
+            self.created_gather_ids.append(payload["id"])
+            status = self.user_get("/api/automation-list-enrolments/%s" % payload["id"])
+            self.assertTrue(status.get("complete"), status)
+            return status["result"]
+        self.assertTrue(payload.get("complete"), payload)
+        return payload["result"]
 
     def set_enrolment_status(self, enrolment_id, status):
         self.db.execute(
@@ -376,3 +496,134 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(enrolments[0]["contact_id"], new_contact_id)
 
         self.cleanup(automation["id"])
+
+    def test_bulk_enrols_contacts_from_list_with_counts_and_source(self):
+        list_id, contacts = self.create_list_with_contacts(3)
+        automation = self.create_automation()
+
+        result = self.bulk_result(self.bulk_enrol(automation["id"], list_id))
+
+        self.assertEqual(result["enrolled_count"], 3)
+        self.assertEqual(result["skipped_count"], 0)
+        self.assertEqual(result["error_count"], 0)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(len(enrolments), 3)
+        self.assertEqual(
+            sorted(e["contact_email"] for e in enrolments),
+            sorted(email for email, _ in contacts),
+        )
+        self.assertTrue(all(e["source"] == "list:%s" % list_id for e in enrolments))
+
+    def test_bulk_enrol_unknown_or_unowned_list_is_blocked(self):
+        automation = self.create_automation()
+
+        unknown = self.bulk_enrol(automation["id"], "unknown-list-id")
+        self.assertEqual(unknown.status_code, 403)
+
+        list_id, _ = self.create_list_with_contacts(1)
+        self.db.execute(
+            "update lists set cid = %s where id = %s",
+            "other-account-cid",
+            list_id,
+        )
+
+        unowned = self.bulk_enrol(automation["id"], list_id)
+        self.assertEqual(unowned.status_code, 403)
+
+        self.db.execute(
+            "delete from lists where id = %s and cid = %s",
+            list_id,
+            "other-account-cid",
+        )
+
+    def test_bulk_enrol_unpublished_automation_is_blocked(self):
+        list_id, _ = self.create_list_with_contacts(1)
+        automation = self.create_automation(publish=False)
+
+        result = self.bulk_enrol(automation["id"], list_id)
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Publish the automation", result.text)
+
+    def test_bulk_enrol_paused_automation_creates_held_enrolments(self):
+        list_id, _ = self.create_list_with_contacts(2)
+        automation = self.create_automation()
+        paused = self.simulate_post(
+            "/api/automations/%s/pause" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(paused.status_code, 200)
+
+        result = self.bulk_result(self.bulk_enrol(automation["id"], list_id))
+
+        self.assertEqual(result["enrolled_count"], 2)
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(sorted(e["status"] for e in enrolments), ["held", "held"])
+
+    def test_bulk_enrol_once_skips_previously_enrolled_contacts(self):
+        list_id, contacts = self.create_list_with_contacts(2)
+        automation = self.create_automation(reentry="once")
+        first = self.enrol(automation["id"], contacts[0][0])
+        self.assertEqual(first.status_code, 201)
+
+        result = self.bulk_result(self.bulk_enrol(automation["id"], list_id))
+
+        self.assertEqual(result["enrolled_count"], 1)
+        self.assertEqual(result["skipped_count"], 1)
+        self.assertEqual(result["error_count"], 0)
+        self.assertEqual(result["skipped"][0]["reason"], "once")
+        self.assertEqual(len(self.list_enrolments(automation["id"])), 2)
+
+    def test_bulk_enrol_multiple_skips_active_and_allows_terminal_previous_pass(self):
+        list_id, contacts = self.create_list_with_contacts(3)
+        automation = self.create_automation(reentry="multiple")
+
+        active = self.enrol(automation["id"], contacts[0][0])
+        self.assertEqual(active.status_code, 201)
+        completed = self.enrol(automation["id"], contacts[1][0])
+        self.assertEqual(completed.status_code, 201)
+        self.set_enrolment_status(completed.json["id"], "completed")
+
+        result = self.bulk_result(self.bulk_enrol(automation["id"], list_id))
+
+        self.assertEqual(result["enrolled_count"], 2)
+        self.assertEqual(result["skipped_count"], 1)
+        self.assertEqual(result["error_count"], 0)
+        self.assertEqual(result["skipped"][0]["reason"], "active_pass")
+        self.assertEqual(len(self.list_enrolments(automation["id"])), 4)
+
+    def test_bulk_enrol_status_endpoint_returns_final_result(self):
+        list_id, _ = self.create_list_with_contacts(2)
+        automation = self.create_automation()
+        self.db.lists.patch(list_id, {"count": 10001})
+
+        response = self.bulk_enrol(automation["id"], list_id)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("id", response.json)
+        self.created_gather_ids.append(response.json["id"])
+
+        status = self.user_get("/api/automation-list-enrolments/%s" % response.json["id"])
+
+        self.assertTrue(status.get("complete"), status)
+        self.assertEqual(status["result"]["enrolled_count"], 2)
+        self.assertEqual(status["result"]["skipped_count"], 0)
+        self.assertEqual(status["result"]["error_count"], 0)
+
+    def test_bulk_enrol_endpoint_requires_automation_ownership(self):
+        list_id, _ = self.create_list_with_contacts(1)
+        automation = self.create_automation()
+        self.db.execute(
+            "update automations set cid = %s where id = %s",
+            "other-account-cid",
+            automation["id"],
+        )
+
+        result = self.bulk_enrol(automation["id"], list_id)
+
+        self.assertEqual(result.status_code, 403)
+        self.db.execute(
+            "delete from automations where id = %s and cid = %s",
+            automation["id"],
+            "other-account-cid",
+        )
