@@ -8,6 +8,7 @@ import TemplateEditor from "../components/TemplateEditor";
 import TemplateRawEditor from "../components/TemplateRawEditor";
 import TemplateWYSIWYGEditor from "../components/TemplateWYSIWYGEditor";
 import TemplateBeefreeEditor from "../components/TemplateBeefreeEditor";
+import TestButton from "../components/TestButton";
 import LoaderButton from "../components/LoaderButton";
 import LoaderPanel from "../components/LoaderPanel";
 import SaveNavbar from "../components/SaveNavbar";
@@ -65,6 +66,7 @@ class AutomationEmail extends Component {
 
     this.state = {
       changed: false,
+      showTestEmailModal: false,
     };
 
     this._saveCB = null;
@@ -145,9 +147,50 @@ class AutomationEmail extends Component {
     }
   }
 
+  updateEmails = emails => {
+    axios.patch('/api/testemails', emails);
+  }
+
+  toggleTestEmailModal = () => {
+    this.setState({showTestEmailModal: true});
+  }
+
+  setTestEmailModal = show => {
+    this.setState({showTestEmailModal: show});
+  }
+
+  sendTest = async (to, route) => {
+    const saved = await this.save();
+    if (!saved) {
+      return;
+    }
+
+    try {
+      await axios.post('/api/automations/' + this.props.automation_id + '/emails/' + this.props.email_id + '/test', {
+        to: to,
+        route: route,
+      });
+
+      await this.props.reloadUser();
+      this.props.reloadExtra();
+
+      notify.show('Test email submitted', "success", 5000);
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to send test email'), 'error');
+    }
+  }
+
   navbarButtons = () => {
     return (
       <div>
+        <LoaderButton
+          id="automation-email-test-button"
+          text="Send Test Email"
+          loadingText="Saving..."
+          disabled={this.props.isSaving}
+          onClick={this.toggleTestEmailModal}
+        />
+        {' '}
         <Button
           bsStyle="primary"
           disabled={this.props.isSaving}
@@ -237,6 +280,18 @@ class AutomationEmail extends Component {
             this.state.changed &&
               <Beforeunload onBeforeunload={() => "Are you sure you want to exit without saving?"} />
           }
+          <span style={{display: 'none'}}>
+            <TestButton
+              emails={this.props.testemails}
+              onConfirm={this.sendTest}
+              onUpdate={this.updateEmails}
+              disabled={this.props.isSaving}
+              routes={this.props.routes}
+              toggleModal={this.setTestEmailModal}
+              showModal={this.state.showTestEmailModal}
+              lasttest={this.props.lasttest}
+            />
+          </span>
           <Prompt when={this.state.changed} message="Are you sure you want to exit without saving?" />
           <EDFormSection onSubmit={this.handleSubmit} formRef={this.props.formRef}>
             <EDFormBox>
@@ -302,5 +357,8 @@ export default withLoadSave({
   patch: ({automation_id, email_id, data}) => axios.patch('/api/automations/' + automation_id + '/emails/' + email_id, patchPayload(data)),
   extra: {
     allfields: async () => (await axios.get('/api/allfields')).data,
+    testemails: async () => (await axios.get('/api/testemails')).data,
+    routes: async () => (await axios.get('/api/userroutes')).data,
+    lasttest: async () => (await axios.get('/api/lasttest')).data,
   },
 });

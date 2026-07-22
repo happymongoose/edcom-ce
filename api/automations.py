@@ -1,6 +1,9 @@
 import falcon
 import copy
+import email.utils
+import os
 import shortuuid
+import traceback
 import dateutil.parser
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
@@ -19,7 +22,9 @@ from .shared.db import DB, JsonObj, open_db
 from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
+from .shared.utils import generate_html, remove_newlines
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
+from .shared.send import check_test_limit, send_backend_mail
 from .shared.segments import (
     Cache,
     segment_get_segments,
@@ -324,6 +329,21 @@ AUTOMATION_EMAIL_CREATE_SCHEMA = {
 }
 
 AUTOMATION_EMAIL_PATCH_SCHEMA = copy.deepcopy(AUTOMATION_EMAIL_CREATE_SCHEMA)
+
+AUTOMATION_EMAIL_TEST_SCHEMA = {
+    "type": "object",
+    "required": ["to"],
+    "properties": {
+        "to": {
+            "type": "string",
+            "minLength": 1,
+        },
+        "route": {
+            "type": "string",
+        },
+    },
+    "additionalProperties": False,
+}
 
 BULK_DETAIL_LIMIT = 100
 
@@ -1118,6 +1138,106 @@ class AutomationEmailDuplicate(object):
             data,
         )
         req.context["result"] = _get_automation_email(db, cid, id, new_email_id)
+
+
+class AutomationEmailTest(object):
+
+    def on_post(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        email_id: str,
+    ) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+
+        doc = req.context.get("doc")
+        if not doc:
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+        _validate_doc(doc, AUTOMATION_EMAIL_TEST_SCHEMA)
+
+        _automation_for_email_route(db, id)
+        automation_email = _get_automation_email(db, cid, id, email_id)
+
+        db.set_cid(None)
+
+        db.users.patch(
+            req.context["uid"],
+            {"lasttest": {"to": doc["to"], "route": doc.get("route", "")}},
+        )
+
+        company = db.companies.get(cid)
+        user = db.users.get(req.context["uid"])
+        if company is None or user is None:
+            raise falcon.HTTPForbidden()
+
+        check_test_limit(db, company, doc["to"].strip().lower())
+
+        availroutes = company.get("routes") or []
+        route_id = doc.get("route", "")
+        if route_id:
+            if route_id not in availroutes:
+                raise falcon.HTTPForbidden()
+        elif len(availroutes) == 1:
+            route_id = availroutes[0]
+        else:
+            raise falcon.HTTPBadRequest(
+                title="Missing parameter",
+                description="No route specified and multiple are available.",
+            )
+
+        route = db.routes.get(route_id)
+        if route is None or "published" not in route:
+            raise falcon.HTTPForbidden()
+
+        imagebucket = os.environ["s3_imagebucket"]
+        parentcompany = db.companies.get(company["cid"])
+        if parentcompany is not None:
+            imagebucket = parentcompany.get("s3_imagebucket", imagebucket)
+
+        html, _ = generate_html(db, automation_email, "test", imagebucket)
+
+        _, addr = email.utils.parseaddr(doc["to"])
+        if not addr:
+            addr = remove_newlines(doc["to"])
+
+        fromemail = remove_newlines(user.get("username", ""))
+        fromname = remove_newlines(user.get("fullname", "") or company.get("name", ""))
+        fromdomain = ""
+        if "@" in fromemail:
+            fromdomain = fromemail.split("@")[-1].strip().lower()
+
+        frm = email.utils.formataddr((fromname, fromemail)) if fromname else fromemail
+        subject = remove_newlines(automation_email["subject"])
+
+        try:
+            send_backend_mail(
+                db,
+                cid,
+                route,
+                html,
+                frm,
+                fromemail,
+                fromdomain,
+                fromemail,
+                remove_newlines(doc["to"]),
+                addr,
+                subject,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            raise falcon.HTTPBadRequest(
+                title="Error sending test",
+                description="Error sending test: %s" % e,
+            )
+
+        req.context["result"] = {}
 
 
 class AutomationPublish(object):

@@ -1,4 +1,5 @@
 import shortuuid
+from unittest.mock import patch
 
 import test_base
 
@@ -62,6 +63,10 @@ class TestAutomationEmails(test_base.TestBase):
         )
         self.created_email_ids.append(email["id"])
         return email
+
+    def route_id(self):
+        company = self.db.companies.get(self.user_cookie["cid"])
+        return company["routes"][0]
 
     def test_create_list_get_patch_duplicate_and_delete_email(self):
         automation = self.create_automation()
@@ -178,6 +183,49 @@ class TestAutomationEmails(test_base.TestBase):
         )
 
         self.assertEqual(result.status_code, 400)
+
+    @patch("api.automations.check_test_limit")
+    @patch("api.automations.send_backend_mail")
+    def test_send_test_email_uses_automation_email(self, send_backend_mail, check_test_limit):
+        automation = self.create_automation()
+        email = self.create_email(
+            automation["id"],
+            subject="Automation Test Subject",
+            rawText="<h1>Automation Test Body</h1>",
+        )
+
+        result = self.user_post(
+            "/api/automations/%s/emails/%s/test" % (automation["id"], email["id"]),
+            json={"to": "recipient@example.com", "route": self.route_id()},
+        )
+
+        self.assertEqual(result, {})
+        check_test_limit.assert_called_once()
+        send_backend_mail.assert_called_once()
+        args = send_backend_mail.call_args[0]
+        self.assertEqual(args[1], self.user_cookie["cid"])
+        self.assertIn("Automation Test Body", args[3])
+        self.assertEqual(args[8], "recipient@example.com")
+        self.assertEqual(args[10], "Automation Test Subject")
+
+        user = self.db.users.get(self.user_cookie["uid"])
+        self.assertEqual(user["lasttest"]["to"], "recipient@example.com")
+        self.assertEqual(user["lasttest"]["route"], self.route_id())
+
+    @patch("api.automations.send_backend_mail")
+    def test_send_test_email_requires_email_ownership(self, send_backend_mail):
+        first = self.create_automation()
+        second = self.create_automation()
+        email = self.create_email(first["id"])
+
+        result = self.simulate_post(
+            "/api/automations/%s/emails/%s/test" % (second["id"], email["id"]),
+            json={"to": "recipient@example.com", "route": self.route_id()},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 403)
+        send_backend_mail.assert_not_called()
 
     def test_email_endpoints_require_automation_ownership(self):
         automation = self.create_automation()
