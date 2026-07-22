@@ -267,7 +267,7 @@ class ContactEdit extends Component {
                     </Button>
                   </div>
                 :
-                  <p>No published automations are available.</p>
+                  <p>No published or paused automations are available.</p>
               }
             </EDFormBox>
           </EDFormSection>

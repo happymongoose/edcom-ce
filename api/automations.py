@@ -684,6 +684,19 @@ def _finish_bulk_list_enrolment(data: List[JsonObj]) -> JsonObj:
     }
 
 
+def _check_automation_gather_owner(db: DB, gatherid: str, cid: str, name: str) -> None:
+    row = db.row(
+        "select cid, data->>'name' from taskgather where id = %s",
+        gatherid,
+    )
+    if row is None:
+        return
+
+    gather_cid, gather_name = row
+    if gather_cid != cid or gather_name != name:
+        raise falcon.HTTPForbidden()
+
+
 def _step_run_obj(row) -> JsonObj | None:
     if row is None:
         return None
@@ -1226,6 +1239,8 @@ class AutomationListEnrolmentStatus(object):
         check_noadmin(req)
 
         db = req.context["db"]
+        cid = db.get_cid()
+        _check_automation_gather_owner(db, id, cid, "automation_list_enrolment")
         db.set_cid(None)
 
         data = gather_check(db, id)
@@ -1395,6 +1410,7 @@ class AutomationSegmentEnrolments(object):
         segment_get_segments(db, segment["parts"], segments)
         campaignids = segment_get_campaignids(segment, list(segments.values()))
         hashlimit, listfactors = segment_get_params(db, cid, segment)
+        db.set_cid(cid)
 
         if hashlimit == 1:
             result = _bulk_enrol_segment_bucket(
@@ -1433,6 +1449,8 @@ class AutomationSegmentEnrolmentStatus(object):
         check_noadmin(req)
 
         db = req.context["db"]
+        cid = db.get_cid()
+        _check_automation_gather_owner(db, id, cid, "automation_segment_enrolment")
         db.set_cid(None)
 
         data = gather_check(db, id)

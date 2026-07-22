@@ -285,7 +285,7 @@ class Segments extends Component {
                       </p>
                     </div>
                   :
-                    <p>No published automations are available.</p>
+                    <p>No published or paused automations are available.</p>
                 }
                 {
                   this.state.bulkEnrolling &&

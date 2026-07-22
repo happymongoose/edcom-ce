@@ -420,6 +420,22 @@ class TestAutomationEnrolments(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_multiple_allows_new_enrolment_after_cancelled(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="multiple")
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.set_enrolment_status(first.json["id"], "cancelled")
+
+        second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 201)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(len(enrolments), 2)
+
+        self.cleanup(automation["id"])
+
     def test_multiple_active_pass_check_is_scoped_by_cid(self):
         email, _, _ = self.create_contact()
         automation = self.create_automation(reentry="multiple")
@@ -657,6 +673,28 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(status["result"]["skipped_count"], 0)
         self.assertEqual(status["result"]["error_count"], 0)
 
+    def test_bulk_enrol_status_endpoint_requires_gather_ownership(self):
+        list_id, _ = self.create_list_with_contacts(2)
+        automation = self.create_automation()
+        self.db.lists.patch(list_id, {"count": 10001})
+
+        response = self.bulk_enrol(automation["id"], list_id)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("id", response.json)
+        self.created_gather_ids.append(response.json["id"])
+        self.db.execute(
+            "update taskgather set cid = %s where id = %s",
+            "other-account-cid",
+            response.json["id"],
+        )
+
+        status = self.simulate_get(
+            "/api/automation-list-enrolments/%s" % response.json["id"],
+            headers=self.headers(),
+        )
+
+        self.assertEqual(status.status_code, 403)
+
     def test_bulk_enrol_endpoint_requires_automation_ownership(self):
         list_id, _ = self.create_list_with_contacts(1)
         automation = self.create_automation()
@@ -794,6 +832,29 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(status["result"]["enrolled_count"], 2)
         self.assertEqual(status["result"]["skipped_count"], 0)
         self.assertEqual(status["result"]["error_count"], 0)
+
+    def test_bulk_segment_status_endpoint_requires_gather_ownership(self):
+        list_id, contacts = self.create_list_with_contacts(2)
+        segment = self.create_segment_for_contacts(contacts)
+        automation = self.create_automation()
+        self.db.lists.patch(list_id, {"count": 10001})
+
+        response = self.bulk_segment_enrol(automation["id"], segment["id"])
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("id", response.json)
+        self.created_gather_ids.append(response.json["id"])
+        self.db.execute(
+            "update taskgather set cid = %s where id = %s",
+            "other-account-cid",
+            response.json["id"],
+        )
+
+        status = self.simulate_get(
+            "/api/automation-segment-enrolments/%s" % response.json["id"],
+            headers=self.headers(),
+        )
+
+        self.assertEqual(status.status_code, 403)
 
     def test_bulk_segment_endpoint_requires_automation_ownership(self):
         _, contacts = self.create_list_with_contacts(1)

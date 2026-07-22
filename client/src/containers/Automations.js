@@ -21,6 +21,9 @@ function errorMessage(error, fallback) {
 }
 
 function statusLabel(automation) {
+  if (automation.status === 'paused') {
+    return 'Paused';
+  }
   if (automation.status === 'published' || automation.published_at) {
     return 'Published';
   }
