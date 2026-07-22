@@ -3,8 +3,8 @@ import axios from "axios";
 import LoaderPanel from "../components/LoaderPanel";
 import LoaderButton from "../components/LoaderButton";
 import withLoadSave from "../components/LoadSave";
-import { FormControlLabel } from "../components/FormControls";
-import { Row, Col } from "react-bootstrap";
+import { FormControlLabel, SelectLabel } from "../components/FormControls";
+import { Button, Row, Col } from "react-bootstrap";
 import SaveNavbar from "../components/SaveNavbar";
 import { EDFormSection, EDFormBox } from "../components/EDDOM";
 import parse from "../utils/parse";
@@ -14,9 +14,34 @@ import notify from "../utils/notify";
 
 const builtIn = ['Email', 'Opened', 'Clicked', 'Unsubscribed', 'Bounced', 'Complained', 'Soft Bounced'];
 
+function errorMessage(error, fallback) {
+  const data = error && error.response && error.response.data;
+  if (data) {
+    return data.description || data.title || fallback;
+  }
+  return fallback;
+}
+
+function automationIsEnrollable(automation) {
+  return automation.status === 'published' || (automation.status === 'paused' && (automation.published || automation.published_at));
+}
+
 class ContactEdit extends Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      automationId: '',
+      isEnrolling: false,
+    };
+  }
+
   handleChange = event => {
     this.props.update({properties: {[event.target.id]: {$set: event.target.value}}})
+  }
+
+  handleAutomationChange = event => {
+    this.setState({automationId: event.target.value});
   }
 
   handleSubmit = async event => {
@@ -84,9 +109,42 @@ class ContactEdit extends Component {
     return field && !this.props.data.properties.hasOwnProperty(trimmed) && !builtIn.includes(trimmed) && !trimmed.includes('!') && !trimmed.includes(',');
   }
 
+  automationOptions() {
+    return _.map(
+      _.sortBy(
+        _.filter(this.props.automations || [], automationIsEnrollable),
+        automation => (automation.name || '').toLowerCase()
+      ),
+      automation => ({
+        id: automation.id,
+        name: automation.name || automation.id,
+      })
+    );
+  }
+
+  enrolInAutomation = async () => {
+    const automationId = this.state.automationId;
+    if (!automationId || !this.props.data.email) {
+      return;
+    }
+
+    this.setState({isEnrolling: true});
+    try {
+      await axios.post('/api/automations/' + automationId + '/enrolments', {
+        email: this.props.data.email,
+      });
+      notify.show('Contact added to automation', 'success');
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to add contact to automation'), 'error');
+    } finally {
+      this.setState({isEnrolling: false});
+    }
+  }
+
   render() {
     var tagitems = _.map(_.filter(this.props.tags, l => !_.find(this.props.data.tags, id => id === l)), t => ({id: t, text: t}));
     var fields = _.filter(this.props.allfields, f => this.isValidNewField(f));
+    var automationOptions = this.automationOptions();
 
     return (
       <SaveNavbar onBack={this.goBack} id={this.props.id} user={this.props.user}
@@ -184,6 +242,34 @@ class ContactEdit extends Component {
                 </Row>
               </div>
             </EDFormBox>
+            <EDFormBox space>
+              <h4>Automation Enrolment</h4>
+              {
+                automationOptions.length ?
+                  <div className="form-inline">
+                    <SelectLabel
+                      id="automationId"
+                      label="Automation"
+                      obj={this.state}
+                      onChange={this.handleAutomationChange}
+                      options={automationOptions}
+                      emptyVal="Select automation"
+                      inline
+                    />
+                    {' '}
+                    <Button
+                      type="button"
+                      bsStyle="primary"
+                      disabled={this.state.isEnrolling || !this.state.automationId || !this.props.data.email}
+                      onClick={this.enrolInAutomation}
+                    >
+                      {this.state.isEnrolling ? 'Adding...' : 'Add to automation'}
+                    </Button>
+                  </div>
+                :
+                  <p>No published automations are available.</p>
+              }
+            </EDFormBox>
           </EDFormSection>
         </LoaderPanel>
       </SaveNavbar>
@@ -202,5 +288,6 @@ export default withLoadSave({
   extra: {
     tags: async() => (await axios.get('/api/recenttags')).data,
     allfields: async () => (await axios.get('/api/allfields')).data,
+    automations: async () => (await axios.get('/api/automations')).data,
   },
 });
