@@ -28,7 +28,9 @@ function normalizeEmail(email) {
   email.name = email.name || 'New automation email';
   email.subject = email.subject || 'Click Here to Edit';
   email.preheader = email.preheader || '';
-  email.type = email.type || 'raw';
+  if (email.type === undefined || email.type === null) {
+    email.type = 'raw';
+  }
   email.rawText = email.rawText || '';
   email.parts = email.parts || [];
   email.bodyStyle = email.bodyStyle || {};
@@ -70,7 +72,19 @@ class AutomationEmail extends Component {
   }
 
   handleChange = event => {
-    this.update({[event.target.id]: {$set: getvalue(event)}});
+    const value = getvalue(event);
+    if (event.target.id === 'type') {
+      const update = {type: {$set: value}};
+      if (!value && !(this.props.data.parts || []).length) {
+        update.initialize = {$set: true};
+      } else if (this.props.data.initialize) {
+        update.initialize = {$set: false};
+      }
+      this.update(update);
+      return;
+    }
+
+    this.update({[event.target.id]: {$set: value}});
   }
 
   save = async () => {
