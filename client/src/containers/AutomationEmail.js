@@ -16,6 +16,7 @@ import { FormControlLabel } from "../components/FormControls";
 import { EDFormSection, EDFormBox } from "../components/EDDOM";
 import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
+import "./AutomationEmail.css";
 
 function errorMessage(error, fallback) {
   const data = error && error.response && error.response.data;
@@ -231,6 +232,7 @@ class AutomationEmail extends Component {
       <SaveNavbar title={title} user={this.props.user} isSaving={this.props.isSaving}
         onBack={this.goBack} buttons={this.navbarButtons()} id={this.props.data.id}>
         <LoaderPanel isLoading={this.props.isLoading}>
+          <div className="automation-email-editor-page">
           {
             this.state.changed &&
               <Beforeunload onBeforeunload={() => "Are you sure you want to exit without saving?"} />
@@ -278,6 +280,7 @@ class AutomationEmail extends Component {
               {this.renderEditor()}
             </EDFormBox>
           </EDFormSection>
+          </div>
         </LoaderPanel>
       </SaveNavbar>
     );

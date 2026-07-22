@@ -1,0 +1,5 @@
+.automation-email-editor-page #TemplateEditor.fixed-editor,
+.automation-email-editor-page #TemplateEditor.fixed-editor #PartDrawer,
+.automation-email-editor-page #TemplateEditor.fixed-editor #Viewer {
+  top: 68px;
+}
