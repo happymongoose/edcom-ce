@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, FormControl, Modal, Panel } from "react-bootstrap";
+import { Button, FormControl, Panel } from "react-bootstrap";
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
@@ -198,10 +198,7 @@ class Automation extends Component {
       runningEnrolmentId: null,
       reenrollingEnrolmentId: null,
       enrolEmail: '',
-      showEmailModal: false,
-      emailModalMode: 'create',
-      emailDraft: {},
-      isSavingEmail: false,
+      isCreatingEmail: false,
       deletingEmailId: null,
       duplicatingEmailId: null,
     };
@@ -456,94 +453,21 @@ class Automation extends Component {
     return canReEnrolAutomation(this.props.data);
   }
 
-  openCreateEmailModal = () => {
-    this.setState({
-      showEmailModal: true,
-      emailModalMode: 'create',
-      emailDraft: {
-        name: '',
-        subject: '',
-        preheader: '',
-        rawText: '<p>Hello</p>',
-      },
-    });
-  }
-
-  openEditEmailModal = email => {
-    this.setState({
-      showEmailModal: true,
-      emailModalMode: 'edit',
-      emailDraft: {
-        id: email.id,
-        name: email.name || '',
-        subject: email.subject || '',
-        preheader: email.preheader || '',
-        rawText: email.rawText || '',
-      },
-    });
-  }
-
-  closeEmailModal = () => {
-    if (this.state.isSavingEmail) {
-      return;
-    }
-
-    this.setState({
-      showEmailModal: false,
-      emailModalMode: 'create',
-      emailDraft: {},
-    });
-  }
-
-  emailDraftChange = event => {
-    this.setState({
-      emailDraft: {
-        ...this.state.emailDraft,
-        [event.target.id]: getvalue(event),
-      },
-    });
-  }
-
-  saveEmail = async event => {
-    event.preventDefault();
-
-    const draft = this.state.emailDraft || {};
-    if (!draft.name.trim() || !draft.subject.trim()) {
-      notify.show('Email name and subject are required', 'error');
-      return;
-    }
-
-    this.setState({isSavingEmail: true});
+  createEmail = async () => {
+    this.setState({isCreatingEmail: true});
     try {
-      const payload = {
-        name: draft.name,
-        subject: draft.subject,
-        preheader: draft.preheader || '',
-        type: 'raw',
-        rawText: draft.rawText || '',
-        parts: [],
-        bodyStyle: {},
-      };
-
-      if (this.state.emailModalMode === 'edit') {
-        await axios.patch('/api/automations/' + this.props.id + '/emails/' + draft.id, payload);
-        notify.show('Automation email saved', 'success');
-      } else {
-        await axios.post('/api/automations/' + this.props.id + '/emails', payload);
-        notify.show('Automation email created', 'success');
-      }
-
-      this.setState({
-        showEmailModal: false,
-        emailModalMode: 'create',
-        emailDraft: {},
-      });
-      await this.props.reloadExtra();
+      const email = (await axios.post('/api/automations/' + this.props.id + '/emails', {})).data;
+      notify.show('Automation email created', 'success');
+      this.props.history.push('/automations/' + this.props.id + '/emails/' + email.id);
     } catch (error) {
-      notify.show(errorMessage(error, 'Unable to save automation email'), 'error');
+      notify.show(errorMessage(error, 'Unable to create automation email'), 'error');
     } finally {
-      this.setState({isSavingEmail: false});
+      this.setState({isCreatingEmail: false});
     }
+  }
+
+  editEmail = email => {
+    this.props.history.push('/automations/' + this.props.id + '/emails/' + email.id);
   }
 
   duplicateEmail = async email => {
@@ -894,14 +818,15 @@ class Automation extends Component {
 
   renderEmails() {
     const emails = this.props.emails || [];
-    const busy = this.state.isSavingEmail || this.state.deletingEmailId || this.state.duplicatingEmailId;
-    const draft = this.state.emailDraft || {};
+    const busy = this.state.isCreatingEmail || this.state.deletingEmailId || this.state.duplicatingEmailId;
 
     return (
       <EDFormBox space>
         <div className="flex-items space-between">
           <h4>Emails</h4>
-          <Button onClick={this.openCreateEmailModal}>Create Email</Button>
+          <Button disabled={busy} onClick={this.createEmail}>
+            {this.state.isCreatingEmail ? 'Creating...' : 'Create Email'}
+          </Button>
         </div>
         {
           emails.length ?
@@ -928,7 +853,7 @@ class Automation extends Component {
                       <Button
                         bsSize="small"
                         disabled={busy}
-                        onClick={this.openEditEmailModal.bind(this, email)}
+                        onClick={this.editEmail.bind(this, email)}
                       >
                         Edit
                       </Button>
@@ -958,55 +883,6 @@ class Automation extends Component {
               <h4>No automation emails yet.</h4>
             </div>
         }
-        <Modal show={this.state.showEmailModal} onHide={this.closeEmailModal}>
-          <form onSubmit={this.saveEmail}>
-            <Modal.Header closeButton={!this.state.isSavingEmail}>
-              <Modal.Title>
-                {this.state.emailModalMode === 'edit' ? 'Edit Automation Email' : 'Create Automation Email'}
-              </Modal.Title>
-            </Modal.Header>
-            <Modal.Body>
-              <FormControlLabel
-                id="name"
-                label="Internal name"
-                obj={draft}
-                onChange={this.emailDraftChange}
-                required
-              />
-              <FormControlLabel
-                id="subject"
-                label="Subject"
-                obj={draft}
-                onChange={this.emailDraftChange}
-                required
-                space
-              />
-              <FormControlLabel
-                id="preheader"
-                label="Preheader"
-                obj={draft}
-                onChange={this.emailDraftChange}
-                space
-              />
-              <label className="control-label" htmlFor="rawText">HTML/body</label>
-              <FormControl
-                id="rawText"
-                componentClass="textarea"
-                rows={8}
-                value={draft.rawText || ''}
-                onChange={this.emailDraftChange}
-              />
-            </Modal.Body>
-            <Modal.Footer>
-              <Button onClick={this.closeEmailModal} disabled={this.state.isSavingEmail}>
-                Cancel
-              </Button>
-              <Button type="submit" bsStyle="primary" disabled={this.state.isSavingEmail}>
-                {this.state.isSavingEmail ? 'Saving...' : 'Save'}
-              </Button>
-            </Modal.Footer>
-          </form>
-        </Modal>
       </EDFormBox>
     );
   }

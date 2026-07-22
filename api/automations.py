@@ -308,7 +308,7 @@ AUTOMATION_EMAIL_CREATE_SCHEMA = {
         },
         "type": {
             "type": "string",
-            "enum": ["raw"],
+            "enum": ["", "raw", "wysiwyg", "beefree"],
         },
         "rawText": {
             "type": "string",
@@ -604,10 +604,10 @@ def _prepare_automation_email_patch(doc: JsonObj) -> JsonObj:
                 title="Invalid email subject",
                 description="Automation email subject is required.",
             )
-    if "type" in patch and patch["type"] != "raw":
+    if "type" in patch and patch["type"] not in ("", "raw", "wysiwyg", "beefree"):
         raise falcon.HTTPBadRequest(
             title="Invalid email type",
-            description="Only simple raw automation emails are supported for now.",
+            description="Automation email type must be raw, wysiwyg or beefree.",
         )
     patch["modified"] = _utc_now()
     return patch

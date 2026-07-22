@@ -129,6 +129,56 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(email["type"], "raw")
         self.assertEqual(email["rawText"], "<p>Hello</p>")
 
+    def test_editor_compatible_fields_can_be_saved(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        beefree = self.user_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={
+                "type": "beefree",
+                "rawText": '{"page": {"body": {}}}',
+                "parts": [],
+                "bodyStyle": {},
+            },
+        )
+        self.assertEqual(beefree["type"], "beefree")
+        self.assertEqual(beefree["rawText"], '{"page": {"body": {}}}')
+
+        wysiwyg = self.user_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={
+                "type": "wysiwyg",
+                "rawText": "<p>WYSIWYG body</p>",
+            },
+        )
+        self.assertEqual(wysiwyg["type"], "wysiwyg")
+        self.assertEqual(wysiwyg["rawText"], "<p>WYSIWYG body</p>")
+
+        legacy = self.user_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={
+                "type": "",
+                "parts": [{"type": "text"}],
+                "bodyStyle": {"version": 3},
+            },
+        )
+        self.assertEqual(legacy["type"], "")
+        self.assertEqual(legacy["parts"], [{"type": "text"}])
+        self.assertEqual(legacy["bodyStyle"], {"version": 3})
+
+    def test_invalid_editor_type_is_rejected(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        result = self.simulate_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={"type": "broadcast"},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+
     def test_email_endpoints_require_automation_ownership(self):
         automation = self.create_automation()
         email = self.create_email(automation["id"])
