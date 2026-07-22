@@ -13,6 +13,7 @@ from .shared.crud import (
     CRUDCollection,
     CRUDSingle,
     check_noadmin,
+    get_orig,
 )
 from .shared.db import DB, JsonObj, open_db
 from .shared.tasks import tasks, HIGH_PRIORITY
@@ -290,6 +291,40 @@ AUTOMATION_SEGMENT_ENROLMENT_SCHEMA = {
     "additionalProperties": False,
 }
 
+AUTOMATION_EMAIL_CREATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "subject": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "preheader": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "type": {
+            "type": "string",
+            "enum": ["raw"],
+        },
+        "rawText": {
+            "type": "string",
+        },
+        "parts": {
+            "type": "array",
+        },
+        "bodyStyle": {
+            "type": "object",
+        },
+    },
+    "additionalProperties": False,
+}
+
+AUTOMATION_EMAIL_PATCH_SCHEMA = copy.deepcopy(AUTOMATION_EMAIL_CREATE_SCHEMA)
+
 BULK_DETAIL_LIMIT = 100
 
 
@@ -521,6 +556,113 @@ def _enrolment_obj(row) -> JsonObj | None:
     data["contact_id"] = contact_id
     data["contact_email"] = contact_email
     return data
+
+
+def _automation_email_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+
+    id, cid, automation_id, data = row
+    data["id"] = id
+    data["cid"] = cid
+    data["automation_id"] = automation_id
+    return data
+
+
+def _default_automation_email(doc: JsonObj | None = None) -> JsonObj:
+    doc = copy.deepcopy(doc or {})
+    now = _utc_now()
+    name = (doc.get("name") or "New automation email").strip()
+    subject = (doc.get("subject") or "Click Here to Edit").strip()
+
+    return {
+        "name": name or "New automation email",
+        "subject": subject or "Click Here to Edit",
+        "preheader": doc.get("preheader", ""),
+        "type": doc.get("type") or "raw",
+        "rawText": doc.get("rawText") or "<p>Hello</p>",
+        "parts": doc.get("parts") or [],
+        "bodyStyle": doc.get("bodyStyle") or {},
+        "created": now,
+        "modified": now,
+    }
+
+
+def _prepare_automation_email_patch(doc: JsonObj) -> JsonObj:
+    patch = copy.deepcopy(doc)
+    if "name" in patch:
+        patch["name"] = (patch.get("name") or "").strip()
+        if not patch["name"]:
+            raise falcon.HTTPBadRequest(
+                title="Invalid email name",
+                description="Automation email name is required.",
+            )
+    if "subject" in patch:
+        patch["subject"] = (patch.get("subject") or "").strip()
+        if not patch["subject"]:
+            raise falcon.HTTPBadRequest(
+                title="Invalid email subject",
+                description="Automation email subject is required.",
+            )
+    if "type" in patch and patch["type"] != "raw":
+        raise falcon.HTTPBadRequest(
+            title="Invalid email type",
+            description="Only simple raw automation emails are supported for now.",
+        )
+    patch["modified"] = _utc_now()
+    return patch
+
+
+def _automation_for_email_route(db: DB, automation_id: str) -> JsonObj:
+    automation = db.automations.get(automation_id)
+    if automation is None:
+        raise falcon.HTTPForbidden()
+    return automation
+
+
+def _get_automation_email(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    email_id: str,
+) -> JsonObj:
+    email = _automation_email_obj(
+        db.row(
+            """
+            select id, cid, automation_id, data
+            from automation_emails
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            cid,
+            automation_id,
+            email_id,
+        )
+    )
+    if email is None:
+        raise falcon.HTTPForbidden()
+    return email
+
+
+def _node_references_automation_email(node: JsonObj, email_id: str) -> bool:
+    return (
+        node.get("email_id") == email_id
+        or node.get("automation_email_id") == email_id
+    )
+
+
+def _automation_references_email(automation: JsonObj, email_id: str) -> JsonObj | None:
+    for workflow_name in ("draft", "published"):
+        workflow = automation.get(workflow_name) or {}
+        for index, node in enumerate(workflow.get("nodes") or []):
+            if _node_references_automation_email(node, email_id):
+                return {
+                    "workflow": workflow_name,
+                    "step": index + 1,
+                    "node_id": node.get("id"),
+                    "node_label": node.get("label"),
+                    "node_type": node.get("type"),
+                }
+    return None
 
 
 def _published_enrolment_context(automation: JsonObj) -> tuple[JsonObj, List[JsonObj], str]:
@@ -773,6 +915,209 @@ class Automation(CRUDSingle):
                 title="Automation cannot be deleted",
                 description="Only draft automations that have never been published or enrolled can be deleted.",
             )
+
+
+class AutomationEmails(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+
+        req.context["result"] = [
+            _automation_email_obj(row)
+            for row in db.execute(
+                """
+                select id, cid, automation_id, data
+                from automation_emails
+                where cid = %s and automation_id = %s
+                order by lower(data->>'name'), id
+                """,
+                cid,
+                id,
+            )
+        ]
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc") or {}
+        _validate_doc(doc, AUTOMATION_EMAIL_CREATE_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+
+        data = _default_automation_email(doc)
+        data = _prepare_automation_email_patch(data)
+        data["created"] = data["modified"]
+        email_id = shortuuid.uuid()
+        db.execute(
+            """
+            insert into automation_emails
+                (id, cid, automation_id, data)
+            values (%s, %s, %s, %s)
+            """,
+            email_id,
+            cid,
+            id,
+            data,
+        )
+
+        resp.status = falcon.HTTP_201
+        req.context["result"] = _get_automation_email(db, cid, id, email_id)
+
+
+class AutomationEmail(object):
+
+    def on_get(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        email_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+        req.context["result"] = _get_automation_email(db, cid, id, email_id)
+
+    def on_patch(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        email_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc")
+        if not doc:
+            raise falcon.HTTPBadRequest(
+                title="Not JSON", description="A valid JSON document is required."
+            )
+        _validate_doc(doc, AUTOMATION_EMAIL_PATCH_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+        _get_automation_email(db, cid, id, email_id)
+        patch = _prepare_automation_email_patch(doc)
+
+        db.execute(
+            """
+            update automation_emails
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            patch,
+            cid,
+            id,
+            email_id,
+        )
+        req.context["result"] = _get_automation_email(db, cid, id, email_id)
+
+    def on_delete(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        email_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        automation = _automation_for_email_route(db, id)
+        _get_automation_email(db, cid, id, email_id)
+
+        reference = _automation_references_email(automation, email_id)
+        if reference is not None:
+            raise falcon.HTTPBadRequest(
+                title="Automation email is in use",
+                description=(
+                    "This email is referenced by %s step %s%s."
+                    % (
+                        reference["workflow"],
+                        reference["step"],
+                        (
+                            " (%s)" % reference["node_label"]
+                            if reference.get("node_label")
+                            else ""
+                        ),
+                    )
+                ),
+            )
+
+        db.execute(
+            """
+            delete from automation_emails
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            cid,
+            id,
+            email_id,
+        )
+        req.context["result"] = {}
+
+
+class AutomationEmailDuplicate(object):
+
+    def on_post(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        email_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+        email = _get_automation_email(db, cid, id, email_id)
+
+        data = copy.deepcopy(email)
+        for key in ("id", "cid", "automation_id"):
+            data.pop(key, None)
+        data["created"] = _utc_now()
+        data["modified"] = data["created"]
+
+        orig, i = get_orig(data.get("name") or "Automation email")
+        while True:
+            data["name"] = "%s (%s)" % (orig, i)
+            existing = db.single(
+                """
+                select id
+                from automation_emails
+                where cid = %s and automation_id = %s and data->>'name' = %s
+                limit 1
+                """,
+                cid,
+                id,
+                data["name"],
+            )
+            if existing is None:
+                break
+            i += 1
+
+        new_email_id = shortuuid.uuid()
+        db.execute(
+            """
+            insert into automation_emails
+                (id, cid, automation_id, data)
+            values (%s, %s, %s, %s)
+            """,
+            new_email_id,
+            cid,
+            id,
+            data,
+        )
+        req.context["result"] = _get_automation_email(db, cid, id, new_email_id)
 
 
 class AutomationPublish(object):
