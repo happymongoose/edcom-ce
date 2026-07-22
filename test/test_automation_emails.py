@@ -248,6 +248,82 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(user["lasttest"]["to"], "recipient@example.com")
         self.assertEqual(user["lasttest"]["route"], self.route_id())
 
+    @patch("api.automations.add_test_txn_log")
+    @patch("api.automations.check_test_limit")
+    @patch("api.automations.send_backend_mail")
+    def test_send_test_email_can_be_included_in_transactional_log(
+        self,
+        send_backend_mail,
+        check_test_limit,
+        add_test_txn_log,
+    ):
+        automation = self.create_automation()
+        email = self.create_email(
+            automation["id"],
+            subject="Logged Automation Test Subject",
+        )
+
+        result = self.user_post(
+            "/api/automations/%s/emails/%s/test" % (automation["id"], email["id"]),
+            json={
+                "to": "recipient@example.com",
+                "route": self.route_id(),
+                "include_in_log": True,
+            },
+        )
+
+        self.assertEqual(result, {})
+        send_backend_mail.assert_called_once()
+        check_test_limit.assert_called_once()
+        add_test_txn_log.assert_called_once()
+        args = add_test_txn_log.call_args[0]
+        self.assertEqual(args[1], self.user_cookie["cid"])
+        self.assertEqual(args[2], "recipient@example.com")
+        self.assertEqual(args[3], "Logged Automation Test Subject")
+        self.assertEqual(args[4], "automation:%s" % automation["id"])
+        self.assertEqual(args[8], self.route_id())
+        self.assertEqual(add_test_txn_log.call_args[1]["status"], "Sent")
+
+    @patch("api.automations.add_test_txn_log")
+    @patch("api.automations.check_test_limit")
+    @patch("api.automations.send_backend_mail")
+    def test_send_test_email_does_not_log_by_default(
+        self,
+        send_backend_mail,
+        check_test_limit,
+        add_test_txn_log,
+    ):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        result = self.user_post(
+            "/api/automations/%s/emails/%s/test" % (automation["id"], email["id"]),
+            json={"to": "recipient@example.com", "route": self.route_id()},
+        )
+
+        self.assertEqual(result, {})
+        send_backend_mail.assert_called_once()
+        check_test_limit.assert_called_once()
+        add_test_txn_log.assert_not_called()
+
+    @patch("api.automations.send_backend_mail")
+    def test_send_test_email_rejects_invalid_include_in_log(self, send_backend_mail):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        result = self.simulate_post(
+            "/api/automations/%s/emails/%s/test" % (automation["id"], email["id"]),
+            json={
+                "to": "recipient@example.com",
+                "route": self.route_id(),
+                "include_in_log": "yes",
+            },
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        send_backend_mail.assert_not_called()
+
     @patch("api.automations.send_backend_mail")
     def test_send_test_email_requires_email_ownership(self, send_backend_mail):
         first = self.create_automation()

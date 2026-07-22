@@ -1,6 +1,7 @@
 import falcon
 import copy
 import email.utils
+import logging
 import os
 import shortuuid
 import traceback
@@ -25,6 +26,7 @@ from .shared.utils import emailre
 from .shared.utils import generate_html, remove_newlines
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
 from .shared.send import check_test_limit, send_backend_mail
+from .transactional import add_test_txn_log
 from .shared.segments import (
     Cache,
     segment_get_segments,
@@ -34,6 +36,8 @@ from .shared.segments import (
     get_segment_rows,
     segment_eval_parts,
 )
+
+log = logging.getLogger(__name__)
 
 
 NODE_ID_SCHEMA = {
@@ -340,6 +344,9 @@ AUTOMATION_EMAIL_TEST_SCHEMA = {
         },
         "route": {
             "type": "string",
+        },
+        "include_in_log": {
+            "type": "boolean",
         },
     },
     "additionalProperties": False,
@@ -1240,10 +1247,47 @@ class AutomationEmailTest(object):
             )
         except Exception as e:
             traceback.print_exc()
+            if doc.get("include_in_log", False):
+                try:
+                    add_test_txn_log(
+                        db,
+                        cid,
+                        remove_newlines(doc["to"]),
+                        subject,
+                        "automation:%s" % id,
+                        fromname,
+                        fromemail,
+                        None,
+                        route_id,
+                        None,
+                        event="Error",
+                        status="Error",
+                        error=str(e),
+                    )
+                except Exception:
+                    log.exception("error logging automation email test send failure")
             raise falcon.HTTPBadRequest(
                 title="Error sending test",
                 description="Error sending test: %s" % e,
             )
+
+        if doc.get("include_in_log", False):
+            try:
+                add_test_txn_log(
+                    db,
+                    cid,
+                    remove_newlines(doc["to"]),
+                    subject,
+                    "automation:%s" % id,
+                    fromname,
+                    fromemail,
+                    None,
+                    route_id,
+                    None,
+                    status="Sent",
+                )
+            except Exception:
+                log.exception("error logging automation email test send")
 
         req.context["result"] = {}
 

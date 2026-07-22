@@ -133,7 +133,7 @@ class AutomationEmail extends Component {
     this.setState({showTestEmailModal: show});
   }
 
-  sendTest = async (to, route) => {
+  sendTest = async (to, route, json, includeInLog) => {
     const saved = await this.save();
     if (!saved) {
       return;
@@ -143,6 +143,7 @@ class AutomationEmail extends Component {
       await axios.post('/api/automations/' + this.props.automation_id + '/emails/' + this.props.email_id + '/test', {
         to: to,
         route: route,
+        include_in_log: includeInLog,
       });
 
       await this.props.reloadUser();
@@ -264,6 +265,7 @@ class AutomationEmail extends Component {
               toggleModal={this.setTestEmailModal}
               showModal={this.state.showTestEmailModal}
               lasttest={this.props.lasttest}
+              showIncludeInLogCheckbox={true}
             />
           </span>
           <Prompt when={this.state.changed} message="Are you sure you want to exit without saving?" />
