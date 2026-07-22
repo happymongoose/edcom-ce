@@ -3,6 +3,7 @@ import { Button, FormControl } from "react-bootstrap";
 import axios from "axios";
 import Beforeunload from "react-beforeunload";
 import { Prompt } from "react-router-dom";
+import shortid from "shortid";
 import TemplateEditor from "../components/TemplateEditor";
 import TemplateRawEditor from "../components/TemplateRawEditor";
 import TemplateWYSIWYGEditor from "../components/TemplateWYSIWYGEditor";
@@ -49,6 +50,14 @@ function patchPayload(data) {
   };
 }
 
+function legacyHtmlPart(rawText) {
+  return {
+    type: 'HTML',
+    id: shortid.generate(),
+    customHtml: rawText || '<p>Enter your HTML here.</p>',
+  };
+}
+
 class AutomationEmail extends Component {
   constructor(props) {
     super(props);
@@ -76,7 +85,15 @@ class AutomationEmail extends Component {
     if (event.target.id === 'type') {
       const update = {type: {$set: value}};
       if (!value && !(this.props.data.parts || []).length) {
-        update.initialize = {$set: true};
+        if ((this.props.data.rawText || '').trim()) {
+          update.initialize = {$set: false};
+          update.parts = {$set: [legacyHtmlPart(this.props.data.rawText)]};
+          if (!this.props.data.bodyStyle || !this.props.data.bodyStyle.version) {
+            update.bodyStyle = {$set: {version: 3}};
+          }
+        } else {
+          update.initialize = {$set: true};
+        }
       } else if (this.props.data.initialize) {
         update.initialize = {$set: false};
       }
