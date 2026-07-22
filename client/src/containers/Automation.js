@@ -453,10 +453,10 @@ class Automation extends Component {
     return canReEnrolAutomation(this.props.data);
   }
 
-  createEmail = async () => {
+  createEmail = async type => {
     this.setState({isCreatingEmail: true});
     try {
-      const email = (await axios.post('/api/automations/' + this.props.id + '/emails', {})).data;
+      const email = (await axios.post('/api/automations/' + this.props.id + '/emails', {type: type})).data;
       notify.show('Automation email created', 'success');
       this.props.history.push('/automations/' + this.props.id + '/emails/' + email.id);
     } catch (error) {
@@ -824,9 +824,19 @@ class Automation extends Component {
       <EDFormBox space>
         <div className="flex-items space-between">
           <h4>Emails</h4>
-          <Button disabled={busy} onClick={this.createEmail}>
-            {this.state.isCreatingEmail ? 'Creating...' : 'Create Email'}
-          </Button>
+          <LoaderButton
+            id="automation-email-create-dropdown"
+            text="Create Email"
+            loadingText="Creating..."
+            disabled={busy}
+            onClick={this.createEmail.bind(this, 'beefree')}
+            splitItems={[
+              { text: 'BeeFree editor', onClick: this.createEmail.bind(this, 'beefree') },
+              { text: 'Legacy editor', onClick: this.createEmail.bind(this, '') },
+              { text: 'WYSIWYG editor', onClick: this.createEmail.bind(this, 'wysiwyg') },
+              { text: 'HTML editor', onClick: this.createEmail.bind(this, 'raw') },
+            ]}
+          />
         </div>
         {
           emails.length ?

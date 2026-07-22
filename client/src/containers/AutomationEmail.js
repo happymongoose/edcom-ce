@@ -1,9 +1,8 @@
 import React, { Component } from "react";
-import { Button, FormControl } from "react-bootstrap";
+import { Button } from "react-bootstrap";
 import axios from "axios";
 import Beforeunload from "react-beforeunload";
 import { Prompt } from "react-router-dom";
-import shortid from "shortid";
 import TemplateEditor from "../components/TemplateEditor";
 import TemplateRawEditor from "../components/TemplateRawEditor";
 import TemplateWYSIWYGEditor from "../components/TemplateWYSIWYGEditor";
@@ -37,6 +36,9 @@ function normalizeEmail(email) {
   email.rawText = email.rawText || '';
   email.parts = email.parts || [];
   email.bodyStyle = email.bodyStyle || {};
+  if (!email.type && !email.parts.length) {
+    email.initialize = true;
+  }
   return email;
 }
 
@@ -49,14 +51,6 @@ function patchPayload(data) {
     rawText: data.rawText || '',
     parts: data.parts || [],
     bodyStyle: data.bodyStyle || {},
-  };
-}
-
-function legacyHtmlPart(rawText) {
-  return {
-    type: 'HTML',
-    id: shortid.generate(),
-    customHtml: rawText || '<p>Enter your HTML here.</p>',
   };
 }
 
@@ -84,27 +78,7 @@ class AutomationEmail extends Component {
   }
 
   handleChange = event => {
-    const value = getvalue(event);
-    if (event.target.id === 'type') {
-      const update = {type: {$set: value}};
-      if (!value && !(this.props.data.parts || []).length) {
-        if ((this.props.data.rawText || '').trim()) {
-          update.initialize = {$set: false};
-          update.parts = {$set: [legacyHtmlPart(this.props.data.rawText)]};
-          if (!this.props.data.bodyStyle || !this.props.data.bodyStyle.version) {
-            update.bodyStyle = {$set: {version: 3}};
-          }
-        } else {
-          update.initialize = {$set: true};
-        }
-      } else if (this.props.data.initialize) {
-        update.initialize = {$set: false};
-      }
-      this.update(update);
-      return;
-    }
-
-    this.update({[event.target.id]: {$set: value}});
+    this.update({[event.target.id]: {$set: getvalue(event)}});
   }
 
   save = async () => {
@@ -317,19 +291,6 @@ class AutomationEmail extends Component {
                 onChange={this.handleChange}
                 space
               />
-              <label className="control-label" htmlFor="type">Editor</label>
-              {' '}
-              <FormControl
-                id="type"
-                componentClass="select"
-                value={this.props.data.type || ''}
-                onChange={this.handleChange}
-              >
-                <option value="beefree">Drag and drop designer</option>
-                <option value="wysiwyg">WYSIWYG editor</option>
-                <option value="raw">HTML editor</option>
-                <option value="">Legacy component editor</option>
-              </FormControl>
             </EDFormBox>
             <EDFormBox space>
               {this.renderEditor()}

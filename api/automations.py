@@ -594,12 +594,13 @@ def _default_automation_email(doc: JsonObj | None = None) -> JsonObj:
     now = _utc_now()
     name = (doc.get("name") or "New automation email").strip()
     subject = (doc.get("subject") or "Click Here to Edit").strip()
+    email_type = doc["type"] if "type" in doc else "raw"
 
     return {
         "name": name or "New automation email",
         "subject": subject or "Click Here to Edit",
         "preheader": doc.get("preheader", ""),
-        "type": doc.get("type") or "raw",
+        "type": email_type,
         "rawText": doc.get("rawText") or "<p>Hello</p>",
         "parts": doc.get("parts") or [],
         "bodyStyle": doc.get("bodyStyle") or {},
@@ -1025,7 +1026,14 @@ class AutomationEmail(object):
         db = req.context["db"]
         cid = db.get_cid()
         _automation_for_email_route(db, id)
-        _get_automation_email(db, cid, id, email_id)
+        email = _get_automation_email(db, cid, id, email_id)
+        if "type" in doc:
+            existing_type = email["type"] if "type" in email else "raw"
+            if doc["type"] != existing_type:
+                raise falcon.HTTPBadRequest(
+                    title="Automation email editor type is fixed",
+                    description="Create a new automation email to use a different editor type.",
+                )
         patch = _prepare_automation_email_patch(doc)
 
         db.execute(

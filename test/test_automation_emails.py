@@ -134,9 +134,24 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(email["type"], "raw")
         self.assertEqual(email["rawText"], "<p>Hello</p>")
 
+    def test_editor_type_is_set_at_creation(self):
+        automation = self.create_automation()
+
+        for email_type in ("beefree", "", "wysiwyg", "raw"):
+            email = self.user_post(
+                "/api/automations/%s/emails" % automation["id"],
+                json={"type": email_type},
+            )
+            self.created_email_ids.append(email["id"])
+            self.assertEqual(email["type"], email_type)
+
     def test_editor_compatible_fields_can_be_saved(self):
         automation = self.create_automation()
-        email = self.create_email(automation["id"])
+        email = self.create_email(
+            automation["id"],
+            type="beefree",
+            rawText='{"page": {"body": {}}}',
+        )
 
         beefree = self.user_patch(
             "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
@@ -150,15 +165,9 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(beefree["type"], "beefree")
         self.assertEqual(beefree["rawText"], '{"page": {"body": {}}}')
 
-        wysiwyg = self.user_patch(
-            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
-            json={
-                "type": "wysiwyg",
-                "rawText": "<p>WYSIWYG body</p>",
-            },
-        )
-        self.assertEqual(wysiwyg["type"], "wysiwyg")
-        self.assertEqual(wysiwyg["rawText"], "<p>WYSIWYG body</p>")
+    def test_legacy_editor_fields_can_be_saved(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"], type="")
 
         legacy = self.user_patch(
             "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
@@ -172,6 +181,19 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(legacy["parts"], [{"type": "text"}])
         self.assertEqual(legacy["bodyStyle"], {"version": 3})
 
+    def test_editor_type_cannot_be_changed_after_creation(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"], type="raw")
+
+        result = self.simulate_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={"type": "wysiwyg"},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("editor type is fixed", result.text)
+
     def test_invalid_editor_type_is_rejected(self):
         automation = self.create_automation()
         email = self.create_email(automation["id"])
@@ -183,6 +205,20 @@ class TestAutomationEmails(test_base.TestBase):
         )
 
         self.assertEqual(result.status_code, 400)
+
+    @patch("api.automations.send_backend_mail")
+    def test_send_test_email_requires_to_address(self, send_backend_mail):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        result = self.simulate_post(
+            "/api/automations/%s/emails/%s/test" % (automation["id"], email["id"]),
+            json={"route": self.route_id()},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        send_backend_mail.assert_not_called()
 
     @patch("api.automations.check_test_limit")
     @patch("api.automations.send_backend_mail")
