@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, FormControl, Panel } from "react-bootstrap";
+import { Button, DropdownButton, FormControl, MenuItem, Panel } from "react-bootstrap";
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
@@ -824,19 +824,16 @@ class Automation extends Component {
       <EDFormBox space>
         <div className="flex-items space-between">
           <h4>Emails</h4>
-          <LoaderButton
+          <DropdownButton
             id="automation-email-create-dropdown"
-            text="Create Email"
-            loadingText="Creating..."
+            title={this.state.isCreatingEmail ? 'Creating...' : 'Create Email'}
             disabled={busy}
-            onClick={this.createEmail.bind(this, 'beefree')}
-            splitItems={[
-              { text: 'BeeFree editor', onClick: this.createEmail.bind(this, 'beefree') },
-              { text: 'Legacy editor', onClick: this.createEmail.bind(this, '') },
-              { text: 'WYSIWYG editor', onClick: this.createEmail.bind(this, 'wysiwyg') },
-              { text: 'HTML editor', onClick: this.createEmail.bind(this, 'raw') },
-            ]}
-          />
+          >
+            <MenuItem onClick={this.createEmail.bind(this, 'beefree')}>BeeFree editor</MenuItem>
+            <MenuItem onClick={this.createEmail.bind(this, '')}>Legacy editor</MenuItem>
+            <MenuItem onClick={this.createEmail.bind(this, 'wysiwyg')}>WYSIWYG editor</MenuItem>
+            <MenuItem onClick={this.createEmail.bind(this, 'raw')}>HTML editor</MenuItem>
+          </DropdownButton>
         </div>
         {
           emails.length ?
