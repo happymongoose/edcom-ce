@@ -16,7 +16,6 @@ import { FormControlLabel } from "../components/FormControls";
 import { EDFormSection, EDFormBox } from "../components/EDDOM";
 import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
-import "./AutomationEmail.css";
 
 function errorMessage(error, fallback) {
   const data = error && error.response && error.response.data;
@@ -203,7 +202,6 @@ class AutomationEmail extends Component {
     if (!data.type) {
       return (
         <TemplateEditor
-          fixed
           user={this.props.user}
           data={data}
           update={this.update}
