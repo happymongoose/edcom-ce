@@ -71,6 +71,21 @@ class AutomationEmail extends Component {
     };
 
     this._saveCB = null;
+    this._fromSet = false;
+  }
+
+  componentWillReceiveProps(nextProps) {
+    if (
+      nextProps.user &&
+      !nextProps.data.fromname &&
+      !nextProps.data.returnpath &&
+      !this._fromSet
+    ) {
+      nextProps.update({
+        fromname: {$set: nextProps.user.fullname},
+        returnpath: {$set: nextProps.user.username},
+      });
+    }
   }
 
   goBack = () => {
@@ -85,6 +100,9 @@ class AutomationEmail extends Component {
   }
 
   handleChange = event => {
+    if (event.target.id === 'fromname' || event.target.id === 'returnpath') {
+      this._fromSet = true;
+    }
     this.update({[event.target.id]: {$set: getvalue(event)}});
   }
 
