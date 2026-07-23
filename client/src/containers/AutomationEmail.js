@@ -68,6 +68,8 @@ class AutomationEmail extends Component {
     this.state = {
       changed: false,
       showTestEmailModal: false,
+      showReplyTo: false,
+      showFromEmail: false,
     };
 
     this._saveCB = null;
@@ -104,6 +106,24 @@ class AutomationEmail extends Component {
       this._fromSet = true;
     }
     this.update({[event.target.id]: {$set: getvalue(event)}});
+  }
+
+  showReplyTo = event => {
+    event.preventDefault();
+    this.setState({showReplyTo: true});
+  }
+
+  showFromEmail = event => {
+    event.preventDefault();
+    this.setState({showFromEmail: true});
+  }
+
+  replyToVisible = () => {
+    return this.state.showReplyTo || this.props.data.replyto;
+  }
+
+  fromEmailVisible = () => {
+    return this.state.showFromEmail || this.props.data.fromemail;
   }
 
   save = async () => {
@@ -335,24 +355,38 @@ class AutomationEmail extends Component {
                     onChange={this.handleChange}
                     space
                   />
+                  { !this.replyToVisible() &&
+                    <div>
+                      <a href="#replyto" onClick={this.showReplyTo}>Add alternate Reply-To address</a>
+                    </div>
+                  }
+                  { !this.fromEmailVisible() &&
+                    <div>
+                      <a href="#mailfrom" onClick={this.showFromEmail}>Add alternate From Email address</a>
+                    </div>
+                  }
                 </Col>
               </Row>
               <Row>
                 <Col md={6}>
-                  <FormControlLabel
-                    id="fromemail"
-                    label="From Email"
-                    obj={this.props.data}
-                    onChange={this.handleChange}
-                  />
+                  { this.fromEmailVisible() &&
+                    <FormControlLabel
+                      id="fromemail"
+                      label="From Email"
+                      obj={this.props.data}
+                      onChange={this.handleChange}
+                    />
+                  }
                 </Col>
                 <Col md={6}>
-                  <FormControlLabel
-                    id="replyto"
-                    label="Reply-To Email"
-                    obj={this.props.data}
-                    onChange={this.handleChange}
-                  />
+                  { this.replyToVisible() &&
+                    <FormControlLabel
+                      id="replyto"
+                      label="Reply-To Email"
+                      obj={this.props.data}
+                      onChange={this.handleChange}
+                    />
+                  }
                 </Col>
               </Row>
             </EDFormBox>
