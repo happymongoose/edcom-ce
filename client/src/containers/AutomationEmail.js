@@ -330,7 +330,7 @@ class AutomationEmail extends Component {
                 <Col md={6}>
                   <FormControlLabel
                     id="returnpath"
-                    label="Bounce / Return-Path Email"
+                    label="Sender Email Address"
                     obj={this.props.data}
                     onChange={this.handleChange}
                     space
