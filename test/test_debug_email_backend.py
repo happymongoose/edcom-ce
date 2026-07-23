@@ -79,6 +79,41 @@ class TestDebugEmailBackend(test_base.TestBase):
         self.created_route_ids.append(route_id)
         return self.db.routes.get(route_id)
 
+    def create_drop_all_route(self):
+        route_id = shortuuid.uuid()
+        now = datetime.utcnow().isoformat() + "Z"
+        route = {
+            "name": "Drop route %s" % self.test_id,
+            "dirty": False,
+            "rules": [
+                {
+                    "splits": [{"pct": 100, "policy": ""}],
+                    "default": True,
+                    "domaingroup": "",
+                }
+            ],
+            "modified": now,
+            "published": {
+                "rules": [
+                    {
+                        "splits": [{"pct": 100, "policy": ""}],
+                        "default": True,
+                        "domaingroup": "",
+                    }
+                ],
+                "usedefault": False,
+            },
+            "usedefault": False,
+        }
+        self.db.execute(
+            "insert into routes (id, cid, data) values (%s, %s, %s)",
+            route_id,
+            self.backend_cid(),
+            route,
+        )
+        self.created_route_ids.append(route_id)
+        return self.db.routes.get(route_id)
+
     def create_debug_backend(self):
         backend_id = shortuuid.uuid()
         self.db.execute(
@@ -203,8 +238,7 @@ class TestDebugEmailBackend(test_base.TestBase):
         self.assertEqual(matched[0]["subject"], "Limited 104")
 
     def test_drop_all_mail_behaviour_is_unchanged(self):
-        company = self.db.companies.get(self.user_cid())
-        route = self.db.routes.get(company["routes"][0])
+        route = self.create_drop_all_route()
 
         with self.assertRaisesRegex(Exception, "Drop All Mail"):
             send_backend_mail(
