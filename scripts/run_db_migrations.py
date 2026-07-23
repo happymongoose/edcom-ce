@@ -12,7 +12,7 @@ from api.shared import contacts
 from api.migrations import fix_funnel_indexes, create_sp_event_table, add_monthly_limit, fix_templates_for_outlook, \
     remove_limit_incr, add_txnsends_msgid, webhooks_to_resthooks, add_resthooks_created, add_txnsettings_table, \
     add_list_stats, add_list_unsubscribe_post, add_signupsettings_table, add_beefree_templates, add_savedrows_table, \
-    add_automations_table, add_automation_enrolments_table, add_automation_emails_table
+    add_automations_table, add_automation_enrolments_table, add_automation_emails_table, add_debug_email_tables
 from api.shared.log import get_logger
 
 log = get_logger()
@@ -35,6 +35,7 @@ migration_list = [
     ('add_automations_table', add_automations_table),
     ('add_automation_enrolments_table', add_automation_enrolments_table),
     ('add_automation_emails_table', add_automation_emails_table),
+    ('add_debug_email_tables', add_debug_email_tables),
 ]
 
 def run():

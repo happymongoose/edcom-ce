@@ -627,6 +627,7 @@ def choose_backend(
     sparkpost: Dict[str, JsonObj],
     easylink: Dict[str, JsonObj],
     smtprelays: Dict[str, JsonObj],
+    debuglogs: Dict[str, JsonObj],
 ) -> Tuple[JsonObj | None, str | None]:
     obj = None
     settingsid = None
@@ -679,7 +680,11 @@ def choose_backend(
                                 if s is None:
                                     s = smtprelays.get(split["policy"], None)
                                     if s is None:
-                                        continue
+                                        s = debuglogs.get(split["policy"], None)
+                                        if s is None:
+                                            continue
+                                        else:
+                                            return s, "debug_log"
                                     else:
                                         return s, "smtprelay"
                                 else:
@@ -739,6 +744,60 @@ def choose_backend(
             break
 
     return obj, settingsid
+
+
+def record_debug_email(
+    db: DB,
+    usercid: str,
+    route: JsonObj,
+    backend: JsonObj,
+    to: str,
+    toaddr: str,
+    fromaddr: str,
+    returnpath: str,
+    replyto: str,
+    subject: str,
+    html: str,
+    text: str | None = None,
+    source_type: str | None = None,
+    source_id: str | None = None,
+    source_ids: JsonObj | None = None,
+    metadata: JsonObj | None = None,
+) -> str:
+    now = datetime.utcnow()
+    data: JsonObj = {
+        "timestamp": now.isoformat() + "Z",
+        "recipient": to,
+        "recipient_email": toaddr,
+        "from": fromaddr,
+        "returnpath": returnpath,
+        "replyto": replyto,
+        "subject": subject,
+        "html": html,
+        "route_id": route["id"],
+        "backend_id": backend["id"],
+    }
+
+    if text is not None:
+        data["text"] = text
+    if source_type is not None:
+        data["source_type"] = source_type
+    if source_id is not None:
+        data["source_id"] = source_id
+    if source_ids is not None:
+        data["source_ids"] = source_ids
+    if metadata is not None:
+        data["metadata"] = metadata
+
+    log_id = shortuuid.uuid()
+    db.execute(
+        "insert into debug_email_logs (id, cid, ts, data) values (%s, %s, %s, %s)",
+        log_id,
+        usercid,
+        now,
+        data,
+    )
+    return log_id
 
 
 def get_frontend_params(
@@ -897,6 +956,11 @@ def send_backend_mail(
     campid: str = "test",
     toname: str | None = None,
     raise_err: bool = False,
+    text: str | None = None,
+    source_type: str | None = None,
+    source_id: str | None = None,
+    source_ids: JsonObj | None = None,
+    metadata: JsonObj | None = None,
 ) -> bool:
     demo, imagebucket, bodydomain, headers, fromencoding, subjectencoding, usedkim = (
         get_frontend_params(db, usercid)
@@ -917,6 +981,7 @@ def send_backend_mail(
     sparkpost = {}
     easylink = {}
     smtprelays = {}
+    debuglogs = {}
     oldcid = db.get_cid()
     db.set_cid(route["cid"])
     try:
@@ -936,6 +1001,8 @@ def send_backend_mail(
             easylink[s["id"]] = s
         for s in db.smtprelays.find():
             smtprelays[s["id"]] = s
+        for d in db.debug_email_backends.find():
+            debuglogs[d["id"]] = d
         obj, settingsid = choose_backend(
             route,
             toaddr,
@@ -947,6 +1014,7 @@ def send_backend_mail(
             sparkpost,
             easylink,
             smtprelays,
+            debuglogs,
         )
     finally:
         db.set_cid(oldcid)
@@ -955,6 +1023,27 @@ def send_backend_mail(
         raise Exception(
             "You must delete Drop All Mail from your postal route to send this message"
         )
+
+    if settingsid == "debug_log":
+        record_debug_email(
+            db,
+            usercid,
+            route,
+            obj,
+            to,
+            toaddr,
+            fromaddr,
+            returnpath,
+            replyto,
+            subject,
+            html,
+            text=text,
+            source_type=source_type,
+            source_id=source_id,
+            source_ids=source_ids,
+            metadata=metadata,
+        )
+        return True
 
     if settingsid == "mailgun":
         clientdomain = db.single(

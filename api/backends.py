@@ -584,6 +584,42 @@ class RoutePolicies(object):
         ret.extend({"id": m["id"], "name": m["name"]} for m in db.sparkpost.find())
         ret.extend({"id": m["id"], "name": m["name"]} for m in db.easylink.find())
         ret.extend({"id": m["id"], "name": m["name"]} for m in db.smtprelays.find())
+        ret.extend(
+            {"id": m["id"], "name": m["name"]} for m in db.debug_email_backends.find()
+        )
+
+        req.context["result"] = ret
+
+
+class DebugEmailLogs(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit = req.get_param_as_int("limit") or 100
+        limit = max(1, min(limit, 100))
+
+        rows = db.execute(
+            """
+            select id, cid, ts, data
+            from debug_email_logs
+            where cid = %s
+            order by ts desc, id desc
+            limit %s
+            """,
+            cid,
+            limit,
+        ).fetchall()
+
+        ret = []
+        for log_id, row_cid, ts, data in rows:
+            item = dict(data)
+            item["id"] = log_id
+            item["cid"] = row_cid
+            item["timestamp"] = item.get("timestamp") or ts.isoformat() + "Z"
+            ret.append(item)
 
         req.context["result"] = ret
 
