@@ -1072,22 +1072,25 @@ class Automation extends Component {
                 :
                   <p>No automation history yet.</p>
               }
-              <div className="flex-items space-between" style={{marginTop: '16px'}}>
+              <div className="flex-items space-between" style={{marginTop: '16px', marginBottom: '6px', position: 'relative', zIndex: 2}}>
                 <h4>Plain text log</h4>
-                <Button
-                  bsSize="small"
+                <button
+                  type="button"
+                  className="btn btn-default btn-sm"
                   title="Copy plain text log"
+                  onMouseDown={event => event.stopPropagation()}
                   onClick={this.copyHistoryLog.bind(this, log)}
-                  style={{marginTop: '4px'}}
+                  style={{marginTop: '4px', position: 'relative', zIndex: 3, pointerEvents: 'auto', cursor: 'pointer'}}
                 >
                   <i className="fa fa-clipboard" /> Copy
-                </Button>
+                </button>
               </div>
               <FormControl
                 componentClass="textarea"
                 rows={Math.min(Math.max((history.events || []).length + 1, 4), 16)}
                 readOnly
                 value={log}
+                onFocus={event => event.target.select()}
               />
             </Panel.Body>
           </Panel.Collapse>
