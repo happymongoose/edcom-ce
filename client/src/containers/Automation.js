@@ -1106,25 +1106,22 @@ class Automation extends Component {
             <EDFormBox space>
               <div className="flex-items space-between">
                 <h4>Draft Workflow</h4>
-                <div>
-                  <Button onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</Button>
-                  {' '}
-                  <Button onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</Button>
-                  {' '}
-                  <Button onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</Button>
-                  {' '}
-                  <Button onClick={this.addNode.bind(this, 'go_to')}>Go To Node</Button>
-                  {' '}
-                  <Button
+                <DropdownButton
+                  id="automation-node-create-dropdown"
+                  title="Add Node"
+                >
+                  <MenuItem onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</MenuItem>
+                  <MenuItem onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</MenuItem>
+                  <MenuItem onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</MenuItem>
+                  <MenuItem onClick={this.addNode.bind(this, 'go_to')}>Go To Node</MenuItem>
+                  <MenuItem
                     onClick={this.addNode.bind(this, 'send_email')}
                     disabled={!((this.props.emails || []).length)}
-                    title={(this.props.emails || []).length ? undefined : 'Create an automation email before adding a send email node.'}
                   >
                     Send Email Node
-                  </Button>
-                  {' '}
-                  <Button onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</Button>
-                </div>
+                  </MenuItem>
+                  <MenuItem onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</MenuItem>
+                </DropdownButton>
               </div>
               {
                 (this.props.emails || []).length ?
