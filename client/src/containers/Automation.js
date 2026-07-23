@@ -127,6 +127,24 @@ export function automationHistoryLog(history) {
       if (event.target_node_id) {
         parts.push('target=' + event.target_node_id);
       }
+      if (event.automation_email_id) {
+        parts.push('automation_email=' + event.automation_email_id);
+      }
+      if (event.automation_email_name) {
+        parts.push('email_name="' + event.automation_email_name + '"');
+      }
+      if (event.subject) {
+        parts.push('subject="' + event.subject + '"');
+      }
+      if (event.recipient_email) {
+        parts.push('recipient=' + event.recipient_email);
+      }
+      if (event.route_id) {
+        parts.push('route=' + event.route_id);
+      }
+      if (event.sent !== undefined && event.sent !== null) {
+        parts.push('sent=' + event.sent);
+      }
       parts.push('status=' + (event.status || ''));
       if (event.error) {
         parts.push('error=' + event.error);

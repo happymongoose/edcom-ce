@@ -964,6 +964,55 @@ def _step_run_obj(row) -> JsonObj | None:
     return data
 
 
+def _automation_execution_route(db: DB, cid: str) -> JsonObj:
+    oldcid = db.get_cid()
+    db.set_cid(None)
+    try:
+        company = db.companies.get(cid)
+        if company is None:
+            raise falcon.HTTPForbidden()
+
+        published_routes = []
+        for route_id in company.get("routes") or []:
+            route = db.routes.get(route_id)
+            if route is not None and route.get("published") is not None:
+                published_routes.append(route)
+
+        if not published_routes:
+            raise falcon.HTTPBadRequest(
+                title="No postal route available",
+                description="Assign exactly one published postal route to this account before sending automation emails.",
+            )
+        if len(published_routes) > 1:
+            raise falcon.HTTPBadRequest(
+                title="Multiple postal routes available",
+                description="Automation email execution requires exactly one published postal route for this account.",
+            )
+        return published_routes[0]
+    finally:
+        db.set_cid(oldcid)
+
+
+def _automation_email_sender(email_doc: JsonObj) -> tuple[str, str, str, str]:
+    fromname = remove_newlines(email_doc.get("fromname", "").strip())
+    returnpath = remove_newlines(email_doc.get("returnpath", "").strip())
+    fromemail = remove_newlines((email_doc.get("fromemail") or returnpath).strip())
+    replyto = remove_newlines((email_doc.get("replyto") or fromemail or returnpath).strip())
+
+    if not fromname:
+        raise falcon.HTTPBadRequest(
+            title="Automation email sender is incomplete",
+            description="The selected automation email is missing From Name.",
+        )
+    if not returnpath:
+        raise falcon.HTTPBadRequest(
+            title="Automation email sender is incomplete",
+            description="The selected automation email is missing Sender Email Address.",
+        )
+
+    return fromname, fromemail, returnpath, replyto
+
+
 class Automations(CRUDCollection):
 
     def __init__(self) -> None:
@@ -2165,6 +2214,12 @@ class AutomationHistory(object):
                     "result": step_run.get("result"),
                     "branch": step_run.get("branch"),
                     "target_node_id": step_run.get("target_node_id"),
+                    "automation_email_id": step_run.get("automation_email_id"),
+                    "automation_email_name": step_run.get("automation_email_name"),
+                    "subject": step_run.get("subject"),
+                    "recipient_email": step_run.get("recipient_email"),
+                    "route_id": step_run.get("route_id"),
+                    "sent": step_run.get("sent"),
                     "published_revision": step_run.get("published_revision"),
                     "status": step_run.get("status"),
                     "error": step_run.get("error"),
@@ -2249,12 +2304,12 @@ class AutomationEnrolmentRunNext(object):
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "wait_duration", "if_has_tag", "go_to", "exit"):
+        if node_type not in ("add_tag", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, wait_duration, if_has_tag, go_to and exit nodes can be executed manually."
+                    "Only add_tag, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -2445,6 +2500,114 @@ class AutomationEnrolmentRunNext(object):
                 "current_node_id": target_node_id,
                 "modified": now,
             }
+        elif node_type == "send_email":
+            automation_email_id = node.get("automation_email_id")
+            automation_email = _automation_email_obj(
+                db.row(
+                    """
+                    select id, cid, automation_id, data
+                    from automation_emails
+                    where cid = %s and automation_id = %s and id = %s
+                    """,
+                    cid,
+                    id,
+                    automation_email_id,
+                )
+            )
+            if automation_email is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation email is missing",
+                    description="The published send_email node references an automation email that was not found.",
+                )
+
+            fromname, fromemail, returnpath, replyto = _automation_email_sender(automation_email)
+
+            route = _automation_execution_route(db, cid)
+
+            imagebucket = os.environ["s3_imagebucket"]
+            oldcid = db.get_cid()
+            db.set_cid(None)
+            try:
+                company = db.companies.get(cid)
+                parentcompany = db.companies.get(company["cid"]) if company else None
+                if parentcompany is not None:
+                    imagebucket = parentcompany.get("s3_imagebucket", imagebucket)
+            finally:
+                db.set_cid(oldcid)
+
+            html, _ = generate_html(db, automation_email, run_id, imagebucket)
+            subject = remove_newlines(automation_email["subject"])
+            fromdomain = ""
+            if "@" in returnpath:
+                fromdomain = returnpath.split("@")[-1].strip().lower()
+            elif "@" in fromemail:
+                fromdomain = fromemail.split("@")[-1].strip().lower()
+            fromaddr = email.utils.formataddr((fromname, fromemail))
+            recipient_email = enrolment["contact_email"]
+
+            try:
+                send_backend_mail(
+                    db,
+                    cid,
+                    route,
+                    html,
+                    fromaddr,
+                    returnpath,
+                    fromdomain,
+                    replyto,
+                    recipient_email,
+                    recipient_email,
+                    subject,
+                    campid=run_id,
+                    source_type="automation",
+                    source_id=id,
+                    source_ids={
+                        "automation_id": id,
+                        "automation_email_id": automation_email_id,
+                        "enrolment_id": enrolment_id,
+                        "node_id": current_node_id,
+                        "step_run_id": run_id,
+                        "published_revision": automation.get("published_revision"),
+                    },
+                    metadata={
+                        "automation_id": id,
+                        "automation_email_id": automation_email_id,
+                        "enrolment_id": enrolment_id,
+                        "node_id": current_node_id,
+                        "step_run_id": run_id,
+                        "published_revision": automation.get("published_revision"),
+                    },
+                )
+            except Exception as e:
+                traceback.print_exc()
+                raise falcon.HTTPBadRequest(
+                    title="Error sending automation email",
+                    description="Error sending automation email: %s" % e,
+                )
+
+            run_data.update(
+                {
+                    "action": "send_email",
+                    "automation_email_id": automation_email_id,
+                    "automation_email_name": automation_email.get("name"),
+                    "subject": subject,
+                    "recipient_email": recipient_email,
+                    "route_id": route["id"],
+                    "sent": True,
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
         else:
             enrolment_update = {
                 "status": "exited",

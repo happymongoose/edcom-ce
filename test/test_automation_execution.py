@@ -3,18 +3,51 @@ import dateutil.parser
 from datetime import datetime, timedelta
 
 import test_base
+from api.migrations import add_debug_email_tables
 
 
 class TestAutomationExecution(test_base.TestBase):
 
     def setUp(self):
         super(TestAutomationExecution, self).setUp()
+        add_debug_email_tables.run(self.db)
         self.created_list_ids = []
         self.created_emails = []
+        self.test_id = "automation_execution_%s" % shortuuid.uuid().lower()
+        self.created_debug_backend_ids = []
+        self.created_route_ids = []
+        self.original_company_routes = None
 
     def tearDown(self):
+        self.cleanup_debug_routes()
         self.cleanup_contacts_and_lists()
         super(TestAutomationExecution, self).tearDown()
+
+    def cleanup_debug_routes(self):
+        cid = self.user_cookie["cid"]
+        if self.original_company_routes is not None:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                {"routes": self.original_company_routes},
+                cid,
+            )
+            self.original_company_routes = None
+        self.db.execute(
+            "delete from debug_email_logs where data->'metadata'->>'test_id' = %s",
+            self.test_id,
+        )
+        if self.created_debug_backend_ids:
+            self.db.execute(
+                "delete from debug_email_backends where id = any(%s)",
+                self.created_debug_backend_ids,
+            )
+            self.created_debug_backend_ids = []
+        if self.created_route_ids:
+            self.db.execute(
+                "delete from routes where id = any(%s)",
+                self.created_route_ids,
+            )
+            self.created_route_ids = []
 
     def cleanup_contacts_and_lists(self):
         cid = self.user_cookie["cid"]
@@ -135,6 +168,16 @@ class TestAutomationExecution(test_base.TestBase):
         ).json
 
     def create_send_email_automation(self):
+        return self.create_send_email_automation_with_options()
+
+    def create_send_email_automation_with_options(
+        self,
+        include_exit=True,
+        fromname="Automation Sender",
+        returnpath="automation-sender@example.com",
+        fromemail="",
+        replyto="",
+    ):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -146,30 +189,38 @@ class TestAutomationExecution(test_base.TestBase):
                 "name": "Execution email",
                 "subject": "Execution subject",
                 "rawText": "<p>Hello</p>",
+                "fromname": fromname,
+                "returnpath": returnpath,
+                "fromemail": fromemail,
+                "replyto": replyto,
             },
         )
+        nodes = [
+            {
+                "id": "node_send_email_1",
+                "type": "send_email",
+                "label": "Send email",
+                "automation_email_id": email["id"],
+            },
+        ]
+        if include_exit:
+            nodes.append(
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                }
+            )
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(
-                nodes=[
-                    {
-                        "id": "node_send_email_1",
-                        "type": "send_email",
-                        "label": "Send email",
-                        "automation_email_id": email["id"],
-                    },
-                    {
-                        "id": "node_exit_1",
-                        "type": "exit",
-                        "label": "Exit automation",
-                    },
-                ]
-            ),
+            json=self.workflow(nodes=nodes),
         )
-        return self.simulate_post(
+        published = self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
             headers=self.headers(),
         ).json
+        published["execution_email_id"] = email["id"]
+        return published
 
     def create_condition_automation(self):
         suffix = self.unique()
@@ -313,7 +364,89 @@ class TestAutomationExecution(test_base.TestBase):
             )
         )
 
+    def backend_cid(self):
+        company = self.db.companies.get(self.user_cookie["cid"])
+        return company["cid"]
+
+    def create_debug_backend(self):
+        backend_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into debug_email_backends (id, cid, data) values (%s, %s, %s)",
+            backend_id,
+            self.backend_cid(),
+            {"name": "Debug Log %s" % self.test_id},
+        )
+        self.created_debug_backend_ids.append(backend_id)
+        return backend_id
+
+    def create_debug_route(self):
+        backend_id = self.create_debug_backend()
+        route_id = shortuuid.uuid()
+        now = datetime.utcnow().isoformat() + "Z"
+        route = {
+            "name": "Debug automation route %s" % self.test_id,
+            "dirty": False,
+            "rules": [
+                {
+                    "splits": [{"pct": 100, "policy": backend_id}],
+                    "default": True,
+                    "domaingroup": "",
+                }
+            ],
+            "modified": now,
+            "published": {
+                "rules": [
+                    {
+                        "splits": [{"pct": 100, "policy": backend_id}],
+                        "default": True,
+                        "domaingroup": "",
+                    }
+                ],
+                "usedefault": False,
+            },
+            "usedefault": False,
+        }
+        self.db.execute(
+            "insert into routes (id, cid, data) values (%s, %s, %s)",
+            route_id,
+            self.backend_cid(),
+            route,
+        )
+        self.created_route_ids.append(route_id)
+        return route_id
+
+    def assign_company_routes(self, routes):
+        cid = self.user_cookie["cid"]
+        if self.original_company_routes is None:
+            company = self.db.companies.get(cid)
+            self.original_company_routes = list(company.get("routes") or [])
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"routes": routes},
+            cid,
+        )
+
+    def assign_single_debug_route(self):
+        route_id = self.create_debug_route()
+        self.assign_company_routes([route_id])
+        return route_id
+
+    def debug_email_logs(self, automation_id):
+        return self.db.execute(
+            """
+            select id, cid, data
+            from debug_email_logs
+            where data->'source_ids'->>'automation_id' = %s
+            order by ts desc
+            """,
+            automation_id,
+        ).fetchall()
+
     def cleanup(self, *automation_ids):
+        self.db.execute(
+            "delete from debug_email_logs where data->'source_ids'->>'automation_id' = any(%s)",
+            list(automation_ids),
+        )
         self.db.execute(
             "delete from automation_emails where automation_id = any(%s)",
             list(automation_ids),
@@ -401,16 +534,183 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_running_send_email_is_unsupported_clearly(self):
+    def test_running_send_email_records_debug_log_and_advances(self):
         email, _ = self.create_contact()
+        route_id = self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["node_type"], "send_email")
+        self.assertEqual(step_run["automation_email_id"], automation["execution_email_id"])
+        self.assertEqual(step_run["subject"], "Execution subject")
+        self.assertEqual(step_run["recipient_email"], email)
+        self.assertEqual(step_run["route_id"], route_id)
+        self.assertEqual(step_run["published_revision"], automation["published_revision"])
+        self.assertEqual(step_run["sent"], True)
+
+        logs = self.debug_email_logs(automation["id"])
+        self.assertEqual(len(logs), 1)
+        log_data = logs[0][2]
+        self.assertEqual(log_data["subject"], "Execution subject")
+        self.assertEqual(log_data["recipient_email"], email)
+        self.assertEqual(log_data["source_type"], "automation")
+        self.assertEqual(log_data["source_id"], automation["id"])
+        self.assertEqual(log_data["source_ids"]["automation_id"], automation["id"])
+        self.assertEqual(log_data["source_ids"]["automation_email_id"], automation["execution_email_id"])
+        self.assertEqual(log_data["source_ids"]["enrolment_id"], enrolment["id"])
+        self.assertEqual(log_data["source_ids"]["node_id"], "node_send_email_1")
+        self.assertEqual(log_data["source_ids"]["step_run_id"], step_run["id"])
+        self.assertEqual(log_data["source_ids"]["published_revision"], automation["published_revision"])
+        self.assertEqual(log_data["metadata"]["automation_id"], automation["id"])
+        self.assertEqual(log_data["metadata"]["step_run_id"], step_run["id"])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_does_not_execute_next_node_in_same_request(self):
+        email, contact_id = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        self.db.set_cid(self.user_cookie["cid"])
+        published = automation["published"].copy()
+        published["nodes"][1] = {
+            "id": "node_add_tag_1",
+            "type": "add_tag",
+            "label": "Add after send",
+            "draft_tag": "send-email-next-node",
+        }
+        self.db.automations.patch(automation["id"], {"published": published})
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertFalse(self.has_tag(contact_id, "send-email-next-node"))
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_completes_when_no_next_node(self):
+        email, _ = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation_with_options(include_exit=False)
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "completed")
+        self.assertEqual(result.json["step_run"]["node_type"], "send_email")
+        self.assertEqual(len(self.debug_email_logs(automation["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_missing_referenced_email_fails_clearly(self):
+        email, _ = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        self.db.set_cid(self.user_cookie["cid"])
+        published = automation["published"].copy()
+        published["nodes"][0] = published["nodes"][0].copy()
+        published["nodes"][0]["automation_email_id"] = "missing-email-id"
+        self.db.automations.patch(automation["id"], {"published": published})
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Automation email is missing", result.text)
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_missing_fromname_fails_clearly(self):
+        email, _ = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation_with_options(fromname="")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("missing From Name", result.text)
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_missing_returnpath_fails_clearly(self):
+        email, _ = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation_with_options(returnpath="")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("missing Sender Email Address", result.text)
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_no_available_route_fails_clearly(self):
+        email, _ = self.create_contact()
+        self.assign_company_routes([])
         automation = self.create_send_email_automation()
         enrolment = self.enrol(automation["id"], email)
 
         result = self.run_next(automation["id"], enrolment["id"])
 
         self.assertEqual(result.status_code, 400)
-        self.assertIn("Unsupported automation node", result.text)
-        self.assertIn("send_email nodes are not supported", result.text)
+        self.assertIn("No postal route available", result.text)
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_multiple_available_routes_fail_clearly(self):
+        email, _ = self.create_contact()
+        first_route = self.create_debug_route()
+        second_route = self.create_debug_route()
+        self.assign_company_routes([first_route, second_route])
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Multiple postal routes available", result.text)
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_paused_enrolment_rejection_remains_intact(self):
+        email, _ = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {"status": "held"},
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Enrolment is paused", result.text)
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
 
         self.cleanup(automation["id"])
 

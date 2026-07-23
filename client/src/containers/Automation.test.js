@@ -205,4 +205,37 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('action=go_to');
     expect(log).toContain('target=node_shared_1');
   });
+
+  it('includes send email metadata in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_send_1',
+          node_type: 'send_email',
+          node_label: 'Send welcome',
+          action: 'send_email',
+          automation_email_id: 'email-1',
+          automation_email_name: 'Welcome email',
+          subject: 'Welcome',
+          recipient_email: 'contact@example.com',
+          route_id: 'route-1',
+          sent: true,
+          status: 'succeeded',
+          published_revision: 4,
+        },
+      ],
+    });
+
+    expect(log).toContain('action=send_email');
+    expect(log).toContain('automation_email=email-1');
+    expect(log).toContain('email_name="Welcome email"');
+    expect(log).toContain('subject="Welcome"');
+    expect(log).toContain('recipient=contact@example.com');
+    expect(log).toContain('route=route-1');
+    expect(log).toContain('sent=true');
+  });
 });
