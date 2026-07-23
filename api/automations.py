@@ -340,6 +340,22 @@ AUTOMATION_EMAIL_CREATE_SCHEMA = {
             "type": "string",
             "maxLength": 1024,
         },
+        "fromname": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "fromemail": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "replyto": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+        "returnpath": {
+            "type": "string",
+            "maxLength": 1024,
+        },
         "type": {
             "type": "string",
             "enum": ["", "raw", "wysiwyg", "beefree"],
@@ -648,6 +664,8 @@ def _automation_email_obj(row) -> JsonObj | None:
     data["id"] = id
     data["cid"] = cid
     data["automation_id"] = automation_id
+    for field in ("fromname", "fromemail", "replyto", "returnpath"):
+        data[field] = data.get(field) or ""
     return data
 
 
@@ -662,6 +680,10 @@ def _default_automation_email(doc: JsonObj | None = None) -> JsonObj:
         "name": name or "New automation email",
         "subject": subject or "Click Here to Edit",
         "preheader": doc.get("preheader", ""),
+        "fromname": doc.get("fromname", ""),
+        "fromemail": doc.get("fromemail", ""),
+        "replyto": doc.get("replyto", ""),
+        "returnpath": doc.get("returnpath", ""),
         "type": email_type,
         "rawText": doc.get("rawText") or "<p>Hello</p>",
         "parts": doc.get("parts") or [],
@@ -687,6 +709,9 @@ def _prepare_automation_email_patch(doc: JsonObj) -> JsonObj:
                 title="Invalid email subject",
                 description="Automation email subject is required.",
             )
+    for field in ("fromname", "fromemail", "replyto", "returnpath"):
+        if field in patch:
+            patch[field] = (patch.get(field) or "").strip()
     if "type" in patch and patch["type"] not in ("", "raw", "wysiwyg", "beefree"):
         raise falcon.HTTPBadRequest(
             title="Invalid email type",
@@ -723,6 +748,8 @@ def _get_automation_email(
     )
     if email is None:
         raise falcon.HTTPForbidden()
+    for field in ("fromname", "fromemail", "replyto", "returnpath"):
+        email[field] = email.get(field) or ""
     return email
 
 

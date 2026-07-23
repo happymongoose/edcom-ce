@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button } from "react-bootstrap";
+import { Button, Row, Col } from "react-bootstrap";
 import axios from "axios";
 import Beforeunload from "react-beforeunload";
 import { Prompt } from "react-router-dom";
@@ -30,6 +30,10 @@ function normalizeEmail(email) {
   email.name = email.name || 'New automation email';
   email.subject = email.subject || 'Click Here to Edit';
   email.preheader = email.preheader || '';
+  email.fromname = email.fromname || '';
+  email.fromemail = email.fromemail || '';
+  email.replyto = email.replyto || '';
+  email.returnpath = email.returnpath || '';
   if (email.type === undefined || email.type === null) {
     email.type = 'raw';
   }
@@ -47,6 +51,10 @@ function patchPayload(data) {
     name: data.name,
     subject: data.subject,
     preheader: data.preheader || '',
+    fromname: data.fromname || '',
+    fromemail: data.fromemail || '',
+    replyto: data.replyto || '',
+    returnpath: data.returnpath || '',
     type: data.type || '',
     rawText: data.rawText || '',
     parts: data.parts || [],
@@ -293,6 +301,44 @@ class AutomationEmail extends Component {
                 onChange={this.handleChange}
                 space
               />
+              <Row>
+                <Col md={6}>
+                  <FormControlLabel
+                    id="fromname"
+                    label="From Name"
+                    obj={this.props.data}
+                    onChange={this.handleChange}
+                    space
+                  />
+                </Col>
+                <Col md={6}>
+                  <FormControlLabel
+                    id="returnpath"
+                    label="Sender Email Address"
+                    obj={this.props.data}
+                    onChange={this.handleChange}
+                    space
+                  />
+                </Col>
+              </Row>
+              <Row>
+                <Col md={6}>
+                  <FormControlLabel
+                    id="fromemail"
+                    label="From Email"
+                    obj={this.props.data}
+                    onChange={this.handleChange}
+                  />
+                </Col>
+                <Col md={6}>
+                  <FormControlLabel
+                    id="replyto"
+                    label="Reply-To Email"
+                    obj={this.props.data}
+                    onChange={this.handleChange}
+                  />
+                </Col>
+              </Row>
             </EDFormBox>
             <EDFormBox space>
               {this.renderEditor()}
@@ -311,6 +357,10 @@ export default withLoadSave({
     name: '',
     subject: '',
     preheader: '',
+    fromname: '',
+    fromemail: '',
+    replyto: '',
+    returnpath: '',
     type: 'raw',
     rawText: '',
     parts: [],

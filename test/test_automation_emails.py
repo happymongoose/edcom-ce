@@ -80,6 +80,10 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(email["rawText"], "<p>Hello</p>")
         self.assertEqual(email["parts"], [])
         self.assertEqual(email["bodyStyle"], {})
+        self.assertEqual(email["fromname"], "")
+        self.assertEqual(email["fromemail"], "")
+        self.assertEqual(email["replyto"], "")
+        self.assertEqual(email["returnpath"], "")
         self.assertIn("created", email)
         self.assertIn("modified", email)
 
@@ -103,6 +107,10 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(patched["name"], "Updated name")
         self.assertEqual(patched["subject"], "Updated subject")
         self.assertEqual(patched["rawText"], "<p>Updated</p>")
+        self.assertEqual(patched["fromname"], "")
+        self.assertEqual(patched["fromemail"], "")
+        self.assertEqual(patched["replyto"], "")
+        self.assertEqual(patched["returnpath"], "")
 
         duplicated = self.user_post(
             "/api/automations/%s/emails/%s/duplicate" % (automation["id"], email["id"]),
@@ -133,6 +141,54 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(email["subject"], "Click Here to Edit")
         self.assertEqual(email["type"], "raw")
         self.assertEqual(email["rawText"], "<p>Hello</p>")
+        self.assertEqual(email["fromname"], "")
+        self.assertEqual(email["fromemail"], "")
+        self.assertEqual(email["replyto"], "")
+        self.assertEqual(email["returnpath"], "")
+
+    def test_sender_fields_can_be_saved_and_fetched(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        patched = self.user_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={
+                "fromname": "  Automation Sender  ",
+                "fromemail": "  from@example.com  ",
+                "replyto": "  reply@example.com  ",
+                "returnpath": "  bounce@example.com  ",
+            },
+        )
+
+        self.assertEqual(patched["fromname"], "Automation Sender")
+        self.assertEqual(patched["fromemail"], "from@example.com")
+        self.assertEqual(patched["replyto"], "reply@example.com")
+        self.assertEqual(patched["returnpath"], "bounce@example.com")
+
+        fetched = self.user_get(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"])
+        )
+        self.assertEqual(fetched["fromname"], "Automation Sender")
+        self.assertEqual(fetched["fromemail"], "from@example.com")
+        self.assertEqual(fetched["replyto"], "reply@example.com")
+        self.assertEqual(fetched["returnpath"], "bounce@example.com")
+
+    def test_empty_sender_fields_do_not_block_content_edits(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+
+        patched = self.user_patch(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            json={
+                "subject": "Content edit only",
+                "rawText": "<p>Edited without sender settings</p>",
+            },
+        )
+
+        self.assertEqual(patched["subject"], "Content edit only")
+        self.assertEqual(patched["rawText"], "<p>Edited without sender settings</p>")
+        self.assertEqual(patched["fromname"], "")
+        self.assertEqual(patched["returnpath"], "")
 
     def test_editor_type_is_set_at_creation(self):
         automation = self.create_automation()
