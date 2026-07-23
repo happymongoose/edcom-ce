@@ -292,11 +292,36 @@ class Automation extends Component {
       .value();
   }
 
+  editorTypeLabel(type) {
+    if (type === 'beefree') {
+      return 'BeeFree';
+    }
+    if (type === 'wysiwyg') {
+      return 'WYSIWYG';
+    }
+    if (type === 'raw') {
+      return 'HTML';
+    }
+    return 'Legacy';
+  }
+
+  automationEmailOptions() {
+    return _.map(this.props.emails || [], email => ({
+      id: email.id,
+      name: (email.name || 'Untitled email') +
+        ' - ' +
+        (email.subject || 'No subject') +
+        ' (' +
+        this.editorTypeLabel(email.type) +
+        ')',
+    }));
+  }
+
   addNode = type => {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
     };
 
     if (type === 'add_tag') {
@@ -316,6 +341,10 @@ class Automation extends Component {
     }
     if (type === 'go_to') {
       node.target_node_id = '';
+    }
+    if (type === 'send_email') {
+      const emails = this.props.emails || [];
+      node.automation_email_id = emails.length ? emails[0].id : '';
     }
 
     this.props.update({
@@ -658,6 +687,29 @@ class Automation extends Component {
       );
     }
 
+    if (node.type === 'send_email') {
+      const options = this.automationEmailOptions();
+      if (!options.length) {
+        return (
+          <div style={{minWidth: '260px'}}>
+            <p className="help-block">Create an automation email before configuring this step.</p>
+          </div>
+        );
+      }
+      return (
+        <div style={{minWidth: '320px'}}>
+          <SelectLabel
+            id="automation_email_id"
+            label="Automation email"
+            obj={node}
+            onChange={this.nodeTargetChange.bind(this, index)}
+            options={options}
+            emptyVal="Select email"
+          />
+        </div>
+      );
+    }
+
     return null;
   }
 
@@ -673,6 +725,9 @@ class Automation extends Component {
     }
     if (type === 'go_to') {
       return 'Go to';
+    }
+    if (type === 'send_email') {
+      return 'Send email';
     }
     return 'Exit';
   }
@@ -1060,9 +1115,23 @@ class Automation extends Component {
                   {' '}
                   <Button onClick={this.addNode.bind(this, 'go_to')}>Go To Node</Button>
                   {' '}
+                  <Button
+                    onClick={this.addNode.bind(this, 'send_email')}
+                    disabled={!((this.props.emails || []).length)}
+                    title={(this.props.emails || []).length ? undefined : 'Create an automation email before adding a send email node.'}
+                  >
+                    Send Email Node
+                  </Button>
+                  {' '}
                   <Button onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</Button>
                 </div>
               </div>
+              {
+                (this.props.emails || []).length ?
+                  null
+                :
+                  <p className="help-block">Create an automation email before adding a send email node.</p>
+              }
               {
                 nodes.length ?
                   <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">

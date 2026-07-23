@@ -7,6 +7,61 @@ import test_base
 
 class TestAutomationExecution(test_base.TestBase):
 
+    def setUp(self):
+        super(TestAutomationExecution, self).setUp()
+        self.created_list_ids = []
+        self.created_emails = []
+
+    def tearDown(self):
+        self.cleanup_contacts_and_lists()
+        super(TestAutomationExecution, self).tearDown()
+
+    def cleanup_contacts_and_lists(self):
+        cid = self.user_cookie["cid"]
+        if self.created_emails:
+            contact_ids = [
+                row[0]
+                for row in self.db.execute(
+                    f"""select contact_id from contacts."contacts_{cid}" where email = any(%s)""",
+                    self.created_emails,
+                )
+            ]
+            if contact_ids:
+                self.db.execute(
+                    "delete from automation_step_runs where contact_id = any(%s) and cid = %s",
+                    contact_ids,
+                    cid,
+                )
+                self.db.execute(
+                    "delete from automation_enrolments where contact_id = any(%s) and cid = %s",
+                    contact_ids,
+                    cid,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_values_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_lists_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+            self.db.execute(
+                f"""delete from contacts."contacts_{cid}" where email = any(%s)""",
+                self.created_emails,
+            )
+            self.created_emails = []
+        if self.created_list_ids:
+            self.db.execute(
+                f"""delete from contacts."contact_lists_{cid}" where list_id = any(%s)""",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from lists where id = any(%s) and cid = %s",
+                self.created_list_ids,
+                cid,
+            )
+            self.created_list_ids = []
+
     def unique(self):
         return shortuuid.uuid().lower()
 
@@ -20,6 +75,8 @@ class TestAutomationExecution(test_base.TestBase):
         suffix = self.unique()
         email = "automation-exec-%s@example.com" % suffix
         lst = self.user_post("/api/lists", json={"name": "automation_execution_%s" % suffix})
+        self.created_list_ids.append(lst["id"])
+        self.created_emails.append(email)
         self.user_post(
             "/api/lists/%s/feed" % lst["id"],
             json={
@@ -71,6 +128,43 @@ class TestAutomationExecution(test_base.TestBase):
         self.user_patch(
             "/api/automations/%s" % automation["id"],
             json=self.workflow(tag=tag, nodes=nodes, reentry=reentry),
+        )
+        return self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
+    def create_send_email_automation(self):
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_send_email_%s" % suffix},
+        )
+        email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Execution email",
+                "subject": "Execution subject",
+                "rawText": "<p>Hello</p>",
+            },
+        )
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(
+                nodes=[
+                    {
+                        "id": "node_send_email_1",
+                        "type": "send_email",
+                        "label": "Send email",
+                        "automation_email_id": email["id"],
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ]
+            ),
         )
         return self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
@@ -221,6 +315,10 @@ class TestAutomationExecution(test_base.TestBase):
 
     def cleanup(self, *automation_ids):
         self.db.execute(
+            "delete from automation_emails where automation_id = any(%s)",
+            list(automation_ids),
+        )
+        self.db.execute(
             "delete from automation_step_runs where automation_id = any(%s)",
             list(automation_ids),
         )
@@ -231,6 +329,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.db.set_cid(self.user_cookie["cid"])
         for automation_id in automation_ids:
             self.db.automations.remove(automation_id)
+        self.cleanup_contacts_and_lists()
 
     def test_running_add_tag_adds_tag_and_advances(self):
         email, contact_id = self.create_contact()
@@ -299,6 +398,19 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(second.json["enrolment"]["status"], "exited")
         self.assertEqual(second.json["step_run"]["node_id"], "node_exit_1")
         self.assertEqual(second.json["step_run"]["node_type"], "exit")
+
+        self.cleanup(automation["id"])
+
+    def test_running_send_email_is_unsupported_clearly(self):
+        email, _ = self.create_contact()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unsupported automation node", result.text)
+        self.assertIn("send_email nodes are not supported", result.text)
 
         self.cleanup(automation["id"])
 

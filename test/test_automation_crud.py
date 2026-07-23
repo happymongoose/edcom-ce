@@ -3,6 +3,43 @@ import test_base
 
 class TestAutomationCRUD(test_base.TestBase):
 
+    def setUp(self):
+        super(TestAutomationCRUD, self).setUp()
+        self.created_automation_ids = []
+        self.created_email_ids = []
+
+    def tearDown(self):
+        cid = self.user_cookie["cid"]
+        if self.created_email_ids:
+            self.db.execute(
+                "delete from automation_emails where id = any(%s) and cid in (%s, %s)",
+                self.created_email_ids,
+                cid,
+                "other-account-cid",
+            )
+        if self.created_automation_ids:
+            self.db.execute(
+                "delete from automation_emails where automation_id = any(%s) and cid in (%s, %s)",
+                self.created_automation_ids,
+                cid,
+                "other-account-cid",
+            )
+            self.db.execute(
+                "delete from automation_step_runs where automation_id = any(%s)",
+                self.created_automation_ids,
+            )
+            self.db.execute(
+                "delete from automation_enrolments where automation_id = any(%s)",
+                self.created_automation_ids,
+            )
+            self.db.execute(
+                "delete from automations where id = any(%s) and cid in (%s, %s)",
+                self.created_automation_ids,
+                cid,
+                "other-account-cid",
+            )
+        super(TestAutomationCRUD, self).tearDown()
+
     def valid_workflow(self, label="Add onboarding tag", draft_tag="onboarding", reentry=None):
         workflow = {
             "entry": {
@@ -166,6 +203,55 @@ class TestAutomationCRUD(test_base.TestBase):
             assert False, "API request failed"
 
         return result.json
+
+    def create_tracked_automation(self, name="Send Email Node"):
+        automation = self.user_post("/api/automations", json={"name": name})
+        self.created_automation_ids.append(automation["id"])
+        return automation
+
+    def create_automation_email(self, automation_id, **overrides):
+        doc = {
+            "name": "Email for automation node",
+            "subject": "Subject for automation node",
+            "rawText": "<p>Hello</p>",
+        }
+        doc.update(overrides)
+        email = self.user_post(
+            "/api/automations/%s/emails" % automation_id,
+            json=doc,
+        )
+        self.created_email_ids.append(email["id"])
+        return email
+
+    def send_email_workflow(self, email_id=None):
+        node = {
+            "id": "node_send_email_1",
+            "type": "send_email",
+            "label": "Send email",
+        }
+        if email_id is not None:
+            node["automation_email_id"] = email_id
+        return self.workflow_with_nodes(
+            [
+                node,
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+
+    def assert_existing_publish_fails(self, automation_id, message):
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation_id,
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(message, result.text)
 
     def test_draft_lifecycle(self):
         created = self.user_post("/api/automations", json={"name": "Welcome Series"})
@@ -740,6 +826,74 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.db.set_cid(self.user_cookie["cid"])
         self.db.automations.remove(automation_id)
+
+    def test_valid_send_email_node_publishes(self):
+        automation = self.create_tracked_automation("Valid Send Email")
+        email = self.create_automation_email(automation["id"])
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.send_email_workflow(email["id"]),
+        )
+        published = self.user_publish(automation["id"])
+
+        send_email = published["published"]["nodes"][0]
+        self.assertEqual(send_email["type"], "send_email")
+        self.assertEqual(send_email["label"], "Send email")
+        self.assertEqual(send_email["automation_email_id"], email["id"])
+
+    def test_send_email_missing_email_id_fails_validation(self):
+        automation = self.create_tracked_automation("Missing Send Email")
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.send_email_workflow(),
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("automation_email_id", result.text)
+
+    def test_send_email_unknown_or_deleted_email_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Unknown Send Email")
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.send_email_workflow("missing-email-id"),
+        )
+
+        self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
+
+    def test_send_email_from_another_automation_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Send Email Owner")
+        other = self.create_tracked_automation("Send Email Other Automation")
+        other_email = self.create_automation_email(other["id"])
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.send_email_workflow(other_email["id"]),
+        )
+
+        self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
+
+    def test_send_email_from_another_account_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Send Email Other Account")
+        email = self.create_automation_email(automation["id"])
+        self.db.execute(
+            "update automation_emails set cid = %s where id = %s",
+            "other-account-cid",
+            email["id"],
+        )
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.send_email_workflow(email["id"]),
+        )
+
+        self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
 
     def test_condition_branch_target_can_point_to_go_to_node(self):
         created = self.user_post("/api/automations", json={"name": "Condition Go To Target"})

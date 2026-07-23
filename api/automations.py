@@ -164,6 +164,30 @@ GO_TO_NODE_SCHEMA = {
 }
 
 
+SEND_EMAIL_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "automation_email_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["send_email"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "automation_email_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 EXIT_NODE_SCHEMA = {
     "type": "object",
     "required": ["id", "type", "label"],
@@ -216,6 +240,7 @@ DRAFT_SCHEMA = {
                     WAIT_DURATION_NODE_SCHEMA,
                     IF_HAS_TAG_NODE_SCHEMA,
                     GO_TO_NODE_SCHEMA,
+                    SEND_EMAIL_NODE_SCHEMA,
                     EXIT_NODE_SCHEMA,
                 ],
             },
@@ -433,6 +458,22 @@ def _node_by_id(nodes: list[JsonObj], node_id: str | None) -> JsonObj | None:
     return None
 
 
+def _automation_email_exists(db: DB, cid: str, automation_id: str, email_id: str) -> bool:
+    return bool(
+        db.single(
+            """
+            select id
+            from automation_emails
+            where cid = %s and automation_id = %s and id = %s
+            limit 1
+            """,
+            cid,
+            automation_id,
+            email_id,
+        )
+    )
+
+
 def _node_display(node: JsonObj, node_positions: dict[str, int]) -> str:
     node_id = node.get("id", "")
     step = node_positions.get(node_id, -1) + 1
@@ -504,7 +545,7 @@ def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
     )
 
 
-def _published_snapshot(automation: JsonObj) -> JsonObj:
+def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
     if not automation.get("name") or not automation.get("name").strip():
         _validation_error("Automation must have a name before publishing.")
 
@@ -558,6 +599,20 @@ def _published_snapshot(automation: JsonObj) -> JsonObj:
                 _validation_error("Go to nodes cannot target themselves.")
             if node_positions.get(target_node_id, -1) <= index:
                 _validation_error("Go to nodes must target a later node.")
+        if node.get("type") == "send_email":
+            automation_email_id = node.get("automation_email_id")
+            if not automation_email_id:
+                _validation_error("Send email nodes must select an automation email.")
+            if not _automation_email_exists(
+                db,
+                automation.get("cid"),
+                automation.get("id"),
+                automation_email_id,
+            ):
+                _validation_error(
+                    "Send email node at step %s must reference an email from this automation."
+                    % (index + 1)
+                )
         if node.get("type") == "wait_duration":
             total_minutes = _duration_minutes(node.get("duration", {}))
             if total_minutes < 5:
@@ -1302,7 +1357,7 @@ class AutomationPublish(object):
         if automation is None:
             raise falcon.HTTPForbidden()
 
-        published = _published_snapshot(automation)
+        published = _published_snapshot(db, automation)
         now = _utc_now()
         revision = int(automation.get("published_revision", 0) or 0) + 1
 
@@ -2170,7 +2225,11 @@ class AutomationEnrolmentRunNext(object):
         if node_type not in ("add_tag", "wait_duration", "if_has_tag", "go_to", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
-                description="Only add_tag, wait_duration, if_has_tag, go_to and exit nodes can be executed manually.",
+                description=(
+                    "%s nodes are not supported by manual execution yet. "
+                    "Only add_tag, wait_duration, if_has_tag, go_to and exit nodes can be executed manually."
+                    % node_type
+                ),
             )
 
         status = enrolment.get("status")

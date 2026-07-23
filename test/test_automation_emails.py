@@ -394,7 +394,7 @@ class TestAutomationEmails(test_base.TestBase):
                             "id": "node_send_email_1",
                             "type": "send_email",
                             "label": "Send email",
-                            "email_id": email["id"],
+                            "automation_email_id": email["id"],
                         }
                     ]
                 }
