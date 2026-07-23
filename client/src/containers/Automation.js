@@ -14,6 +14,7 @@ import { EDFormSection, EDFormBox, EDTable, EDTableRow } from "../components/EDD
 import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
+import copyText from "../utils/clipboard";
 
 import "react-select2-wrapper/css/select2.css";
 
@@ -479,6 +480,14 @@ class Automation extends Component {
       notify.show(errorMessage(error, 'Unable to run next automation step'), 'error');
     } finally {
       this.setState({runningEnrolmentId: null});
+    }
+  }
+
+  copyHistoryLog = log => {
+    if (copyText(log)) {
+      notify.show('Debug history copied to clipboard', 'success');
+    } else {
+      notify.show('Error accessing clipboard', 'error');
     }
   }
 
@@ -1055,6 +1064,16 @@ class Automation extends Component {
                 :
                   <p>No automation history yet.</p>
               }
+              <div className="flex-items space-between" style={{marginTop: '16px'}}>
+                <h4>Plain text log</h4>
+                <Button
+                  bsSize="small"
+                  title="Copy plain text log"
+                  onClick={this.copyHistoryLog.bind(this, log)}
+                >
+                  <i className="fa fa-clipboard" />
+                </Button>
+              </div>
               <FormControl
                 componentClass="textarea"
                 rows={Math.min(Math.max((history.events || []).length + 1, 4), 16)}
