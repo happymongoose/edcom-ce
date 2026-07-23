@@ -53,6 +53,10 @@ export function canReEnrolAutomation(data) {
   return published.reentry === 'multiple';
 }
 
+export function isTerminalEnrolmentStatus(status) {
+  return _.contains(['completed', 'exited', 'cancelled'], status);
+}
+
 export function displayAutomationEnrolments(enrolments) {
   return _.chain(enrolments)
     .groupBy(enrolment => enrolment.contact_id || enrolment.contact_email)
@@ -191,7 +195,7 @@ export function automationEnrolmentAction(enrolment, automation, now) {
     };
   }
 
-  if (canReEnrolAutomation(automation)) {
+  if (canReEnrolAutomation(automation) && isTerminalEnrolmentStatus(enrolment.status)) {
     return {
       type: 'reenrol',
       label: 'Run automation again',
@@ -1066,13 +1070,19 @@ class Automation extends Component {
               }
               <div className="flex-items space-between" style={{marginTop: '16px'}}>
                 <h4>Plain text log</h4>
-                <Button
-                  bsSize="small"
+                <i
+                  className="fa fa-clipboard"
                   title="Copy plain text log"
+                  role="button"
+                  tabIndex="0"
                   onClick={this.copyHistoryLog.bind(this, log)}
-                >
-                  <i className="fa fa-clipboard" />
-                </Button>
+                  onKeyPress={event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      this.copyHistoryLog(log);
+                    }
+                  }}
+                  style={{fontSize: '20px', color: 'rgb(170, 224, 255)', cursor: 'pointer', marginTop: '8px'}}
+                />
               </div>
               <FormControl
                 componentClass="textarea"

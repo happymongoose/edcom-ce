@@ -125,14 +125,47 @@ describe('automation enrolment display helpers', () => {
     expect(elapsed.label).toBe('Continue test');
   });
 
-  it('does not show run controls for held or paused enrolments', () => {
-    _.each(['held', 'paused_ready', 'paused_waiting'], status => {
+  it('shows rerun for terminal enrolments when reentry is multiple', () => {
+    _.each(['completed', 'exited', 'cancelled'], status => {
+      const action = automationEnrolmentAction(
+        {status: status},
+        {published: {reentry: 'multiple'}}
+      );
+      expect(action.type).toBe('reenrol');
+      expect(action.label).toBe('Run automation again');
+      expect(action.disabled).toBe(false);
+    });
+  });
+
+  it('does not show rerun for non-terminal enrolments when reentry is multiple', () => {
+    _.each(['held', 'paused_ready', 'paused_waiting', 'failed'], status => {
       const action = automationEnrolmentAction(
         {status: status, wake_at: '2026-07-20T10:05:00Z'},
         {published: {reentry: 'multiple'}},
         '2026-07-20T10:06:00Z'
       );
       expect(action.type).toBe('none');
+    });
+
+    expect(automationEnrolmentAction(
+      {status: 'ready'},
+      {published: {reentry: 'multiple'}}
+    ).type).toBe('run_next');
+    expect(automationEnrolmentAction(
+      {status: 'waiting', wake_at: '2026-07-20T10:05:00Z'},
+      {published: {reentry: 'multiple'}},
+      '2026-07-20T10:00:00Z'
+    ).type).toBe('skip_wait');
+  });
+
+  it('never shows rerun after terminal enrolments when reentry is once', () => {
+    _.each(['completed', 'exited', 'cancelled'], status => {
+      const action = automationEnrolmentAction(
+        {status: status},
+        {published: {reentry: 'once'}}
+      );
+      expect(action.type).toBe('none');
+      expect(action.disabled).toBe(true);
     });
   });
 
