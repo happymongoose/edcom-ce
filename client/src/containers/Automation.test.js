@@ -11,7 +11,7 @@ describe('automation enrolment display helpers', () => {
   it('only allows rerun UI when published reentry is multiple', () => {
     expect(canReEnrolAutomation({published: {reentry: 'multiple'}})).toBe(true);
     expect(canReEnrolAutomation({published: {reentry: 'once'}})).toBe(false);
-    expect(canReEnrolAutomation({reentry: 'multiple'})).toBe(false);
+    expect(canReEnrolAutomation({reentry: 'multiple'})).toBe(true);
   });
 
   it('collapses sessions by contact and prefers the latest ready session', () => {
@@ -135,6 +135,11 @@ describe('automation enrolment display helpers', () => {
       expect(action.label).toBe('Run automation again');
       expect(action.disabled).toBe(false);
     });
+
+    expect(automationEnrolmentAction(
+      {status: 'completed'},
+      {reentry: 'multiple'}
+    ).type).toBe('reenrol');
   });
 
   it('does not show rerun for non-terminal enrolments when reentry is multiple', () => {

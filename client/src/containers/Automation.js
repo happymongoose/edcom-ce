@@ -50,7 +50,7 @@ function patchPayload(data) {
 
 export function canReEnrolAutomation(data) {
   const published = data.published || {};
-  return published.reentry === 'multiple';
+  return published.reentry === 'multiple' || data.reentry === 'multiple';
 }
 
 export function isTerminalEnrolmentStatus(status) {
@@ -487,7 +487,11 @@ class Automation extends Component {
     }
   }
 
-  copyHistoryLog = log => {
+  copyHistoryLog = (log, event) => {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
     if (copyText(log)) {
       notify.show('Debug history copied to clipboard', 'success');
     } else {
@@ -1070,19 +1074,14 @@ class Automation extends Component {
               }
               <div className="flex-items space-between" style={{marginTop: '16px'}}>
                 <h4>Plain text log</h4>
-                <i
-                  className="fa fa-clipboard"
+                <Button
+                  bsSize="small"
                   title="Copy plain text log"
-                  role="button"
-                  tabIndex="0"
                   onClick={this.copyHistoryLog.bind(this, log)}
-                  onKeyPress={event => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      this.copyHistoryLog(log);
-                    }
-                  }}
-                  style={{fontSize: '20px', color: 'rgb(170, 224, 255)', cursor: 'pointer', marginTop: '8px'}}
-                />
+                  style={{marginTop: '4px'}}
+                >
+                  <i className="fa fa-clipboard" /> Copy
+                </Button>
               </div>
               <FormControl
                 componentClass="textarea"
