@@ -349,6 +349,29 @@ class TestAutomationExecution(test_base.TestBase):
             )
         )
 
+    def add_existing_tag(self, contact_id, tag, count=1):
+        cid = self.user_cookie["cid"]
+        self.db.execute(
+            """insert into alltags (cid, tag, added, count) values (%s, %s, now(), %s)
+            on conflict (cid, tag) do update set count = excluded.count""",
+            cid,
+            tag,
+            count,
+        )
+        self.db.execute(
+            f"""insert into contacts."contact_values_{cid}" (contact_id, type, value)
+            values (%s, 'tag', %s) on conflict (contact_id, type, value) do nothing""",
+            contact_id,
+            tag,
+        )
+
+    def tag_count(self, tag):
+        return self.db.single(
+            "select count from alltags where cid = %s and tag = %s",
+            self.user_cookie["cid"],
+            tag,
+        )
+
     def step_runs(self, automation_id, enrolment_id):
         return list(
             self.db.execute(
@@ -516,6 +539,132 @@ class TestAutomationExecution(test_base.TestBase):
 
         again = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(again.status_code, 400)
+
+        self.cleanup(automation["id"])
+
+    def test_running_remove_tag_removes_existing_tag_and_advances(self):
+        email, contact_id = self.create_contact()
+        tag = "%s_remove_existing" % self.test_id
+        self.add_existing_tag(contact_id, tag)
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_remove_tag_1",
+                    "type": "remove_tag",
+                    "label": "Remove old tag",
+                    "draft_tag": tag,
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(self.has_tag(contact_id, tag))
+        self.assertIsNone(self.tag_count(tag))
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "remove_tag")
+        self.assertEqual(result.json["step_run"]["action"], "remove_tag")
+        self.assertEqual(result.json["step_run"]["tag"], tag)
+        self.assertEqual(result.json["step_run"]["removed"], True)
+
+        self.cleanup(automation["id"])
+
+    def test_running_remove_tag_when_tag_absent_succeeds_and_advances(self):
+        email, contact_id = self.create_contact()
+        tag = "%s_remove_absent" % self.test_id
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_remove_tag_1",
+                    "type": "remove_tag",
+                    "label": "Remove missing tag",
+                    "draft_tag": tag,
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(self.has_tag(contact_id, tag))
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "remove_tag")
+        self.assertEqual(result.json["step_run"]["removed"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_remove_tag_completes_when_final_node(self):
+        email, contact_id = self.create_contact()
+        tag = "%s_remove_final" % self.test_id
+        self.add_existing_tag(contact_id, tag)
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_remove_tag_1",
+                    "type": "remove_tag",
+                    "label": "Remove final tag",
+                    "draft_tag": tag,
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(self.has_tag(contact_id, tag))
+        self.assertEqual(result.json["enrolment"]["status"], "completed")
+        self.assertEqual(result.json["step_run"]["node_type"], "remove_tag")
+        self.assertEqual(result.json["step_run"]["removed"], True)
+
+        self.cleanup(automation["id"])
+
+    def test_remove_tag_does_not_execute_next_node_in_same_request(self):
+        email, contact_id = self.create_contact()
+        remove_tag = "%s_remove_one_node" % self.test_id
+        next_tag = "%s_next_not_run" % self.test_id
+        self.add_existing_tag(contact_id, remove_tag)
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_remove_tag_1",
+                    "type": "remove_tag",
+                    "label": "Remove first tag",
+                    "draft_tag": remove_tag,
+                },
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add next tag",
+                    "draft_tag": next_tag,
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(self.has_tag(contact_id, remove_tag))
+        self.assertFalse(self.has_tag(contact_id, next_tag))
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
 
         self.cleanup(automation["id"])
 

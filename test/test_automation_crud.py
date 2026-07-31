@@ -700,6 +700,49 @@ class TestAutomationCRUD(test_base.TestBase):
         self.db.set_cid(self.user_cookie["cid"])
         self.db.automations.remove(automation_id)
 
+    def test_valid_remove_tag_node_publishes(self):
+        created = self.user_post("/api/automations", json={"name": "Remove Tag"})
+        automation_id = created["id"]
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_remove_tag_1",
+                "type": "remove_tag",
+                "label": "Remove old tag",
+                "draft_tag": "old-tag",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][0]["type"], "remove_tag")
+        self.assertEqual(published["published"]["nodes"][0]["draft_tag"], "old-tag")
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_remove_tag_missing_tag_fails_publish_validation(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_remove_tag_1",
+                "type": "remove_tag",
+                "label": "Remove old tag",
+                "draft_tag": "",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "Remove tag nodes must have draft tag configuration.")
+
     def test_wait_duration_below_five_minutes_fails_publish_validation(self):
         created = self.user_post("/api/automations", json={"name": "Short Wait"})
         automation_id = created["id"]
@@ -1024,6 +1067,31 @@ class TestAutomationCRUD(test_base.TestBase):
                 "label": "If contact has tag",
                 "draft_tag": "vip",
                 "yes_node_id": "node_wait_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+
+    def test_remove_tag_linear_progression_is_counted_in_cycle_detection(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_remove_tag_1",
+                "type": "remove_tag",
+                "label": "Remove before condition",
+                "draft_tag": "before-condition",
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_remove_tag_1",
                 "no_node_id": "node_exit_1",
             },
             {

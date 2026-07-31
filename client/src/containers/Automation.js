@@ -117,6 +117,9 @@ export function automationHistoryLog(history) {
       if (event.tag) {
         parts.push('tag=' + event.tag);
       }
+      if (event.removed !== undefined && event.removed !== null) {
+        parts.push('removed=' + event.removed);
+      }
       if (event.wake_at) {
         parts.push('wake_at=' + event.wake_at);
       }
@@ -293,7 +296,7 @@ class Automation extends Component {
   tagData() {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
-    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
+    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
 
     return _.map(_.uniq(tags.concat(draftTags)), tag => ({id: tag, text: tag}));
   }
@@ -344,10 +347,10 @@ class Automation extends Component {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
     };
 
-    if (type === 'add_tag') {
+    if (type === 'add_tag' || type === 'remove_tag') {
       node.draft_tag = '';
     }
     if (type === 'if_has_tag') {
@@ -621,7 +624,7 @@ class Automation extends Component {
   }
 
   renderNodeConfig(node, index) {
-    if (node.type === 'add_tag' || node.type === 'if_has_tag') {
+    if (node.type === 'add_tag' || node.type === 'remove_tag' || node.type === 'if_has_tag') {
       return (
         <div style={{minWidth: '220px'}}>
           <Select2
@@ -1160,6 +1163,7 @@ class Automation extends Component {
                   title="Add Node"
                 >
                   <MenuItem onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</MenuItem>
+                  <MenuItem onClick={this.addNode.bind(this, 'remove_tag')}>Remove Tag Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'go_to')}>Go To Node</MenuItem>

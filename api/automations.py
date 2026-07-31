@@ -69,6 +69,29 @@ ADD_TAG_NODE_SCHEMA = {
 }
 
 
+REMOVE_TAG_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "draft_tag"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["remove_tag"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "draft_tag": {
+            "type": "string",
+            "maxLength": 1024,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 WAIT_DURATION_SCHEMA = {
     "type": "object",
     "required": ["days", "hours", "minutes"],
@@ -237,6 +260,7 @@ DRAFT_SCHEMA = {
             "items": {
                 "oneOf": [
                     ADD_TAG_NODE_SCHEMA,
+                    REMOVE_TAG_NODE_SCHEMA,
                     WAIT_DURATION_NODE_SCHEMA,
                     IF_HAS_TAG_NODE_SCHEMA,
                     GO_TO_NODE_SCHEMA,
@@ -592,6 +616,8 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
             _validation_error("Every automation node must have a label.")
         if node.get("type") == "add_tag" and not node.get("draft_tag"):
             _validation_error("Add tag nodes must have draft tag configuration.")
+        if node.get("type") == "remove_tag" and not node.get("draft_tag"):
+            _validation_error("Remove tag nodes must have draft tag configuration.")
         if node.get("type") == "if_has_tag":
             if not node.get("draft_tag"):
                 _validation_error("If has tag nodes must have draft tag configuration.")
@@ -2207,6 +2233,7 @@ class AutomationHistory(object):
                     "node_type": step_run["node_type"],
                     "node_label": step_run.get("node_label"),
                     "tag": step_run.get("tag"),
+                    "removed": step_run.get("removed"),
                     "duration": step_run.get("duration"),
                     "wake_at": step_run.get("wake_at"),
                     "action": step_run.get("action"),
@@ -2304,12 +2331,12 @@ class AutomationEnrolmentRunNext(object):
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
+        if node_type not in ("add_tag", "remove_tag", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
+                    "Only add_tag, remove_tag, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -2414,6 +2441,57 @@ class AutomationEnrolmentRunNext(object):
                 )
 
             run_data["tag"] = tag
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "remove_tag":
+            tag = node.get("draft_tag")
+            if not tag:
+                raise falcon.HTTPBadRequest(
+                    title="Remove tag node is missing tag configuration",
+                    description="The published remove_tag node does not include a tag.",
+                )
+
+            tagcounts = {}
+            contacts.remove_tag(
+                db,
+                cid,
+                enrolment["contact_email"],
+                enrolment["contact_id"],
+                tag,
+                tagcounts,
+                [],
+            )
+            removed = bool(tagcounts.get(tag))
+            for tagname, cnt in tagcounts.items():
+                db.execute(
+                    "update alltags set count = count + %s where cid = %s and tag = %s",
+                    cnt,
+                    cid,
+                    tagname,
+                )
+            if tagcounts:
+                db.execute(
+                    "delete from alltags where cid = %s and count <= 0",
+                    cid,
+                )
+
+            run_data.update(
+                {
+                    "action": "remove_tag",
+                    "tag": tag,
+                    "removed": removed,
+                }
+            )
 
             if node_index + 1 < len(nodes):
                 enrolment_update = {
