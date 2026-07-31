@@ -3597,13 +3597,21 @@ def _create_automation_trigger_event(
 
 def _claim_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> List[JsonObj]:
     now = _utc_now()
+    stale_before = datetime.utcnow() - CLAIM_STALE_AFTER
     with db.transaction():
         rows = db.execute(
             """
             with candidates as (
-                select id
+                select id, data->>'status' as previous_status
                 from automation_trigger_events
-                where cid = %s and data->>'status' = 'pending'
+                where cid = %s
+                    and (
+                        data->>'status' = 'pending'
+                        or (
+                            data->>'status' = 'processing'
+                            and nullif(data->>'claimed_at', '')::timestamptz < %s
+                        )
+                    )
                 order by ts, id
                 limit %s
                 for update skip locked
@@ -3611,14 +3619,27 @@ def _claim_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> Li
             update automation_trigger_events e
             set data = e.data || jsonb_build_object(
                 'status', 'processing',
-                'claimed_at', %s
+                'claimed_at', %s,
+                'recovered_at',
+                    case
+                        when candidates.previous_status = 'processing' then to_jsonb(%s::text)
+                        else coalesce(e.data->'recovered_at', 'null'::jsonb)
+                    end,
+                'recovery_count',
+                    case
+                        when candidates.previous_status = 'processing'
+                            then to_jsonb(coalesce((e.data->>'recovery_count')::int, 0) + 1)
+                        else coalesce(e.data->'recovery_count', '0'::jsonb)
+                    end
             )
             from candidates
             where e.id = candidates.id
             returning e.id, e.cid, e.contact_id, e.contact_email, e.event_type, e.ts, e.data
             """,
             cid,
+            stale_before,
             limit,
+            now,
             now,
         ).fetchall()
     return [_trigger_event_obj(row) for row in rows]

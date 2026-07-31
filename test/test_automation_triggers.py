@@ -1,6 +1,6 @@
 import os
 import shortuuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import test_base
 from api.migrations import add_automation_trigger_events_table
@@ -228,6 +228,13 @@ class TestAutomationTriggers(test_base.TestBase):
     def event_status(self, event_id):
         return self.db.single(
             "select data->>'status' from automation_trigger_events where cid = %s and id = %s",
+            self.user_cookie["cid"],
+            event_id,
+        )
+
+    def event_data(self, event_id):
+        return self.db.single(
+            "select data from automation_trigger_events where cid = %s and id = %s",
             self.user_cookie["cid"],
             event_id,
         )
@@ -500,3 +507,121 @@ class TestAutomationTriggers(test_base.TestBase):
 
         self.assertEqual(result["processed"], 0)
         self.assertEqual(self.event_status(event["id"]), "processing")
+
+    def test_non_stale_processing_event_is_not_recovered(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_non_stale" % self.test_id
+        automation = self.create_automation(tag)
+        event = self.create_event(email, tag)
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || jsonb_build_object('status', 'processing', 'claimed_at', %s)
+            where cid = %s and id = %s
+            """,
+            datetime.utcnow().isoformat() + "Z",
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 0)
+        self.assertEqual(self.event_status(event["id"]), "processing")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 0)
+
+    def test_stale_processing_event_is_reclaimed_and_processed(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_stale" % self.test_id
+        automation = self.create_automation(tag)
+        event = self.create_event(email, tag)
+        stale_claimed_at = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || jsonb_build_object('status', 'processing', 'claimed_at', %s)
+            where cid = %s and id = %s
+            """,
+            stale_claimed_at,
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        self.assertEqual(self.event_status(event["id"]), "processed")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+        data = self.event_data(event["id"])
+        self.assertEqual(data["recovery_count"], 1)
+        self.assertTrue(data.get("recovered_at"))
+
+    def test_stale_recovery_is_account_scoped(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_stale_scope" % self.test_id
+        automation = self.create_automation(tag)
+        event = self.create_event(email, tag)
+        other_cid = "%s_other_stale_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set cid = %s,
+                data = data || jsonb_build_object('status', 'processing', 'claimed_at', %s)
+            where cid = %s and id = %s
+            """,
+            other_cid,
+            (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z",
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 0)
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 0)
+        self.assertEqual(
+            self.db.single(
+                "select data->>'status' from automation_trigger_events where cid = %s and id = %s",
+                other_cid,
+                event["id"],
+            ),
+            "processing",
+        )
+
+    def test_recovered_event_does_not_duplicate_existing_enrolment(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_stale_existing" % self.test_id
+        automation = self.create_automation(tag, reentry="multiple")
+        existing = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        event = self.create_event(email, tag)
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || jsonb_build_object('status', 'processing', 'claimed_at', %s)
+            where cid = %s and id = %s
+            """,
+            (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z",
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "active_pass")
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], existing["id"])
+        data = self.event_data(event["id"])
+        self.assertEqual(data["recovery_count"], 1)
