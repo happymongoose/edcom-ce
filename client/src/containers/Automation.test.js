@@ -143,7 +143,7 @@ describe('automation enrolment display helpers', () => {
   });
 
   it('does not show rerun for non-terminal enrolments when reentry is multiple', () => {
-    _.each(['held', 'paused_ready', 'paused_waiting', 'failed'], status => {
+    _.each(['held', 'paused_ready', 'paused_waiting', 'running', 'failed'], status => {
       const action = automationEnrolmentAction(
         {status: status, wake_at: '2026-07-20T10:05:00Z'},
         {published: {reentry: 'multiple'}},

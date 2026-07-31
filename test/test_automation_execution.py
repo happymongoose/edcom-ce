@@ -1,8 +1,10 @@
 import shortuuid
 import dateutil.parser
+import falcon
 from datetime import datetime, timedelta
 
 import test_base
+from api import automations
 from api.migrations import add_debug_email_tables
 
 
@@ -438,6 +440,21 @@ class TestAutomationExecution(test_base.TestBase):
             )
         )
 
+    def enrolment_data(self, enrolment_id):
+        return self.db.single(
+            "select data from automation_enrolments where id = %s and cid = %s",
+            enrolment_id,
+            self.user_cookie["cid"],
+        )
+
+    def assert_claim_cleared(self, data):
+        self.assertIsNone(data.get("claim_token"))
+        self.assertIsNone(data.get("claimed_at"))
+        self.assertIsNone(data.get("claimed_node_id"))
+        self.assertIsNone(data.get("claimed_published_revision"))
+        self.assertIsNone(data.get("running_status"))
+        self.assertNotEqual(data.get("status"), "running")
+
     def backend_cid(self):
         company = self.db.companies.get(self.user_cookie["cid"])
         return company["cid"]
@@ -472,6 +489,41 @@ class TestAutomationExecution(test_base.TestBase):
                 "rules": [
                     {
                         "splits": [{"pct": 100, "policy": backend_id}],
+                        "default": True,
+                        "domaingroup": "",
+                    }
+                ],
+                "usedefault": False,
+            },
+            "usedefault": False,
+        }
+        self.db.execute(
+            "insert into routes (id, cid, data) values (%s, %s, %s)",
+            route_id,
+            self.backend_cid(),
+            route,
+        )
+        self.created_route_ids.append(route_id)
+        return route_id
+
+    def create_drop_all_route(self):
+        route_id = shortuuid.uuid()
+        now = datetime.utcnow().isoformat() + "Z"
+        route = {
+            "name": "Drop automation route %s" % self.test_id,
+            "dirty": False,
+            "rules": [
+                {
+                    "splits": [{"pct": 100, "policy": ""}],
+                    "default": True,
+                    "domaingroup": "",
+                }
+            ],
+            "modified": now,
+            "published": {
+                "rules": [
+                    {
+                        "splits": [{"pct": 100, "policy": ""}],
                         "default": True,
                         "domaingroup": "",
                     }
@@ -553,6 +605,8 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["step_run"]["node_type"], "add_tag")
         self.assertEqual(result.json["step_run"]["tag"], "execution-tag")
         self.assertEqual(result.json["step_run"]["status"], "succeeded")
+        self.assert_claim_cleared(result.json["enrolment"])
+        self.assert_claim_cleared(self.enrolment_data(enrolment["id"]))
 
         self.cleanup(automation["id"])
 
@@ -1003,6 +1057,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json["enrolment"]["status"], "ready")
         self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assert_claim_cleared(result.json["enrolment"])
 
         step_run = result.json["step_run"]
         self.assertEqual(step_run["node_type"], "send_email")
@@ -1012,6 +1067,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(step_run["route_id"], route_id)
         self.assertEqual(step_run["published_revision"], automation["published_revision"])
         self.assertEqual(step_run["sent"], True)
+        self.assertEqual(step_run["status"], "succeeded")
 
         logs = self.debug_email_logs(automation["id"])
         self.assertEqual(len(logs), 1)
@@ -1169,6 +1225,170 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Enrolment is paused", result.text)
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+        self.assertIsNone(self.enrolment_data(enrolment["id"]).get("claim_token"))
+
+        self.cleanup(automation["id"])
+
+    def test_running_claim_rejects_duplicate_run_next(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email)
+        now = datetime.utcnow().isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {
+                "status": "running",
+                "running_status": "ready",
+                "claim_token": "active-claim",
+                "claimed_at": now,
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("already running", result.text)
+        self.assertFalse(self.has_tag(contact_id, "onboarding"))
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "running")
+        self.assertEqual(data["claim_token"], "active-claim")
+
+        self.cleanup(automation["id"])
+
+    def test_stale_running_claim_can_be_recovered(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="stale-claim-tag")
+        enrolment = self.enrol(automation["id"], email)
+        stale = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {
+                "status": "running",
+                "running_status": "ready",
+                "claim_token": "stale-claim",
+                "claimed_at": stale,
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertTrue(self.has_tag(contact_id, "stale-claim-tag"))
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assert_claim_cleared(result.json["enrolment"])
+
+        self.cleanup(automation["id"])
+
+    def test_stale_running_claim_with_non_runnable_status_is_not_recovered(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="stale-held-tag")
+        enrolment = self.enrol(automation["id"], email)
+        stale = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {
+                "status": "running",
+                "running_status": "held",
+                "claim_token": "stale-held-claim",
+                "claimed_at": stale,
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("already running", result.text)
+        self.assertFalse(self.has_tag(contact_id, "stale-held-tag"))
+        self.assertEqual(self.enrolment_data(enrolment["id"])["claim_token"], "stale-held-claim")
+
+        self.cleanup(automation["id"])
+
+    def test_final_enrolment_update_requires_matching_claim_token(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {
+                "status": "running",
+                "running_status": "ready",
+                "claim_token": "correct-token",
+                "claimed_at": datetime.utcnow().isoformat() + "Z",
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+        )
+
+        with self.assertRaises(falcon.HTTPConflict):
+            automations._advance_claimed_enrolment(
+                self.db,
+                self.user_cookie["cid"],
+                automation["id"],
+                enrolment["id"],
+                "wrong-token",
+                {"status": "ready", "modified": datetime.utcnow().isoformat() + "Z"},
+            )
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "running")
+        self.assertEqual(data["claim_token"], "correct-token")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_failure_records_failed_step_run_and_releases_claim(self):
+        email, _ = self.create_contact()
+        route_id = self.create_drop_all_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Drop All Mail", result.text)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assert_claim_cleared(data)
+        runs = self.step_runs(automation["id"], enrolment["id"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][6], "send_email")
+        self.assertEqual(runs[0][7]["status"], "failed")
+        self.assertIn("Drop All Mail", runs[0][7]["error"])
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
 
         self.cleanup(automation["id"])
 
@@ -1196,6 +1416,34 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(after_exited.status_code, 400)
 
         self.cleanup(completed_automation["id"], exited_automation["id"])
+
+    def test_terminal_enrolments_are_not_claimed(self):
+        email, _ = self.create_contact()
+        automation_ids = []
+        try:
+            for status in ("completed", "exited", "cancelled"):
+                automation = self.create_automation(tag="%s-terminal" % status)
+                automation_ids.append(automation["id"])
+                enrolment = self.enrol(automation["id"], email)
+                self.db.execute(
+                    """
+                    update automation_enrolments
+                    set data = data || %s
+                    where cid = %s and automation_id = %s and id = %s
+                    """,
+                    {"status": status},
+                    self.user_cookie["cid"],
+                    automation["id"],
+                    enrolment["id"],
+                )
+
+                result = self.run_next(automation["id"], enrolment["id"])
+
+                self.assertEqual(result.status_code, 400)
+                self.assertIn("Enrolment is not ready", result.text)
+                self.assertIsNone(self.enrolment_data(enrolment["id"]).get("claim_token"))
+        finally:
+            self.cleanup(*automation_ids)
 
     def test_missing_current_node_is_rejected_clearly(self):
         email, _ = self.create_contact()
@@ -1512,6 +1760,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertIn("wake_at", updated)
         self.assertEqual(updated["wait"]["node_id"], "node_wait_1")
         self.assertEqual(updated["wait"]["duration"], {"days": 0, "hours": 0, "minutes": 5})
+        self.assert_claim_cleared(updated)
         self.assertEqual(step_run["node_id"], "node_wait_1")
         self.assertEqual(step_run["node_type"], "wait_duration")
         self.assertEqual(step_run["status"], "waiting")
@@ -1536,6 +1785,9 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Wait has not elapsed", result.text)
         self.assertIn(started.json["enrolment"]["wake_at"], result.text)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "waiting")
+        self.assert_claim_cleared(data)
 
         self.cleanup(automation["id"])
 
@@ -1590,6 +1842,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["enrolment"]["status"], "ready")
         self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
         self.assertEqual(result.json["enrolment"]["wake_at"], None)
+        self.assert_claim_cleared(result.json["enrolment"])
         self.assertEqual(result.json["step_run"]["node_type"], "wait_duration")
         self.assertEqual(result.json["step_run"]["status"], "succeeded")
         self.assertEqual(result.json["step_run"]["action"], "wait_complete")
