@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, DropdownButton, FormControl, MenuItem, Panel } from "react-bootstrap";
+import { Button, DropdownButton, FormControl, MenuItem, Panel, PanelGroup } from "react-bootstrap";
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
@@ -171,6 +171,32 @@ export function automationHistoryLog(history) {
     parts.push('revision=' + (event.published_revision || ''));
     return parts.join(' | ');
   }).join('\n');
+}
+
+export function automationHistoryForEnrolment(history, enrolmentId) {
+  return {
+    enrolments: _.filter((history && history.enrolments) || [], enrolment => enrolment.id === enrolmentId),
+    events: _.filter((history && history.events) || [], event => event.enrolment_id === enrolmentId),
+  };
+}
+
+export function automationHistoryLogForEnrolment(history, enrolmentId) {
+  return automationHistoryLog(automationHistoryForEnrolment(history, enrolmentId));
+}
+
+export function automationHistoryContacts(history) {
+  return _.chain((history && history.enrolments) || [])
+    .groupBy(enrolment => enrolment.contact_email || 'unknown contact')
+    .map((enrolments, email) => ({
+      id: email,
+      email: email,
+      enrolments: _.chain(enrolments)
+        .sortBy(enrolment => moment(enrolment.created || 0).valueOf())
+        .reverse()
+        .value(),
+    }))
+    .sortBy(contact => contact.email.toLowerCase())
+    .value();
 }
 
 export function automationEnrolmentAction(enrolment, automation, now) {
@@ -1040,9 +1066,107 @@ class Automation extends Component {
     );
   }
 
+  renderStepRuns(enrolment) {
+    if (!enrolment.step_runs || !enrolment.step_runs.length) {
+      return <p>No step runs recorded for this pass.</p>;
+    }
+
+    return (
+      <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
+        <thead>
+          <tr>
+            <th>Created</th>
+            <th>Node</th>
+            <th>Type</th>
+            <th>Label</th>
+            <th>Tag</th>
+            <th>Status</th>
+            <th>Revision</th>
+          </tr>
+        </thead>
+        {
+          _.map(enrolment.step_runs, (stepRun, index) =>
+            <EDTableRow key={stepRun.id} index={index}>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{formatDebugTime(stepRun.created)}</h4></td>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_id}</h4></td>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_type}</h4></td>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_label || ''}</h4></td>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.tag || ''}</h4></td>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.status || stepRun.error || ''}</h4></td>
+              <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.published_revision || ''}</h4></td>
+            </EDTableRow>
+          )
+        }
+      </EDTable>
+    );
+  }
+
+  renderEnrolmentHistory(history, enrolment) {
+    const log = automationHistoryLogForEnrolment(history, enrolment.id);
+    const events = automationHistoryForEnrolment(history, enrolment.id).events;
+
+    return (
+      <div>
+        <p>
+          Pass {enrolment.id}
+          {' | '}status={enrolment.status || ''}
+          {' | '}source={enrolment.source || ''}
+          {' | '}current_node={enrolment.current_node_id || ''}
+          {
+            enrolment.wake_at ?
+              ' | wake_at=' + enrolment.wake_at
+            :
+              ''
+          }
+          {
+            enrolment.paused_at ?
+              ' | paused_at=' + formatDebugTime(enrolment.paused_at)
+            :
+              ''
+          }
+          {
+            enrolment.resumed_at ?
+              ' | resumed_at=' + formatDebugTime(enrolment.resumed_at)
+            :
+              ''
+          }
+          {
+            enrolment.wait && enrolment.wait.remaining_seconds !== undefined ?
+              ' | remaining_seconds=' + enrolment.wait.remaining_seconds
+            :
+              ''
+          }
+          {' | '}created={formatDebugTime(enrolment.created)}
+          {' | '}modified={formatDebugTime(enrolment.modified)}
+        </p>
+        {this.renderStepRuns(enrolment)}
+        <div className="flex-items space-between" style={{marginTop: '16px', marginBottom: '6px', position: 'relative', zIndex: 2}}>
+          <h4>Plain text log for this pass</h4>
+          <button
+            type="button"
+            className="btn btn-default btn-sm"
+            title="Copy this pass log"
+            onMouseDown={event => event.stopPropagation()}
+            onClick={this.copyHistoryLog.bind(this, log)}
+            style={{marginTop: '4px', position: 'relative', zIndex: 3, pointerEvents: 'auto', cursor: 'pointer'}}
+          >
+            <i className="fa fa-clipboard" /> Copy
+          </button>
+        </div>
+        <FormControl
+          componentClass="textarea"
+          rows={Math.min(Math.max(events.length + 1, 4), 12)}
+          readOnly
+          value={log}
+          onFocus={event => event.target.select()}
+        />
+      </div>
+    );
+  }
+
   renderHistory() {
     const history = this.props.historyData || {};
-    const enrolments = history.enrolments || [];
+    const contacts = automationHistoryContacts(history);
     const log = automationHistoryLog(history);
 
     return (
@@ -1056,75 +1180,48 @@ class Automation extends Component {
           <Panel.Collapse>
             <Panel.Body>
               {
-                enrolments.length ?
-                  _.map(enrolments, enrolment =>
-                    <div key={enrolment.id} className="space-bottom-sm">
-                      <h4>{enrolment.contact_email}</h4>
-                      <p>
-                        Session {enrolment.id}
-                        {' | '}status={enrolment.status || ''}
-                        {' | '}source={enrolment.source || ''}
-                        {' | '}current_node={enrolment.current_node_id || ''}
-                        {
-                          enrolment.wake_at ?
-                            ' | wake_at=' + enrolment.wake_at
-                          :
-                            ''
-                        }
-                        {
-                          enrolment.paused_at ?
-                            ' | paused_at=' + formatDebugTime(enrolment.paused_at)
-                          :
-                            ''
-                        }
-                        {
-                          enrolment.resumed_at ?
-                            ' | resumed_at=' + formatDebugTime(enrolment.resumed_at)
-                          :
-                            ''
-                        }
-                        {
-                          enrolment.wait && enrolment.wait.remaining_seconds !== undefined ?
-                            ' | remaining_seconds=' + enrolment.wait.remaining_seconds
-                          :
-                            ''
-                        }
-                        {' | '}created={formatDebugTime(enrolment.created)}
-                        {' | '}modified={formatDebugTime(enrolment.modified)}
-                      </p>
-                      {
-                        enrolment.step_runs && enrolment.step_runs.length ?
-                          <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
-                            <thead>
-                              <tr>
-                                <th>Created</th>
-                                <th>Node</th>
-                                <th>Type</th>
-                                <th>Label</th>
-                                <th>Tag</th>
-                                <th>Status</th>
-                                <th>Revision</th>
-                              </tr>
-                            </thead>
-                            {
-                              _.map(enrolment.step_runs, (stepRun, index) =>
-                                <EDTableRow key={stepRun.id} index={index}>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{formatDebugTime(stepRun.created)}</h4></td>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_id}</h4></td>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_type}</h4></td>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.node_label || ''}</h4></td>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.tag || ''}</h4></td>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.status || stepRun.error || ''}</h4></td>
-                                  <td><h4 style={{whiteSpace: 'nowrap'}}>{stepRun.published_revision || ''}</h4></td>
-                                </EDTableRow>
-                              )
-                            }
-                          </EDTable>
-                        :
-                          <p>No step runs recorded for this session.</p>
-                      }
-                    </div>
-                  )
+                contacts.length ?
+                  <PanelGroup accordion id="automation-history-contacts-accordion">
+                    {
+                      _.map(contacts, (contact, contactIndex) =>
+                        <Panel eventKey={contact.id} key={contact.id}>
+                          <Panel.Heading>
+                            <Panel.Title toggle style={{fontSize: '14px'}}>
+                              {contact.email}
+                              {' '}
+                              <span className="text-muted">
+                                ({contact.enrolments.length} {contact.enrolments.length === 1 ? 'pass' : 'passes'})
+                              </span>
+                            </Panel.Title>
+                          </Panel.Heading>
+                          <Panel.Collapse>
+                            <Panel.Body>
+                              <PanelGroup accordion id={'automation-history-passes-' + contactIndex}>
+                                {
+                                  _.map(contact.enrolments, enrolment =>
+                                    <Panel eventKey={enrolment.id} key={enrolment.id}>
+                                      <Panel.Heading>
+                                        <Panel.Title toggle style={{fontSize: '14px'}}>
+                                          {formatDebugTime(enrolment.created) || 'Unknown date'}
+                                          {' | '}status={enrolment.status || ''}
+                                          {' | '}source={enrolment.source || ''}
+                                        </Panel.Title>
+                                      </Panel.Heading>
+                                      <Panel.Collapse>
+                                        <Panel.Body>
+                                          {this.renderEnrolmentHistory(history, enrolment)}
+                                        </Panel.Body>
+                                      </Panel.Collapse>
+                                    </Panel>
+                                  )
+                                }
+                              </PanelGroup>
+                            </Panel.Body>
+                          </Panel.Collapse>
+                        </Panel>
+                      )
+                    }
+                  </PanelGroup>
                 :
                   <p>No automation history yet.</p>
               }

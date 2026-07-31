@@ -2,6 +2,8 @@ import _ from 'underscore';
 
 import {
   automationEnrolmentAction,
+  automationHistoryContacts,
+  automationHistoryLogForEnrolment,
   automationHistoryLog,
   canReEnrolAutomation,
   displayAutomationEnrolments,
@@ -275,5 +277,75 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('recipient=contact@example.com');
     expect(log).toContain('route=route-1');
     expect(log).toContain('sent=true');
+  });
+
+  it('groups debug history by contact email and sorts passes newest first', () => {
+    const contacts = automationHistoryContacts({
+      enrolments: [
+        {
+          id: 'older-pass',
+          contact_email: 'contact@example.com',
+          created: '2026-07-20T10:00:00Z',
+        },
+        {
+          id: 'newer-pass',
+          contact_email: 'contact@example.com',
+          created: '2026-07-20T11:00:00Z',
+        },
+        {
+          id: 'other-pass',
+          contact_email: 'other@example.com',
+          created: '2026-07-20T09:00:00Z',
+        },
+      ],
+    });
+
+    expect(contacts).toHaveLength(2);
+    expect(contacts[0].email).toBe('contact@example.com');
+    expect(_.pluck(contacts[0].enrolments, 'id')).toEqual(['newer-pass', 'older-pass']);
+    expect(contacts[1].email).toBe('other@example.com');
+  });
+
+  it('formats copy-friendly history text for one pass only', () => {
+    const log = automationHistoryLogForEnrolment({
+      enrolments: [
+        {
+          id: 'pass-1',
+          contact_email: 'contact@example.com',
+        },
+        {
+          id: 'pass-2',
+          contact_email: 'contact@example.com',
+        },
+      ],
+      events: [
+        {
+          type: 'enrolment',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'pass-1',
+          status: 'completed',
+          published_revision: 3,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T11:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'pass-2',
+          node_id: 'node_add_tag_2',
+          node_type: 'add_tag',
+          node_label: 'Add tag',
+          tag: 'second-pass',
+          status: 'succeeded',
+          published_revision: 4,
+        },
+      ],
+    }, 'pass-2');
+
+    expect(log).toContain('enrolment pass-2');
+    expect(log).toContain('step add_tag node_add_tag_2');
+    expect(log).toContain('tag=second-pass');
+    expect(log).toContain('revision=4');
+    expect(log).not.toContain('pass-1');
   });
 });
