@@ -529,6 +529,54 @@ class TestAutomationCRUD(test_base.TestBase):
         self.db.set_cid(self.user_cookie["cid"])
         self.db.automations.remove(automation_id)
 
+    def test_manual_entry_publishes_as_before(self):
+        automation = self.create_tracked_automation("Manual Entry Publish")
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.valid_workflow())
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(published["published"]["entry"], {"type": "manual"})
+
+    def test_tag_added_entry_with_tag_publishes(self):
+        automation = self.create_tracked_automation("Tag Added Entry Publish")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "tag_added",
+            "tag": "automation-entry-vip",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {
+                "type": "tag_added",
+                "tag": "automation-entry-vip",
+            },
+        )
+
+    def test_tag_added_entry_missing_tag_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Tag Added Entry Missing Tag")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "tag_added",
+            "tag": "",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Tag added entry trigger requires a tag", result.text)
+
     def test_publish_validation_failure_does_not_modify_existing_published_data(self):
         created = self.user_post("/api/automations", json={"name": "Publish Failure"})
         automation_id = created["id"]

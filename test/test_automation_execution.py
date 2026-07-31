@@ -90,6 +90,11 @@ class TestAutomationExecution(test_base.TestBase):
 
     def cleanup_contacts_and_lists(self):
         cid = self.user_cookie["cid"]
+        self.db.execute(
+            "delete from alltags where cid = %s and tag like %s",
+            cid,
+            "%s%%" % self.test_id,
+        )
         if self.created_emails:
             contact_ids = [
                 row[0]
@@ -759,6 +764,43 @@ class TestAutomationExecution(test_base.TestBase):
         self.assert_claim_cleared(self.enrolment_data(enrolment["id"]))
 
         self.cleanup(automation["id"])
+
+    def test_tag_added_entry_does_not_automatically_enrol_when_tag_is_added(self):
+        email, contact_id = self.create_contact()
+        trigger_tag = "%s_entry_trigger" % self.test_id
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_entry_trigger_%s" % self.unique()},
+        )
+        workflow = self.workflow(tag="entry-trigger-action")
+        workflow["entry"] = {
+            "type": "tag_added",
+            "tag": trigger_tag,
+        }
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=workflow,
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
+        self.add_existing_tag(contact_id, trigger_tag)
+
+        enrolment_count = self.db.single(
+            """
+            select count(*)
+            from automation_enrolments
+            where cid = %s and automation_id = %s and contact_id = %s
+            """,
+            self.user_cookie["cid"],
+            published["id"],
+            contact_id,
+        )
+        self.assertEqual(enrolment_count, 0)
+
+        self.cleanup(published["id"])
 
     def test_running_add_tag_when_contact_already_has_tag_succeeds_and_advances(self):
         email, contact_id = self.create_contact()

@@ -28,19 +28,33 @@ function errorMessage(error, fallback) {
 
 function normalizeAutomation(automation) {
   automation.entry = automation.entry || {type: 'manual'};
-  automation.entry.type = 'manual';
+  if (automation.entry.type === 'tag_added') {
+    automation.entry.tag = automation.entry.tag || '';
+  } else {
+    automation.entry = {type: 'manual'};
+  }
   automation.reentry = automation.reentry || 'once';
   automation.draft = automation.draft || {};
   automation.draft.nodes = automation.draft.nodes || [];
   return automation;
 }
 
+function entryPayload(entry) {
+  if (entry && entry.type === 'tag_added') {
+    return {
+      type: 'tag_added',
+      tag: entry.tag || '',
+    };
+  }
+  return {
+    type: 'manual',
+  };
+}
+
 function patchPayload(data) {
   return {
     name: data.name,
-    entry: {
-      type: 'manual',
-    },
+    entry: entryPayload(data.entry),
     reentry: data.reentry || 'once',
     draft: {
       nodes: data.draft.nodes,
@@ -304,6 +318,26 @@ class Automation extends Component {
     });
   }
 
+  entryTypeChange = event => {
+    const type = getvalue(event);
+    this.props.update({
+      entry: {$set: type === 'tag_added' ? {
+        type: 'tag_added',
+        tag: (this.props.data.entry && this.props.data.entry.tag) || '',
+      } : {
+        type: 'manual',
+      }},
+    });
+  }
+
+  entryTagChange = event => {
+    this.props.update({
+      entry: {
+        tag: {$set: event.params.data.id},
+      },
+    });
+  }
+
   nodeDurationChange = (index, event) => {
     const value = parseInt(event.target.value, 10);
     this.props.update({
@@ -335,8 +369,10 @@ class Automation extends Component {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
     const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
+    const entry = this.props.data.entry || {};
+    const entryTags = entry.type === 'tag_added' && entry.tag ? [entry.tag] : [];
 
-    return _.map(_.uniq(tags.concat(draftTags)), tag => ({id: tag, text: tag}));
+    return _.map(_.uniq(tags.concat(draftTags).concat(entryTags)), tag => ({id: tag, text: tag}));
   }
 
   nodeTargetOptions(node) {
@@ -1294,7 +1330,44 @@ class Automation extends Component {
             </EDFormBox>
             <EDFormBox space>
               <h4>Entry</h4>
-              <p>Manual enrolment</p>
+              <SelectLabel
+                id="type"
+                label="Entry trigger"
+                obj={data.entry || {type: 'manual'}}
+                onChange={this.entryTypeChange}
+                options={[
+                  {id: 'manual', name: 'Manual'},
+                  {id: 'tag_added', name: 'Tag added'},
+                ]}
+              />
+              {
+                data.entry && data.entry.type === 'tag_added' ?
+                  <div style={{maxWidth: '360px'}} className="space-bottom">
+                    <label>Trigger tag</label>
+                    <Select2
+                      data={this.tagData()}
+                      value={data.entry.tag || ''}
+                      onSelect={this.entryTagChange}
+                      style={{width:'100%'}}
+                      options={{
+                        placeholder: 'Select or create tag',
+                        tags: true,
+                        createTag: function (params) {
+                          const fixed = fixTag(params.term);
+                          if (!fixed) {
+                            return null;
+                          }
+                          return {
+                            id: fixed,
+                            text: fixed,
+                          };
+                        }
+                      }}
+                    />
+                  </div>
+                :
+                  <p>Contacts can be added manually from this automation or from a contact/list action.</p>
+              }
               <SelectLabel
                 id="reentry"
                 label="Contact re-entry"

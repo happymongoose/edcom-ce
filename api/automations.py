@@ -285,15 +285,34 @@ TERMINAL_ENROLMENT_STATUSES = ("completed", "exited", "cancelled")
 
 
 ENTRY_SCHEMA = {
-    "type": "object",
-    "required": ["type"],
-    "properties": {
-        "type": {
-            "type": "string",
-            "enum": ["manual"],
+    "oneOf": [
+        {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["manual"],
+                },
+            },
+            "additionalProperties": False,
         },
-    },
-    "additionalProperties": False,
+        {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["tag_added"],
+                },
+                "tag": {
+                    "type": "string",
+                    "maxLength": 1024,
+                },
+            },
+            "additionalProperties": False,
+        },
+    ],
 }
 
 
@@ -514,6 +533,21 @@ def _prepare_patch_doc(doc: JsonObj) -> None:
 
 def _validation_error(message: str) -> None:
     raise falcon.HTTPBadRequest(title="Automation publish validation failed", description=message)
+
+
+def _published_entry(entry: JsonObj) -> JsonObj:
+    entry_type = entry.get("type")
+    if entry_type == "manual":
+        return {"type": "manual"}
+    if entry_type == "tag_added":
+        tag = (entry.get("tag") or "").strip()
+        if not tag:
+            _validation_error("Tag added entry trigger requires a tag.")
+        return {
+            "type": "tag_added",
+            "tag": tag,
+        }
+    _validation_error("Automation entry trigger type is not supported.")
 
 
 def _duration_minutes(duration: JsonObj) -> int:
@@ -800,8 +834,7 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
     if entry is None:
         _validation_error("Automation entry is required.")
     _validate_doc(entry, ENTRY_SCHEMA)
-    if entry.get("type") != "manual":
-        _validation_error("Automation entry must be manual.")
+    entry = _published_entry(entry)
 
     reentry = automation.get("reentry", "once")
     _validate_doc(reentry, REENTRY_SCHEMA)
