@@ -3170,7 +3170,7 @@ class AutomationEnrolmentRunNext(object):
                         },
                     )
                 except Exception as e:
-                    traceback.print_exc()
+                    log.warning("Error sending automation email: %s", e)
                     raise falcon.HTTPBadRequest(
                         title="Error sending automation email",
                         description="Error sending automation email: %s" % e,
