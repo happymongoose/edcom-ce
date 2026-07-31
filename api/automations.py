@@ -1148,6 +1148,8 @@ def _create_enrolment_for_contact(
     contact_id: int,
     contact_email: str,
     source: str,
+    trigger_correlation_id: str | None = None,
+    trigger_depth: int | None = None,
 ) -> JsonObj:
     _, nodes, reentry = _published_enrolment_context(automation)
 
@@ -1210,6 +1212,10 @@ def _create_enrolment_for_contact(
         "created": now,
         "modified": now,
     }
+    if trigger_correlation_id:
+        data["trigger_correlation_id"] = trigger_correlation_id
+    if trigger_depth is not None:
+        data["trigger_depth"] = trigger_depth
 
     db.execute(
         """
@@ -2967,6 +2973,11 @@ def _run_next_automation_enrolment(
                 tag,
             )
             tagcounts = {}
+            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            try:
+                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
+            except (TypeError, ValueError):
+                trigger_depth = 1
             contacts.add_tag(
                 db,
                 cid,
@@ -2977,6 +2988,16 @@ def _run_next_automation_enrolment(
                 {},
                 tagcounts,
                 [],
+                {
+                    "type": "automation",
+                    "automation_id": id,
+                    "enrolment_id": enrolment_id,
+                    "node_id": node.get("id"),
+                    "step_run_id": run_id,
+                    "published_revision": automation.get("published_revision"),
+                },
+                trigger_correlation_id,
+                trigger_depth,
             )
             for tagname, cnt in tagcounts.items():
                 db.execute(
@@ -3805,6 +3826,8 @@ def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonO
                 int(event.get("contact_id")),
                 event.get("contact_email"),
                 "trigger:%s" % event.get("id"),
+                event.get("correlation_id"),
+                depth,
             )
             if outcome.get("status") == "enrolled":
                 result["enrolled"] += 1

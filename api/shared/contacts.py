@@ -49,6 +49,105 @@ WRITE_BLOCK_SIZE = 32 * 1024
 HASH_BLOCK_SIZE = 1024 * 1024
 # Max hash buckets to prevent runaway rehashing/task fan-out. Can be overridden via env.
 HASHLIMIT_CAP = int(os.environ.get("hashlimit_max", "128"))
+AUTOMATION_TRIGGER_SOURCE_FIELDS = (
+    "type",
+    "automation_id",
+    "enrolment_id",
+    "node_id",
+    "step_run_id",
+    "published_revision",
+)
+
+
+def automation_trigger_emission_enabled() -> bool:
+    return (os.environ.get("automation_trigger_emission_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def sanitize_automation_trigger_source(source: JsonObj | None) -> JsonObj:
+    source = source or {}
+    ret: JsonObj = {
+        "type": str(source.get("type") or "manual")[:32],
+    }
+    for key in AUTOMATION_TRIGGER_SOURCE_FIELDS:
+        if key == "type":
+            continue
+        value = source.get(key)
+        if value is not None:
+            ret[key] = str(value)[:128]
+    return ret
+
+
+def matching_tag_added_automation_exists(db: DB, cid: str, tag: str) -> bool:
+    return bool(
+        db.single(
+            """
+            select id
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+                and data->'published'->'entry'->>'type' = 'tag_added'
+                and data->'published'->'entry'->>'tag' = %s
+            limit 1
+            """,
+            cid,
+            tag,
+        )
+    )
+
+
+def maybe_insert_tag_added_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    if not automation_trigger_emission_enabled():
+        return None
+    if not matching_tag_added_automation_exists(db, cid, tag):
+        return None
+
+    now = datetime.utcnow()
+    event_id = shortuuid.uuid()
+    try:
+        depth = max(0, min(int(depth or 0), 100))
+    except (TypeError, ValueError):
+        depth = 0
+    data = {
+        "status": "pending",
+        "tag": tag,
+        "source": sanitize_automation_trigger_source(source),
+        "correlation_id": (correlation_id or shortuuid.uuid())[:128],
+        "depth": depth,
+        "manual_debug": False,
+        "created_by": None,
+        "created": now.isoformat() + "Z",
+        "processed_at": None,
+        "results": [],
+    }
+    db.execute(
+        """
+        insert into automation_trigger_events
+            (id, cid, contact_id, contact_email, event_type, ts, data)
+        values (%s, %s, %s, %s, 'tag_added', %s, %s)
+        """,
+        event_id,
+        cid,
+        contact_id,
+        email,
+        now,
+        data,
+    )
+    return event_id
 
 
 def load_campaign_or_message(db: DB, campid: str) -> Tuple[JsonObj | None, bool]:
@@ -208,6 +307,9 @@ def update_tags(
     webhook_msgs: List[JsonObj],
     email_contact_ids: List[Tuple[str, int]] | None = None,
     funnel: str | None = None,
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
 ) -> None:
     if email_contact_ids is None:
         email_contact_ids = list(
@@ -245,6 +347,9 @@ def update_tags(
                 funnelcounts,
                 tagcounts,
                 webhook_msgs,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
             )
 
         for tag in remove_tags:
@@ -277,7 +382,10 @@ def add_tag(
     funnelcounts: Dict[str, int],
     tagcounts: Dict[str, int],
     webhook_msgs: List[JsonObj],
-) -> None:
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
+) -> bool:
     is_new = db.single(
         f"""insert into contacts."contact_values_{cid}" (contact_id, type, value) values (%s, 'tag', %s)
                            on conflict (contact_id, type, value) do nothing returning contact_id""",
@@ -299,6 +407,23 @@ def add_tag(
 
         if tagfunnels is not None:
             insert_funnel_tag(db, cid, email, tag, tagfunnels, funnelcounts)
+
+        try:
+            maybe_insert_tag_added_trigger_event(
+                db,
+                cid,
+                email,
+                contact_id,
+                tag,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
+        except Exception:
+            log.exception("failed to emit automation tag_added trigger event")
+        return True
+
+    return False
 
 
 def remove_tag(

@@ -3,6 +3,7 @@ import shortuuid
 from datetime import datetime, timedelta
 
 import test_base
+from api.shared import contacts
 from api.migrations import add_automation_trigger_events_table
 
 
@@ -18,6 +19,7 @@ class TestAutomationTriggers(test_base.TestBase):
         self.created_other_cids = []
         self.original_env = {
             "automation_triggers_enabled": os.environ.get("automation_triggers_enabled"),
+            "automation_trigger_emission_enabled": os.environ.get("automation_trigger_emission_enabled"),
             "automation_trigger_manual_events_enabled": os.environ.get("automation_trigger_manual_events_enabled"),
             "automation_trigger_max_depth": os.environ.get("automation_trigger_max_depth"),
             "automation_trigger_cooldown_minutes": os.environ.get("automation_trigger_cooldown_minutes"),
@@ -29,6 +31,11 @@ class TestAutomationTriggers(test_base.TestBase):
         cid = self.user_cookie["cid"]
         self.db.execute(
             "delete from automation_trigger_events where cid = %s and data->>'correlation_id' like %s",
+            cid,
+            "%s%%" % self.test_id,
+        )
+        self.db.execute(
+            "delete from alltags where cid = %s and tag like %s",
             cid,
             "%s%%" % self.test_id,
         )
@@ -122,6 +129,9 @@ class TestAutomationTriggers(test_base.TestBase):
     def enable_processing(self):
         os.environ["automation_triggers_enabled"] = "true"
 
+    def enable_emission(self):
+        os.environ["automation_trigger_emission_enabled"] = "true"
+
     def create_contact(self):
         suffix = self.unique()
         email = "automation-trigger-%s@example.com" % suffix
@@ -164,6 +174,33 @@ class TestAutomationTriggers(test_base.TestBase):
             },
         }
 
+    def add_tag_workflow(self, add_tag, entry_type="manual", entry_tag=None, reentry="once"):
+        entry = {"type": "manual"}
+        if entry_type == "tag_added":
+            entry = {
+                "type": "tag_added",
+                "tag": entry_tag or add_tag,
+            }
+        return {
+            "entry": entry,
+            "reentry": reentry,
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add tag",
+                        "draft_tag": add_tag,
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
     def create_automation(self, tag, reentry="once", paused=False):
         automation = self.user_post(
             "/api/automations",
@@ -188,6 +225,23 @@ class TestAutomationTriggers(test_base.TestBase):
             return paused_result.json
         return published.json
 
+    def create_add_tag_automation(self, add_tag, entry_type="manual", entry_tag=None):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_add_tag_automation_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.add_tag_workflow(add_tag, entry_type, entry_tag),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(published.status_code, 200)
+        return published.json
+
     def create_event(self, email, tag, **overrides):
         doc = {
             "event_type": "tag_added",
@@ -200,6 +254,36 @@ class TestAutomationTriggers(test_base.TestBase):
 
     def process_events(self, limit=25):
         return self.user_post("/api/automation-trigger-events/process", json={"limit": limit})
+
+    def run_next(self, automation_id, enrolment_id):
+        return self.simulate_post(
+            "/api/automations/%s/enrolments/%s/run-next" % (automation_id, enrolment_id),
+            headers=self.headers(),
+        )
+
+    def add_contact_tag(self, email, contact_id, tag, **kwargs):
+        webhook_msgs = []
+        contacts.update_tags(
+            self.db,
+            self.user_cookie["cid"],
+            [email],
+            [tag],
+            webhook_msgs,
+            [(email, contact_id)],
+            **kwargs
+        )
+
+    def emitted_events(self, tag):
+        return self.db.execute(
+            """
+            select id, data
+            from automation_trigger_events
+            where cid = %s and event_type = 'tag_added' and data->>'tag' = %s
+            order by ts, id
+            """,
+            self.user_cookie["cid"],
+            tag,
+        ).fetchall()
 
     def enrolment_rows(self, automation_id):
         return self.db.execute(
@@ -293,6 +377,217 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(rows[0][1]["status"], "ready")
         self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
         self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_emission_flag_off_does_not_create_event_even_with_match(self):
+        email, contact_id = self.create_contact()
+        tag = "%s_emit_off" % self.test_id
+        self.create_automation(tag)
+
+        self.add_contact_tag(email, contact_id, tag)
+
+        self.assertEqual(len(self.emitted_events(tag)), 0)
+
+    def test_emission_enabled_without_matching_automation_does_not_create_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_no_emit_match" % self.test_id
+
+        self.add_contact_tag(email, contact_id, tag)
+
+        self.assertEqual(len(self.emitted_events(tag)), 0)
+
+    def test_matching_published_automation_creates_pending_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_emit_published" % self.test_id
+        self.create_automation(tag)
+
+        self.add_contact_tag(email, contact_id, tag)
+
+        events = self.emitted_events(tag)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
+        self.assertEqual(events[0][1]["source"]["type"], "manual")
+        self.assertEqual(events[0][1]["depth"], 0)
+
+    def test_matching_paused_automation_creates_pending_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_emit_paused" % self.test_id
+        self.create_automation(tag, paused=True)
+
+        self.add_contact_tag(email, contact_id, tag)
+
+        events = self.emitted_events(tag)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
+
+    def test_idempotent_second_tag_add_does_not_create_second_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_emit_once" % self.test_id
+        self.create_automation(tag)
+
+        self.add_contact_tag(email, contact_id, tag)
+        self.add_contact_tag(email, contact_id, tag)
+
+        self.assertEqual(len(self.emitted_events(tag)), 1)
+
+    def test_processing_emitted_event_creates_enrolment_with_correlation_data(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, contact_id = self.create_contact()
+        tag = "%s_emit_process" % self.test_id
+        automation = self.create_automation(tag)
+
+        self.add_contact_tag(email, contact_id, tag)
+        events = self.emitted_events(tag)
+        result = self.process_events()
+
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["trigger_correlation_id"], events[0][1]["correlation_id"])
+        self.assertEqual(rows[0][1]["trigger_depth"], 0)
+
+    def test_automation_add_tag_emits_source_metadata_when_another_automation_matches(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_automation_source" % self.test_id
+        source_automation = self.create_add_tag_automation(tag)
+        target_automation = self.create_automation(tag, reentry="multiple")
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200)
+        events = self.emitted_events(tag)
+        self.assertEqual(len(events), 1)
+        source = events[0][1]["source"]
+        self.assertEqual(source["type"], "automation")
+        self.assertEqual(source["automation_id"], source_automation["id"])
+        self.assertEqual(source["enrolment_id"], enrolment["id"])
+        self.assertEqual(source["node_id"], "node_add_tag_1")
+        self.assertEqual(source["step_run_id"], run.json["step_run"]["id"])
+        self.assertEqual(source["published_revision"], str(source_automation["published_revision"]))
+
+        result = self.process_events()
+
+        self.assertEqual(result["enrolled"], 1)
+        self.assertEqual(len(self.enrolment_rows(target_automation["id"])), 1)
+
+    def test_same_automation_source_emitted_event_is_suppressed(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_same_auto_emit" % self.test_id
+        automation = self.create_add_tag_automation(tag, "tag_added", tag)
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200)
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "same_automation_source")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
+    def test_depth_increments_for_automation_caused_event(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        tag = "%s_depth_increment" % self.test_id
+        source_automation = self.create_add_tag_automation(tag)
+        self.create_automation(tag)
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+        self.patch_enrolment_status(enrolment["id"], "ready")
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || jsonb_build_object('trigger_correlation_id', %s, 'trigger_depth', 2)
+            where cid = %s and id = %s
+            """,
+            "%s_existing_correlation" % self.test_id,
+            self.user_cookie["cid"],
+            enrolment["id"],
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200)
+
+        events = self.emitted_events(tag)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["correlation_id"], "%s_existing_correlation" % self.test_id)
+        self.assertEqual(events[0][1]["depth"], 3)
+
+    def test_source_payload_is_bounded_and_sanitized(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_source_bounds" % self.test_id
+        self.create_automation(tag)
+
+        self.add_contact_tag(
+            email,
+            contact_id,
+            tag,
+            automation_trigger_source={
+                "type": "api",
+                "automation_id": "a" * 200,
+                "metadata": "x" * 5000,
+            },
+            automation_trigger_correlation_id="c" * 200,
+            automation_trigger_depth=500,
+        )
+
+        event = self.emitted_events(tag)[0][1]
+        self.assertEqual(event["source"]["type"], "api")
+        self.assertEqual(len(event["source"]["automation_id"]), 128)
+        self.assertNotIn("metadata", event["source"])
+        self.assertEqual(len(event["correlation_id"]), 128)
+        self.assertEqual(event["depth"], 100)
+
+    def test_emission_matching_is_current_account_scoped(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_emit_scope" % self.test_id
+        other_cid = "%s_emit_other_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            "%s_emit_other_automation" % self.test_id,
+            other_cid,
+            {
+                "name": "%s emit other automation" % self.test_id,
+                "status": "published",
+                "published": {
+                    "entry": {
+                        "type": "tag_added",
+                        "tag": tag,
+                    },
+                    "reentry": "once",
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ],
+                },
+                "published_revision": 1,
+            },
+        )
+
+        self.add_contact_tag(email, contact_id, tag)
+
+        self.assertEqual(len(self.emitted_events(tag)), 0)
 
     def test_paused_automation_creates_held_enrolment(self):
         self.enable_manual_events()
