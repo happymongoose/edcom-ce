@@ -3438,7 +3438,7 @@ class AutomationEnrolmentProcessor(object):
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)
 
-        doc = req.get_media(default_when_empty={}) or {}
+        doc = req.context.get("doc") or {}
         if not isinstance(doc, dict):
             raise falcon.HTTPBadRequest(
                 title="Not JSON",

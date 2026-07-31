@@ -2123,6 +2123,23 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_processor_automation_id_filter_only_processes_selected_automation(self):
+        selected_email, selected_contact_id = self.create_contact()
+        other_email, other_contact_id = self.create_contact()
+        selected = self.create_automation(tag="processor-selected")
+        other = self.create_automation(tag="processor-other")
+        self.enrol(selected["id"], selected_email)
+        self.enrol(other["id"], other_email)
+
+        result = self.process_enrolments(automation_id=selected["id"], limit=10)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+        self.assertTrue(self.has_tag(selected_contact_id, "processor-selected"))
+        self.assertFalse(self.has_tag(other_contact_id, "processor-other"))
+
+        self.cleanup(selected["id"], other["id"])
+
     def test_processor_is_current_account_scoped(self):
         email, _ = self.create_contact()
         automation = self.create_automation(tag="processor-scope")
