@@ -755,6 +755,9 @@ class Automation extends Component {
     if (type === 'add_tag') {
       return 'Add tag';
     }
+    if (type === 'remove_tag') {
+      return 'Remove tag';
+    }
     if (type === 'wait_duration') {
       return 'Wait';
     }
