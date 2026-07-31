@@ -1,3 +1,4 @@
+import os
 import shortuuid
 import dateutil.parser
 import falcon
@@ -18,12 +19,48 @@ class TestAutomationExecution(test_base.TestBase):
         self.test_id = "automation_execution_%s" % shortuuid.uuid().lower()
         self.created_debug_backend_ids = []
         self.created_route_ids = []
+        self.created_scheduler_cids = []
         self.original_company_routes = None
+        self.original_automation_env = {
+            "automation_processing_enabled": os.environ.get("automation_processing_enabled"),
+            "automation_processing_limit": os.environ.get("automation_processing_limit"),
+            "automation_processing_account_limit": os.environ.get("automation_processing_account_limit"),
+        }
 
     def tearDown(self):
+        self.restore_automation_env()
+        self.cleanup_scheduler_accounts()
         self.cleanup_debug_routes()
         self.cleanup_contacts_and_lists()
         super(TestAutomationExecution, self).tearDown()
+
+    def restore_automation_env(self):
+        for key, value in self.original_automation_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def cleanup_scheduler_accounts(self):
+        if not self.created_scheduler_cids:
+            return
+        self.db.execute(
+            "delete from automation_step_runs where cid = any(%s)",
+            self.created_scheduler_cids,
+        )
+        self.db.execute(
+            "delete from automation_enrolments where cid = any(%s)",
+            self.created_scheduler_cids,
+        )
+        self.db.execute(
+            "delete from automations where cid = any(%s)",
+            self.created_scheduler_cids,
+        )
+        self.db.execute(
+            "delete from companies where id = any(%s)",
+            self.created_scheduler_cids,
+        )
+        self.created_scheduler_cids = []
 
     def cleanup_debug_routes(self):
         cid = self.user_cookie["cid"]
@@ -363,6 +400,93 @@ class TestAutomationExecution(test_base.TestBase):
             automation_id,
             limit,
         )
+
+    def run_scheduler_with_dispatch_patch(self, account_ids):
+        original_account_ids = automations._automation_processing_account_ids
+        original_run_task = automations.run_task
+        dispatched = []
+
+        def fake_account_ids(db, account_limit):
+            return account_ids[:account_limit]
+
+        def fake_run_task(task, cid, automation_id, limit):
+            dispatched.append(
+                {
+                    "task": task,
+                    "cid": cid,
+                    "automation_id": automation_id,
+                    "limit": limit,
+                }
+            )
+            return "task-%s" % len(dispatched)
+
+        automations._automation_processing_account_ids = fake_account_ids
+        automations.run_task = fake_run_task
+        try:
+            result = automations.check_automation_enrolments()
+        finally:
+            automations._automation_processing_account_ids = original_account_ids
+            automations.run_task = original_run_task
+        return result, dispatched
+
+    def create_scheduler_candidate_account(self, status="ready", automation_status="published", wake_at=None, modified_at=None):
+        cid = "automation-scheduler-%s" % self.unique()
+        automation_id = "automation-scheduler-automation-%s" % self.unique()
+        enrolment_id = "automation-scheduler-enrolment-%s" % self.unique()
+        now = modified_at or datetime.utcnow().isoformat() + "Z"
+        data = {
+            "name": "Scheduler account %s" % cid,
+            "admin": False,
+        }
+        self.db.execute(
+            "insert into companies (id, cid, data) values (%s, %s, %s)",
+            cid,
+            self.backend_cid(),
+            data,
+        )
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            automation_id,
+            cid,
+            {
+                "name": "Scheduler automation %s" % cid,
+                "status": automation_status,
+                "published": {
+                    "nodes": [
+                        {
+                            "id": "node_add_tag_1",
+                            "type": "add_tag",
+                            "label": "Add tag",
+                            "draft_tag": "scheduler-tag",
+                        }
+                    ],
+                },
+                "published_revision": 1,
+            },
+        )
+        enrolment_data = {
+            "status": status,
+            "current_node_id": "node_add_tag_1",
+            "created": now,
+            "modified": now,
+        }
+        if wake_at is not None:
+            enrolment_data["wake_at"] = wake_at
+        self.db.execute(
+            """
+            insert into automation_enrolments
+                (id, cid, automation_id, contact_id, contact_email, data)
+            values (%s, %s, %s, %s, %s, %s)
+            """,
+            enrolment_id,
+            cid,
+            automation_id,
+            1,
+            "%s@example.com" % cid,
+            enrolment_data,
+        )
+        self.created_scheduler_cids.append(cid)
+        return cid
 
     def patch_enrolment_data(self, enrolment_id, data):
         self.db.execute(
@@ -2392,3 +2516,159 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertIn("errors", task_result)
 
         self.cleanup(manual["id"], task["id"])
+
+    def test_scheduler_feature_flag_off_does_not_dispatch(self):
+        os.environ.pop("automation_processing_enabled", None)
+        result, dispatched = self.run_scheduler_with_dispatch_patch([self.user_cookie["cid"]])
+
+        self.assertEqual(result["enabled"], False)
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_scheduler_enabled_dispatches_for_ready_account(self):
+        os.environ["automation_processing_enabled"] = "true"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([self.user_cookie["cid"]])
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(dispatched[0]["task"], automations.process_automation_enrolments_task)
+        self.assertEqual(dispatched[0]["cid"], self.user_cookie["cid"])
+        self.assertIsNone(dispatched[0]["automation_id"])
+        self.assertEqual(dispatched[0]["limit"], 25)
+
+    def test_scheduler_enabled_dispatches_for_elapsed_waiting_account(self):
+        os.environ["automation_processing_enabled"] = "1"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([self.user_cookie["cid"]])
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(dispatched[0]["cid"], self.user_cookie["cid"])
+
+    def test_scheduler_account_selection_includes_ready_enrolment(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertIn(cid, cids)
+
+    def test_scheduler_account_selection_includes_elapsed_waiting_enrolment(self):
+        cid = self.create_scheduler_candidate_account(
+            status="waiting",
+            wake_at=(datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z",
+        )
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertIn(cid, cids)
+
+    def test_scheduler_account_selection_ignores_non_elapsed_waiting(self):
+        cid = self.create_scheduler_candidate_account(
+            status="waiting",
+            wake_at=(datetime.utcnow() + timedelta(minutes=5)).isoformat() + "Z",
+        )
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertNotIn(cid, cids)
+
+    def test_scheduler_account_selection_ignores_paused_automation(self):
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_status="paused",
+        )
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertNotIn(cid, cids)
+
+    def test_scheduler_account_selection_respects_account_cap(self):
+        first = self.create_scheduler_candidate_account(status="ready", modified_at="1970-01-01T00:00:00Z")
+        second = self.create_scheduler_candidate_account(status="ready", modified_at="1970-01-01T00:00:01Z")
+
+        cids = automations._automation_processing_account_ids(self.db, 1)
+
+        self.assertEqual(len(cids), 1)
+        self.assertTrue(first in cids or second in cids)
+
+    def test_scheduler_account_selection_ignores_account_without_eligible_enrolments(self):
+        cid = self.create_scheduler_candidate_account(status="completed")
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertNotIn(cid, cids)
+
+    def test_scheduler_ignores_non_elapsed_waiting_accounts_when_selection_is_empty(self):
+        os.environ["automation_processing_enabled"] = "true"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([])
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_scheduler_ignores_paused_automation_accounts_when_selection_is_empty(self):
+        os.environ["automation_processing_enabled"] = "true"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([])
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_scheduler_ignores_accounts_without_eligible_enrolments(self):
+        os.environ["automation_processing_enabled"] = "true"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([])
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["accounts"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_scheduler_account_cap_is_respected(self):
+        os.environ["automation_processing_enabled"] = "true"
+        os.environ["automation_processing_account_limit"] = "1"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([
+            self.user_cookie["cid"],
+            "other-account-cid",
+        ])
+
+        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(result["account_limit"], 1)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["cid"], self.user_cookie["cid"])
+
+    def test_scheduler_process_limit_is_configurable_and_capped(self):
+        os.environ["automation_processing_enabled"] = "true"
+        os.environ["automation_processing_limit"] = "500"
+        result, dispatched = self.run_scheduler_with_dispatch_patch([self.user_cookie["cid"]])
+
+        self.assertEqual(result["limit"], 100)
+        self.assertEqual(dispatched[0]["limit"], 100)
+
+    def test_scheduler_one_node_only_relies_on_processor_task(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add first scheduler tag",
+                    "draft_tag": "scheduler-task-first-node",
+                },
+                {
+                    "id": "node_add_tag_2",
+                    "type": "add_tag",
+                    "label": "Add second scheduler tag",
+                    "draft_tag": "scheduler-task-second-node",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.process_enrolments_task(automation["id"], 25)
+
+        self.assertEqual(result["processed"], 1)
+        self.assertTrue(self.has_tag(contact_id, "scheduler-task-first-node"))
+        self.assertFalse(self.has_tag(contact_id, "scheduler-task-second-node"))
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["current_node_id"], "node_add_tag_2")
+
+        self.cleanup(automation["id"])

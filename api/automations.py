@@ -1259,6 +1259,8 @@ CLAIM_STALE_AFTER = timedelta(minutes=30)
 AUTOMATION_PROCESS_DEFAULT_LIMIT = 25
 AUTOMATION_PROCESS_MAX_LIMIT = 100
 AUTOMATION_PROCESS_ERROR_LIMIT = 100
+AUTOMATION_PROCESS_ACCOUNT_LIMIT = 50
+CHECK_AUTOMATION_ENROLMENTS_LOCK = 58413921
 
 
 def _claim_clear_patch() -> JsonObj:
@@ -3284,6 +3286,33 @@ def _automation_process_limit(value: object) -> int:
     return min(limit, AUTOMATION_PROCESS_MAX_LIMIT)
 
 
+def _automation_processing_enabled() -> bool:
+    return (os.environ.get("automation_processing_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _automation_scheduler_account_limit() -> int:
+    value = os.environ.get("automation_processing_account_limit")
+    if value is None:
+        return AUTOMATION_PROCESS_ACCOUNT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return AUTOMATION_PROCESS_ACCOUNT_LIMIT
+    return max(1, min(limit, AUTOMATION_PROCESS_ACCOUNT_LIMIT))
+
+
+def _automation_scheduler_process_limit() -> int:
+    try:
+        return _automation_process_limit(os.environ.get("automation_processing_limit"))
+    except falcon.HTTPBadRequest:
+        return AUTOMATION_PROCESS_DEFAULT_LIMIT
+
+
 def _eligible_automation_enrolments(
     db: DB,
     cid: str,
@@ -3362,6 +3391,44 @@ def _running_automation_enrolment_count(
         )
         or 0
     )
+
+
+def _automation_processing_account_ids(
+    db: DB,
+    account_limit: int,
+) -> List[str]:
+    return [
+        cid
+        for cid, in db.execute(
+            """
+            select e.cid
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            join companies c on c.id = e.cid
+            where c.data @> %s
+                and a.data->'published' is not null
+                and coalesce(a.data->>'status', '') <> 'paused'
+                and (
+                    e.data->>'status' = 'ready'
+                    or (
+                        e.data->>'status' = 'waiting'
+                        and nullif(e.data->>'wake_at', '')::timestamptz <= %s
+                    )
+                )
+            group by e.cid
+            order by min(
+                coalesce(
+                    nullif(e.data->>'modified', '')::timestamptz,
+                    nullif(e.data->>'created', '')::timestamptz
+                )
+            ), e.cid
+            limit %s
+            """,
+            {"admin": False},
+            datetime.utcnow(),
+            account_limit,
+        )
+    ]
 
 
 def _process_eligible_automation_enrolments(
@@ -3459,6 +3526,60 @@ def process_automation_enrolments_task(
             result,
         )
         return result
+
+
+def check_automation_enrolments() -> JsonObj:
+    if not _automation_processing_enabled():
+        log.info("Automation processing is disabled; set automation_processing_enabled=true to enable scheduled processing.")
+        return {
+            "enabled": False,
+            "accounts": 0,
+            "dispatched": 0,
+            "task_ids": [],
+        }
+
+    account_limit = _automation_scheduler_account_limit()
+    process_limit = _automation_scheduler_process_limit()
+    task_ids: List[str | None] = []
+
+    with open_db() as db:
+        with db.transaction():
+            if not db.single(f"select pg_try_advisory_xact_lock({CHECK_AUTOMATION_ENROLMENTS_LOCK})"):
+                log.info("Automation processing scheduler is already running.")
+                return {
+                    "enabled": True,
+                    "locked": True,
+                    "accounts": 0,
+                    "dispatched": 0,
+                    "task_ids": [],
+                }
+
+            cids = _automation_processing_account_ids(db, account_limit)
+            log.info(
+                "Dispatching automation processing for %s account(s), account_limit=%s, per_account_limit=%s.",
+                len(cids),
+                account_limit,
+                process_limit,
+            )
+            for cid in cids:
+                task_ids.append(
+                    run_task(
+                        process_automation_enrolments_task,
+                        cid,
+                        None,
+                        process_limit,
+                    )
+                )
+
+    return {
+        "enabled": True,
+        "locked": False,
+        "accounts": len(task_ids),
+        "dispatched": len(task_ids),
+        "task_ids": task_ids,
+        "limit": process_limit,
+        "account_limit": account_limit,
+    }
 
 
 class AutomationEnrolmentProcessor(object):
