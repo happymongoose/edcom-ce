@@ -4,13 +4,14 @@ import LoaderPanel from "../components/LoaderPanel";
 import LoaderButton from "../components/LoaderButton";
 import withLoadSave from "../components/LoadSave";
 import { FormControlLabel, SelectLabel } from "../components/FormControls";
-import { Button, Row, Col } from "react-bootstrap";
+import { Button, Row, Col, Table } from "react-bootstrap";
 import SaveNavbar from "../components/SaveNavbar";
 import { EDFormSection, EDFormBox } from "../components/EDDOM";
 import parse from "../utils/parse";
 import Select2 from 'react-select2-wrapper';
 import _ from 'lodash';
 import notify from "../utils/notify";
+import moment from "moment";
 
 const builtIn = ['Email', 'Opened', 'Clicked', 'Unsubscribed', 'Bounced', 'Complained', 'Soft Bounced'];
 
@@ -33,7 +34,25 @@ class ContactEdit extends Component {
     this.state = {
       automationId: '',
       isEnrolling: false,
+      emailHistory: null,
+      emailHistoryPage: 1,
+      isEmailHistoryLoading: false,
     };
+    this.emailHistoryRequest = 0;
+  }
+
+  componentDidMount() {
+    if (this.props.data && this.props.data.email) {
+      this.loadEmailHistory(1);
+    }
+  }
+
+  componentWillReceiveProps(nextProps) {
+    const currentEmail = this.props.data && this.props.data.email;
+    const nextEmail = nextProps.data && nextProps.data.email;
+    if (nextEmail && nextEmail !== currentEmail) {
+      this.loadEmailHistory(1, nextEmail);
+    }
   }
 
   handleChange = event => {
@@ -139,6 +158,131 @@ class ContactEdit extends Component {
     } finally {
       this.setState({isEnrolling: false});
     }
+  }
+
+  loadEmailHistory = async (page, email) => {
+    const contactEmail = email || (this.props.data && this.props.data.email);
+    if (!contactEmail) {
+      return;
+    }
+
+    const requestId = ++this.emailHistoryRequest;
+    this.setState({isEmailHistoryLoading: true, emailHistoryPage: page});
+    try {
+      const response = await axios.get('/api/contactdata/' + encodeURIComponent(contactEmail) + '/email-history', {
+        params: {page},
+      });
+      if (requestId === this.emailHistoryRequest) {
+        this.setState({emailHistory: response.data});
+      }
+    } catch (error) {
+      if (requestId === this.emailHistoryRequest) {
+        notify.show(errorMessage(error, 'Unable to load email history'), 'error');
+      }
+    } finally {
+      if (requestId === this.emailHistoryRequest) {
+        this.setState({isEmailHistoryLoading: false});
+      }
+    }
+  }
+
+  emailHistoryMaxPage() {
+    const history = this.state.emailHistory;
+    if (!history || !history.total) {
+      return 1;
+    }
+    return Math.ceil(history.total / history.page_size);
+  }
+
+  previousEmailHistoryPage = () => {
+    if (this.state.emailHistoryPage <= 1) {
+      return;
+    }
+    this.loadEmailHistory(this.state.emailHistoryPage - 1);
+  }
+
+  nextEmailHistoryPage = () => {
+    if (this.state.emailHistoryPage >= this.emailHistoryMaxPage()) {
+      return;
+    }
+    this.loadEmailHistory(this.state.emailHistoryPage + 1);
+  }
+
+  renderEmailHistory() {
+    const history = this.state.emailHistory;
+    const records = (history && history.records) || [];
+    const maxPage = this.emailHistoryMaxPage();
+
+    if (this.state.isEmailHistoryLoading && !history) {
+      return <p>Loading email history...</p>;
+    }
+
+    if (!records.length) {
+      return (
+        <div>
+          <p>No recent automation or transactional emails found for this contact.</p>
+          {
+            this.state.isEmailHistoryLoading &&
+            <p>Refreshing email history...</p>
+          }
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <Table responsive className="space15">
+          <thead>
+            <tr>
+              <th>Sent</th>
+              <th>Type</th>
+              <th>Name / Source</th>
+              <th>Subject</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              _.map(records, record =>
+                <tr key={record.id}>
+                  <td>{record.sent_at ? moment(record.sent_at).format('l LTS') : ''}</td>
+                  <td>{record.source_type}</td>
+                  <td>{record.source_name}</td>
+                  <td>{record.subject}</td>
+                  <td>{record.status}</td>
+                </tr>
+              )
+            }
+          </tbody>
+        </Table>
+        {
+          maxPage > 1 &&
+          <div className="form-inline space-bottom" style={{display: 'flex', gap: '16px', alignItems: 'center'}}>
+            <Button
+              type="button"
+              style={{width: '120px'}}
+              onClick={this.previousEmailHistoryPage}
+              disabled={this.state.isEmailHistoryLoading || this.state.emailHistoryPage <= 1}
+            >
+              Previous
+            </Button>
+            <span>Page {this.state.emailHistoryPage} of {maxPage}</span>
+            <Button
+              type="button"
+              style={{width: '120px'}}
+              onClick={this.nextEmailHistoryPage}
+              disabled={this.state.isEmailHistoryLoading || this.state.emailHistoryPage >= maxPage}
+            >
+              Next
+            </Button>
+          </div>
+        }
+        {
+          this.state.isEmailHistoryLoading &&
+          <p>Refreshing email history...</p>
+        }
+      </div>
+    );
   }
 
   render() {
@@ -269,6 +413,10 @@ class ContactEdit extends Component {
                 :
                   <p>No published or paused automations are available.</p>
               }
+            </EDFormBox>
+            <EDFormBox space>
+              <h4>Recent automation and transactional emails</h4>
+              {this.renderEmailHistory()}
             </EDFormBox>
           </EDFormSection>
         </LoaderPanel>

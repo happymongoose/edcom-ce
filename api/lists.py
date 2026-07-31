@@ -489,6 +489,167 @@ builtin_props = [
 ]
 
 
+def _iso_datetime(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat() + ("Z" if value.tzinfo is None else "")
+    return str(value)
+
+
+class ContactEmailHistory(object):
+
+    PAGE_SIZE = 10
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        page = max(req.get_param_as_int("page") or 1, 1)
+        offset = self.PAGE_SIZE * (page - 1)
+
+        contact_id = db.single(
+            f"""
+            select contact_id
+            from contacts."contacts_{cid}"
+            where email = %s
+            """,
+            email,
+        )
+        if contact_id is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found", description="Contact not found"
+            )
+
+        rows = db.execute(
+            """
+            with automation_sends as (
+                select
+                    'automation:' || sr.id as id,
+                    (sr.data->>'created')::timestamptz as sent_at,
+                    'automation' as source_type,
+                    coalesce(sr.data->>'automation_email_name', a.data->>'name', sr.automation_id) as source_name,
+                    coalesce(sr.data->>'subject', '') as subject,
+                    case
+                        when coalesce(sr.data->>'sent', '') = 'true' then 'sent'
+                        else coalesce(sr.data->>'status', '')
+                    end as status,
+                    jsonb_build_object(
+                        'automation_id', sr.automation_id,
+                        'automation_email_id', sr.data->>'automation_email_id',
+                        'enrolment_id', sr.enrolment_id,
+                        'node_id', sr.node_id,
+                        'step_run_id', sr.id,
+                        'published_revision', sr.data->'published_revision',
+                        'route_id', sr.data->>'route_id'
+                    ) as metadata
+                from automation_step_runs sr
+                left join automations a on a.cid = sr.cid and a.id = sr.automation_id
+                where sr.cid = %s
+                  and sr.contact_id = %s
+                  and sr.node_type = 'send_email'
+                  and coalesce(sr.data->>'sent', '') = 'true'
+                  and sr.data->>'created' is not null
+            ), transactional_sends as (
+                select
+                    'transactional:' || t.id as id,
+                    t.ts::timestamptz as sent_at,
+                    'transactional' as source_type,
+                    coalesce(t.data->>'tag', 'untagged') as source_name,
+                    coalesce(t.data->>'subject', '') as subject,
+                    coalesce(t.data->>'error', t.data->>'status', t.data->>'event', '') as status,
+                    jsonb_build_object(
+                        'transactional_send_id', t.id,
+                        'msgid', t.msgid,
+                        'tag', t.data->>'tag',
+                        'event', t.data->>'event',
+                        'route', t.data->>'route'
+                    ) as metadata
+                from txnsends t
+                where t.cid = %s
+                  and lower(coalesce(t.data->>'to', '')) = lower(%s)
+            ), combined as (
+                select * from automation_sends
+                union all
+                select * from transactional_sends
+            )
+            select id, sent_at, source_type, source_name, subject, status, metadata, count(*) over() as total
+            from combined
+            order by sent_at desc, id desc
+            limit %s
+            offset %s
+            """,
+            cid,
+            contact_id,
+            cid,
+            email,
+            self.PAGE_SIZE,
+            offset,
+        ).fetchall()
+
+        records = []
+        total = 0
+        for row in rows:
+            (
+                history_id,
+                sent_at,
+                source_type,
+                source_name,
+                subject,
+                status,
+                metadata,
+                total,
+            ) = row
+            records.append(
+                {
+                    "id": history_id,
+                    "sent_at": _iso_datetime(sent_at),
+                    "source_type": source_type,
+                    "source_name": source_name or "",
+                    "subject": subject or "",
+                    "status": status or "",
+                    "metadata": metadata or {},
+                }
+            )
+
+        if not rows:
+            total = db.single(
+                """
+                with automation_sends as (
+                    select sr.id
+                    from automation_step_runs sr
+                    where sr.cid = %s
+                      and sr.contact_id = %s
+                      and sr.node_type = 'send_email'
+                      and coalesce(sr.data->>'sent', '') = 'true'
+                      and sr.data->>'created' is not null
+                ), transactional_sends as (
+                    select t.id
+                    from txnsends t
+                    where t.cid = %s
+                      and lower(coalesce(t.data->>'to', '')) = lower(%s)
+                )
+                select count(*) from (
+                    select id from automation_sends
+                    union all
+                    select id from transactional_sends
+                ) combined
+                """,
+                cid,
+                contact_id,
+                cid,
+                email,
+            )
+
+        req.context["result"] = {
+            "records": records,
+            "page": page,
+            "page_size": self.PAGE_SIZE,
+            "total": total or 0,
+        }
+
+
 class ContactData(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
