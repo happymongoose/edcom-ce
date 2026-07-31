@@ -1256,6 +1256,9 @@ def _automation_email_sender(email_doc: JsonObj) -> tuple[str, str, str, str]:
 
 
 CLAIM_STALE_AFTER = timedelta(minutes=30)
+AUTOMATION_PROCESS_DEFAULT_LIMIT = 25
+AUTOMATION_PROCESS_MAX_LIMIT = 100
+AUTOMATION_PROCESS_ERROR_LIMIT = 100
 
 
 def _claim_clear_patch() -> JsonObj:
@@ -2696,6 +2699,773 @@ class AutomationHistory(object):
         }
 
 
+def _run_next_automation_enrolment(
+    db: DB,
+    cid: str,
+    id: str,
+    enrolment_id: str,
+    skip_wait: bool = False,
+) -> JsonObj:
+    automation = db.automations.get(id)
+    if automation is None:
+        raise falcon.HTTPForbidden()
+    if automation.get("status") == "paused":
+        raise falcon.HTTPBadRequest(
+            title="Automation is paused",
+            description="Resume the automation before running test steps.",
+        )
+
+    published = automation.get("published")
+    if not published:
+        raise falcon.HTTPBadRequest(
+            title="Automation is not published",
+            description="Automation execution uses the published workflow snapshot.",
+        )
+
+    now_dt = datetime.utcnow()
+    now = now_dt.isoformat() + "Z"
+    claim_token = shortuuid.uuid()
+    enrolment = _claim_run_enrolment(
+        db,
+        cid,
+        id,
+        enrolment_id,
+        claim_token,
+        now,
+        now_dt - CLAIM_STALE_AFTER,
+    )
+    original_status = _running_status(enrolment)
+    run_id = shortuuid.uuid()
+    run_inserted = False
+
+    try:
+        nodes = published.get("nodes") or []
+        current_node_id = enrolment.get("current_node_id")
+        node_index = None
+        for i, node in enumerate(nodes):
+            if node.get("id") == current_node_id:
+                node_index = i
+                break
+
+        if node_index is None:
+            raise falcon.HTTPBadRequest(
+                title="Current automation node is missing",
+                description="The enrolment current_node_id was not found in the published workflow.",
+            )
+
+        node = nodes[node_index]
+        node_type = node.get("type")
+        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
+            raise falcon.HTTPBadRequest(
+                title="Unsupported automation node",
+                description=(
+                    "%s nodes are not supported by manual execution yet. "
+                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
+                    % node_type
+                ),
+            )
+
+        if original_status == "waiting" and node_type != "wait_duration":
+            raise falcon.HTTPBadRequest(
+                title="Enrolment wait state is invalid",
+                description="Waiting enrolments must remain on a wait_duration node.",
+            )
+
+        if original_status == "waiting":
+            wake_at = enrolment.get("wake_at")
+            if not wake_at:
+                raise falcon.HTTPBadRequest(
+                    title="Waiting enrolment is missing wake_at",
+                    description="The waiting enrolment cannot continue without wake_at metadata.",
+                )
+            if now_dt < _parse_datetime(wake_at) and not skip_wait:
+                _release_run_claim(
+                    db,
+                    cid,
+                    id,
+                    enrolment_id,
+                    claim_token,
+                    "waiting",
+                    now,
+                )
+                raise falcon.HTTPBadRequest(
+                    title="Wait has not elapsed",
+                    description="This enrolment is waiting until %s." % wake_at,
+                )
+
+        run_data = {
+            "id": run_id,
+            "status": "running",
+            "node_label": node.get("label"),
+            "published_revision": automation.get("published_revision"),
+            "claim_token": claim_token,
+            "created": now,
+        }
+        _insert_step_run(
+            db,
+            cid,
+            id,
+            enrolment_id,
+            enrolment["contact_id"],
+            current_node_id,
+            node_type,
+            run_data,
+        )
+        run_inserted = True
+        success_data = {
+            "status": "succeeded",
+        }
+
+        if original_status == "waiting":
+            wake_at = enrolment.get("wake_at")
+            wait = enrolment.get("wait") or {}
+            success_data.update(
+                {
+                    "action": "wait_complete",
+                    "duration": wait.get("duration", node.get("duration")),
+                    "wake_at": wake_at,
+                    "skipped": skip_wait and now_dt < _parse_datetime(wake_at),
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "wake_at": None,
+                    "wait": None,
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "wake_at": None,
+                    "wait": None,
+                    "modified": now,
+                }
+        elif node_type == "add_tag":
+            tag = node.get("draft_tag")
+            if not tag:
+                raise falcon.HTTPBadRequest(
+                    title="Add tag node is missing tag configuration",
+                    description="The published add_tag node does not include a tag.",
+                )
+
+            db.execute(
+                """insert into alltags (cid, tag, added, count) values (%s, %s, now(), 0)
+                on conflict (cid, tag) do nothing""",
+                cid,
+                tag,
+            )
+            tagcounts = {}
+            contacts.add_tag(
+                db,
+                cid,
+                enrolment["contact_email"],
+                enrolment["contact_id"],
+                tag,
+                None,
+                {},
+                tagcounts,
+                [],
+            )
+            for tagname, cnt in tagcounts.items():
+                db.execute(
+                    "update alltags set count = count + %s where cid = %s and tag = %s",
+                    cnt,
+                    cid,
+                    tagname,
+                )
+
+            success_data["tag"] = tag
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "remove_tag":
+            tag = node.get("draft_tag")
+            if not tag:
+                raise falcon.HTTPBadRequest(
+                    title="Remove tag node is missing tag configuration",
+                    description="The published remove_tag node does not include a tag.",
+                )
+
+            tagcounts = {}
+            contacts.remove_tag(
+                db,
+                cid,
+                enrolment["contact_email"],
+                enrolment["contact_id"],
+                tag,
+                tagcounts,
+                [],
+            )
+            removed = bool(tagcounts.get(tag))
+            for tagname, cnt in tagcounts.items():
+                db.execute(
+                    "update alltags set count = count + %s where cid = %s and tag = %s",
+                    cnt,
+                    cid,
+                    tagname,
+                )
+            if tagcounts:
+                db.execute(
+                    "delete from alltags where cid = %s and count <= 0",
+                    cid,
+                )
+
+            success_data.update(
+                {
+                    "action": "remove_tag",
+                    "tag": tag,
+                    "removed": removed,
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "add_to_list":
+            list_id = node.get("list_id")
+            if not list_id:
+                raise falcon.HTTPBadRequest(
+                    title="Add to list node is missing list configuration",
+                    description="The published add_to_list node does not include a contact list.",
+                )
+
+            list_result = _add_contact_to_list(
+                db,
+                cid,
+                enrolment["contact_id"],
+                enrolment["contact_email"],
+                list_id,
+            )
+            success_data.update(
+                {
+                    "action": "add_to_list",
+                    "list_id": list_result["list_id"],
+                    "list_name": list_result.get("list_name"),
+                    "added": list_result["added"],
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "remove_from_list":
+            list_id = node.get("list_id")
+            if not list_id:
+                raise falcon.HTTPBadRequest(
+                    title="Remove from list node is missing list configuration",
+                    description="The published remove_from_list node does not include a contact list.",
+                )
+
+            list_result = _remove_contact_from_list(
+                db,
+                cid,
+                enrolment["contact_id"],
+                enrolment["contact_email"],
+                list_id,
+            )
+            success_data.update(
+                {
+                    "action": "remove_from_list",
+                    "list_id": list_result["list_id"],
+                    "list_name": list_result.get("list_name"),
+                    "removed": list_result["removed"],
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "wait_duration":
+            duration = node.get("duration") or {}
+            wake_at = _wake_at(now_dt, duration)
+            success_data.update(
+                {
+                    "status": "waiting",
+                    "action": "wait_start",
+                    "duration": duration,
+                    "wake_at": wake_at,
+                }
+            )
+            enrolment_update = {
+                "status": "waiting",
+                "current_node_id": current_node_id,
+                "wake_at": wake_at,
+                "wait": {
+                    "node_id": current_node_id,
+                    "duration": duration,
+                    "started_at": now,
+                    "wake_at": wake_at,
+                    "published_revision": automation.get("published_revision"),
+                },
+                "modified": now,
+            }
+        elif node_type == "if_has_tag":
+            tag = node.get("draft_tag")
+            if not tag:
+                raise falcon.HTTPBadRequest(
+                    title="If has tag node is missing tag configuration",
+                    description="The published if_has_tag node does not include a tag.",
+                )
+
+            result = _contact_has_tag(db, cid, enrolment["contact_id"], tag)
+            branch = "yes" if result else "no"
+            target_node_id = node.get("yes_node_id") if result else node.get("no_node_id")
+            if _node_by_id(nodes, target_node_id) is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation branch target is missing",
+                    description="The published if_has_tag %s target was not found in the published workflow." % branch,
+                )
+
+            success_data.update(
+                {
+                    "action": "branch",
+                    "tag": tag,
+                    "result": result,
+                    "branch": branch,
+                    "target_node_id": target_node_id,
+                }
+            )
+            enrolment_update = {
+                "status": "ready",
+                "current_node_id": target_node_id,
+                "modified": now,
+            }
+        elif node_type == "go_to":
+            target_node_id = node.get("target_node_id")
+            if _node_by_id(nodes, target_node_id) is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation go to target is missing",
+                    description="The published go_to target was not found in the published workflow.",
+                )
+
+            success_data.update(
+                {
+                    "action": "go_to",
+                    "target_node_id": target_node_id,
+                }
+            )
+            enrolment_update = {
+                "status": "ready",
+                "current_node_id": target_node_id,
+                "modified": now,
+            }
+        elif node_type == "send_email":
+            automation_email_id = node.get("automation_email_id")
+            automation_email = _automation_email_obj(
+                db.row(
+                    """
+                    select id, cid, automation_id, data
+                    from automation_emails
+                    where cid = %s and automation_id = %s and id = %s
+                    """,
+                    cid,
+                    id,
+                    automation_email_id,
+                )
+            )
+            if automation_email is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation email is missing",
+                    description="The published send_email node references an automation email that was not found.",
+                )
+
+            fromname, fromemail, returnpath, replyto = _automation_email_sender(automation_email)
+
+            route = _automation_execution_route(db, cid)
+
+            imagebucket = os.environ["s3_imagebucket"]
+            oldcid = db.get_cid()
+            db.set_cid(None)
+            try:
+                company = db.companies.get(cid)
+                parentcompany = db.companies.get(company["cid"]) if company else None
+                if parentcompany is not None:
+                    imagebucket = parentcompany.get("s3_imagebucket", imagebucket)
+            finally:
+                db.set_cid(oldcid)
+
+            html, _ = generate_html(db, automation_email, run_id, imagebucket)
+            subject = remove_newlines(automation_email["subject"])
+            fromdomain = ""
+            if "@" in returnpath:
+                fromdomain = returnpath.split("@")[-1].strip().lower()
+            elif "@" in fromemail:
+                fromdomain = fromemail.split("@")[-1].strip().lower()
+            fromaddr = email.utils.formataddr((fromname, fromemail))
+            recipient_email = enrolment["contact_email"]
+
+            try:
+                send_backend_mail(
+                    db,
+                    cid,
+                    route,
+                    html,
+                    fromaddr,
+                    returnpath,
+                    fromdomain,
+                    replyto,
+                    recipient_email,
+                    recipient_email,
+                    subject,
+                    campid=run_id,
+                    source_type="automation",
+                    source_id=id,
+                    source_ids={
+                        "automation_id": id,
+                        "automation_email_id": automation_email_id,
+                        "enrolment_id": enrolment_id,
+                        "node_id": current_node_id,
+                        "step_run_id": run_id,
+                        "published_revision": automation.get("published_revision"),
+                    },
+                    metadata={
+                        "automation_id": id,
+                        "automation_email_id": automation_email_id,
+                        "enrolment_id": enrolment_id,
+                        "node_id": current_node_id,
+                        "step_run_id": run_id,
+                        "published_revision": automation.get("published_revision"),
+                    },
+                )
+            except Exception as e:
+                log.warning("Error sending automation email: %s", e)
+                raise falcon.HTTPBadRequest(
+                    title="Error sending automation email",
+                    description="Error sending automation email: %s" % e,
+                )
+
+            success_data.update(
+                {
+                    "action": "send_email",
+                    "automation_email_id": automation_email_id,
+                    "automation_email_name": automation_email.get("name"),
+                    "subject": subject,
+                    "recipient_email": recipient_email,
+                    "route_id": route["id"],
+                    "sent": True,
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        else:
+            enrolment_update = {
+                "status": "exited",
+                "modified": now,
+            }
+    except falcon.HTTPError as e:
+        fail_now = _utc_now()
+        if run_inserted:
+            _patch_step_run(
+                db,
+                cid,
+                run_id,
+                {
+                    "status": "failed",
+                    "error": e.description or e.title,
+                    "failed_at": fail_now,
+                },
+            )
+        _release_run_claim(
+            db,
+            cid,
+            id,
+            enrolment_id,
+            claim_token,
+            original_status,
+            fail_now,
+            {
+                "last_error": {
+                    "title": e.title,
+                    "description": e.description,
+                    "at": fail_now,
+                },
+            },
+        )
+        raise
+
+    _patch_step_run(db, cid, run_id, success_data)
+    _advance_claimed_enrolment(
+        db,
+        cid,
+        id,
+        enrolment_id,
+        claim_token,
+        enrolment_update,
+    )
+
+    return {
+        "enrolment": _enrolment_obj(
+            db.row(
+                """
+                select id, cid, automation_id, contact_id, contact_email, data
+                from automation_enrolments
+                where cid = %s and automation_id = %s and id = %s
+                """,
+                cid,
+                id,
+                enrolment_id,
+            )
+        ),
+        "step_run": _step_run_obj(
+            db.row(
+                """
+                select id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data
+                from automation_step_runs
+                where cid = %s and id = %s
+                """,
+                cid,
+                run_id,
+            )
+        ),
+    }
+
+
+def _automation_process_limit(value: object) -> int:
+    if value is None:
+        return AUTOMATION_PROCESS_DEFAULT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation process limit",
+            description="limit must be a positive integer.",
+        )
+    if limit < 1:
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation process limit",
+            description="limit must be at least 1.",
+        )
+    return min(limit, AUTOMATION_PROCESS_MAX_LIMIT)
+
+
+def _eligible_automation_enrolments(
+    db: DB,
+    cid: str,
+    limit: int,
+    automation_id: str | None = None,
+) -> List[JsonObj]:
+    now = datetime.utcnow()
+    params: List[object] = [cid, now, limit]
+    automation_filter = ""
+    if automation_id:
+        automation_filter = "and e.automation_id = %s"
+        params = [cid, automation_id, now, limit]
+
+    return [
+        {
+            "automation_id": automation_id,
+            "enrolment_id": enrolment_id,
+            "contact_email": contact_email,
+            "status": status,
+        }
+        for automation_id, enrolment_id, contact_email, status in db.execute(
+            f"""
+            select e.automation_id, e.id, e.contact_email, e.data->>'status'
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+            where e.cid = %s
+                {automation_filter}
+                and a.data->'published' is not null
+                and coalesce(a.data->>'status', '') <> 'paused'
+                and (
+                    e.data->>'status' = 'ready'
+                    or (
+                        e.data->>'status' = 'waiting'
+                        and nullif(e.data->>'wake_at', '')::timestamptz <= %s
+                    )
+                )
+            order by
+                coalesce(
+                    nullif(e.data->>'modified', '')::timestamptz,
+                    nullif(e.data->>'created', '')::timestamptz
+                ),
+                e.id
+            limit %s
+            """,
+            *params,
+        )
+    ]
+
+
+def _running_automation_enrolment_count(
+    db: DB,
+    cid: str,
+    automation_id: str | None = None,
+) -> int:
+    params: List[object] = [cid]
+    automation_filter = ""
+    if automation_id:
+        automation_filter = "and e.automation_id = %s"
+        params.append(automation_id)
+
+    return int(
+        db.single(
+            f"""
+            select count(*)
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+            where e.cid = %s
+                {automation_filter}
+                and a.data->'published' is not null
+                and coalesce(a.data->>'status', '') <> 'paused'
+                and e.data->>'status' = 'running'
+            """,
+            *params,
+        )
+        or 0
+    )
+
+
+def _process_eligible_automation_enrolments(
+    db: DB,
+    cid: str,
+    limit: int,
+    automation_id: str | None = None,
+) -> JsonObj:
+    result: JsonObj = {
+        "processed": 0,
+        "succeeded": 0,
+        "waiting": 0,
+        "completed": 0,
+        "exited": 0,
+        "failed": 0,
+        "skipped_running": _running_automation_enrolment_count(db, cid, automation_id),
+        "errors": [],
+    }
+
+    for candidate in _eligible_automation_enrolments(db, cid, limit, automation_id):
+        result["processed"] += 1
+        try:
+            run_result = _run_next_automation_enrolment(
+                db,
+                cid,
+                candidate["automation_id"],
+                candidate["enrolment_id"],
+                False,
+            )
+        except falcon.HTTPBadRequest as e:
+            if e.title == "Automation enrolment is already running":
+                result["skipped_running"] += 1
+                continue
+            result["failed"] += 1
+            if len(result["errors"]) < AUTOMATION_PROCESS_ERROR_LIMIT:
+                result["errors"].append(
+                    {
+                        "automation_id": candidate["automation_id"],
+                        "enrolment_id": candidate["enrolment_id"],
+                        "contact_email": candidate["contact_email"],
+                        "title": e.title,
+                        "description": e.description,
+                    }
+                )
+            continue
+        except falcon.HTTPError as e:
+            result["failed"] += 1
+            if len(result["errors"]) < AUTOMATION_PROCESS_ERROR_LIMIT:
+                result["errors"].append(
+                    {
+                        "automation_id": candidate["automation_id"],
+                        "enrolment_id": candidate["enrolment_id"],
+                        "contact_email": candidate["contact_email"],
+                        "title": e.title,
+                        "description": e.description,
+                    }
+                )
+            continue
+
+        result["succeeded"] += 1
+        status = (run_result.get("enrolment") or {}).get("status")
+        if status == "waiting":
+            result["waiting"] += 1
+        elif status == "completed":
+            result["completed"] += 1
+        elif status == "exited":
+            result["exited"] += 1
+
+    return result
+
+
+class AutomationEnrolmentProcessor(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        doc = req.get_media(default_when_empty={}) or {}
+        if not isinstance(doc, dict):
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+
+        limit = _automation_process_limit(doc.get("limit"))
+        automation_id = doc.get("automation_id")
+        if automation_id is not None and not isinstance(automation_id, str):
+            raise falcon.HTTPBadRequest(
+                title="Invalid automation_id",
+                description="automation_id must be a string.",
+            )
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        if automation_id and db.automations.get(automation_id) is None:
+            raise falcon.HTTPForbidden()
+
+        req.context["result"] = _process_eligible_automation_enrolments(
+            db,
+            cid,
+            limit,
+            automation_id,
+        )
+
+
 class AutomationEnrolmentRunNext(object):
 
     def on_post(
@@ -2712,561 +3482,10 @@ class AutomationEnrolmentRunNext(object):
 
         db = req.context["db"]
         cid = db.get_cid()
-        automation = db.automations.get(id)
-        if automation is None:
-            raise falcon.HTTPForbidden()
-        if automation.get("status") == "paused":
-            raise falcon.HTTPBadRequest(
-                title="Automation is paused",
-                description="Resume the automation before running test steps.",
-            )
-
-        published = automation.get("published")
-        if not published:
-            raise falcon.HTTPBadRequest(
-                title="Automation is not published",
-                description="Automation execution uses the published workflow snapshot.",
-            )
-
-        now_dt = datetime.utcnow()
-        now = now_dt.isoformat() + "Z"
-        claim_token = shortuuid.uuid()
-        enrolment = _claim_run_enrolment(
+        req.context["result"] = _run_next_automation_enrolment(
             db,
             cid,
             id,
             enrolment_id,
-            claim_token,
-            now,
-            now_dt - CLAIM_STALE_AFTER,
+            skip_wait,
         )
-        original_status = _running_status(enrolment)
-        run_id = shortuuid.uuid()
-        run_inserted = False
-
-        try:
-            nodes = published.get("nodes") or []
-            current_node_id = enrolment.get("current_node_id")
-            node_index = None
-            for i, node in enumerate(nodes):
-                if node.get("id") == current_node_id:
-                    node_index = i
-                    break
-
-            if node_index is None:
-                raise falcon.HTTPBadRequest(
-                    title="Current automation node is missing",
-                    description="The enrolment current_node_id was not found in the published workflow.",
-                )
-
-            node = nodes[node_index]
-            node_type = node.get("type")
-            if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
-                raise falcon.HTTPBadRequest(
-                    title="Unsupported automation node",
-                    description=(
-                        "%s nodes are not supported by manual execution yet. "
-                        "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
-                        % node_type
-                    ),
-                )
-
-            if original_status == "waiting" and node_type != "wait_duration":
-                raise falcon.HTTPBadRequest(
-                    title="Enrolment wait state is invalid",
-                    description="Waiting enrolments must remain on a wait_duration node.",
-                )
-
-            if original_status == "waiting":
-                wake_at = enrolment.get("wake_at")
-                if not wake_at:
-                    raise falcon.HTTPBadRequest(
-                        title="Waiting enrolment is missing wake_at",
-                        description="The waiting enrolment cannot continue without wake_at metadata.",
-                    )
-                if now_dt < _parse_datetime(wake_at) and not skip_wait:
-                    _release_run_claim(
-                        db,
-                        cid,
-                        id,
-                        enrolment_id,
-                        claim_token,
-                        "waiting",
-                        now,
-                    )
-                    raise falcon.HTTPBadRequest(
-                        title="Wait has not elapsed",
-                        description="This enrolment is waiting until %s." % wake_at,
-                    )
-
-            run_data = {
-                "id": run_id,
-                "status": "running",
-                "node_label": node.get("label"),
-                "published_revision": automation.get("published_revision"),
-                "claim_token": claim_token,
-                "created": now,
-            }
-            _insert_step_run(
-                db,
-                cid,
-                id,
-                enrolment_id,
-                enrolment["contact_id"],
-                current_node_id,
-                node_type,
-                run_data,
-            )
-            run_inserted = True
-            success_data = {
-                "status": "succeeded",
-            }
-
-            if original_status == "waiting":
-                wake_at = enrolment.get("wake_at")
-                wait = enrolment.get("wait") or {}
-                success_data.update(
-                    {
-                        "action": "wait_complete",
-                        "duration": wait.get("duration", node.get("duration")),
-                        "wake_at": wake_at,
-                        "skipped": skip_wait and now_dt < _parse_datetime(wake_at),
-                    }
-                )
-
-                if node_index + 1 < len(nodes):
-                    enrolment_update = {
-                        "status": "ready",
-                        "current_node_id": nodes[node_index + 1]["id"],
-                        "wake_at": None,
-                        "wait": None,
-                        "modified": now,
-                    }
-                else:
-                    enrolment_update = {
-                        "status": "completed",
-                        "wake_at": None,
-                        "wait": None,
-                        "modified": now,
-                    }
-            elif node_type == "add_tag":
-                tag = node.get("draft_tag")
-                if not tag:
-                    raise falcon.HTTPBadRequest(
-                        title="Add tag node is missing tag configuration",
-                        description="The published add_tag node does not include a tag.",
-                    )
-
-                db.execute(
-                    """insert into alltags (cid, tag, added, count) values (%s, %s, now(), 0)
-                    on conflict (cid, tag) do nothing""",
-                    cid,
-                    tag,
-                )
-                tagcounts = {}
-                contacts.add_tag(
-                    db,
-                    cid,
-                    enrolment["contact_email"],
-                    enrolment["contact_id"],
-                    tag,
-                    None,
-                    {},
-                    tagcounts,
-                    [],
-                )
-                for tagname, cnt in tagcounts.items():
-                    db.execute(
-                        "update alltags set count = count + %s where cid = %s and tag = %s",
-                        cnt,
-                        cid,
-                        tagname,
-                    )
-
-                success_data["tag"] = tag
-
-                if node_index + 1 < len(nodes):
-                    enrolment_update = {
-                        "status": "ready",
-                        "current_node_id": nodes[node_index + 1]["id"],
-                        "modified": now,
-                    }
-                else:
-                    enrolment_update = {
-                        "status": "completed",
-                        "modified": now,
-                    }
-            elif node_type == "remove_tag":
-                tag = node.get("draft_tag")
-                if not tag:
-                    raise falcon.HTTPBadRequest(
-                        title="Remove tag node is missing tag configuration",
-                        description="The published remove_tag node does not include a tag.",
-                    )
-
-                tagcounts = {}
-                contacts.remove_tag(
-                    db,
-                    cid,
-                    enrolment["contact_email"],
-                    enrolment["contact_id"],
-                    tag,
-                    tagcounts,
-                    [],
-                )
-                removed = bool(tagcounts.get(tag))
-                for tagname, cnt in tagcounts.items():
-                    db.execute(
-                        "update alltags set count = count + %s where cid = %s and tag = %s",
-                        cnt,
-                        cid,
-                        tagname,
-                    )
-                if tagcounts:
-                    db.execute(
-                        "delete from alltags where cid = %s and count <= 0",
-                        cid,
-                    )
-
-                success_data.update(
-                    {
-                        "action": "remove_tag",
-                        "tag": tag,
-                        "removed": removed,
-                    }
-                )
-
-                if node_index + 1 < len(nodes):
-                    enrolment_update = {
-                        "status": "ready",
-                        "current_node_id": nodes[node_index + 1]["id"],
-                        "modified": now,
-                    }
-                else:
-                    enrolment_update = {
-                        "status": "completed",
-                        "modified": now,
-                    }
-            elif node_type == "add_to_list":
-                list_id = node.get("list_id")
-                if not list_id:
-                    raise falcon.HTTPBadRequest(
-                        title="Add to list node is missing list configuration",
-                        description="The published add_to_list node does not include a contact list.",
-                    )
-
-                list_result = _add_contact_to_list(
-                    db,
-                    cid,
-                    enrolment["contact_id"],
-                    enrolment["contact_email"],
-                    list_id,
-                )
-                success_data.update(
-                    {
-                        "action": "add_to_list",
-                        "list_id": list_result["list_id"],
-                        "list_name": list_result.get("list_name"),
-                        "added": list_result["added"],
-                    }
-                )
-
-                if node_index + 1 < len(nodes):
-                    enrolment_update = {
-                        "status": "ready",
-                        "current_node_id": nodes[node_index + 1]["id"],
-                        "modified": now,
-                    }
-                else:
-                    enrolment_update = {
-                        "status": "completed",
-                        "modified": now,
-                    }
-            elif node_type == "remove_from_list":
-                list_id = node.get("list_id")
-                if not list_id:
-                    raise falcon.HTTPBadRequest(
-                        title="Remove from list node is missing list configuration",
-                        description="The published remove_from_list node does not include a contact list.",
-                    )
-
-                list_result = _remove_contact_from_list(
-                    db,
-                    cid,
-                    enrolment["contact_id"],
-                    enrolment["contact_email"],
-                    list_id,
-                )
-                success_data.update(
-                    {
-                        "action": "remove_from_list",
-                        "list_id": list_result["list_id"],
-                        "list_name": list_result.get("list_name"),
-                        "removed": list_result["removed"],
-                    }
-                )
-
-                if node_index + 1 < len(nodes):
-                    enrolment_update = {
-                        "status": "ready",
-                        "current_node_id": nodes[node_index + 1]["id"],
-                        "modified": now,
-                    }
-                else:
-                    enrolment_update = {
-                        "status": "completed",
-                        "modified": now,
-                    }
-            elif node_type == "wait_duration":
-                duration = node.get("duration") or {}
-                wake_at = _wake_at(now_dt, duration)
-                success_data.update(
-                    {
-                        "status": "waiting",
-                        "action": "wait_start",
-                        "duration": duration,
-                        "wake_at": wake_at,
-                    }
-                )
-                enrolment_update = {
-                    "status": "waiting",
-                    "current_node_id": current_node_id,
-                    "wake_at": wake_at,
-                    "wait": {
-                        "node_id": current_node_id,
-                        "duration": duration,
-                        "started_at": now,
-                        "wake_at": wake_at,
-                        "published_revision": automation.get("published_revision"),
-                    },
-                    "modified": now,
-                }
-            elif node_type == "if_has_tag":
-                tag = node.get("draft_tag")
-                if not tag:
-                    raise falcon.HTTPBadRequest(
-                        title="If has tag node is missing tag configuration",
-                        description="The published if_has_tag node does not include a tag.",
-                    )
-
-                result = _contact_has_tag(db, cid, enrolment["contact_id"], tag)
-                branch = "yes" if result else "no"
-                target_node_id = node.get("yes_node_id") if result else node.get("no_node_id")
-                if _node_by_id(nodes, target_node_id) is None:
-                    raise falcon.HTTPBadRequest(
-                        title="Automation branch target is missing",
-                        description="The published if_has_tag %s target was not found in the published workflow." % branch,
-                    )
-
-                success_data.update(
-                    {
-                        "action": "branch",
-                        "tag": tag,
-                        "result": result,
-                        "branch": branch,
-                        "target_node_id": target_node_id,
-                    }
-                )
-                enrolment_update = {
-                    "status": "ready",
-                    "current_node_id": target_node_id,
-                    "modified": now,
-                }
-            elif node_type == "go_to":
-                target_node_id = node.get("target_node_id")
-                if _node_by_id(nodes, target_node_id) is None:
-                    raise falcon.HTTPBadRequest(
-                        title="Automation go to target is missing",
-                        description="The published go_to target was not found in the published workflow.",
-                    )
-
-                success_data.update(
-                    {
-                        "action": "go_to",
-                        "target_node_id": target_node_id,
-                    }
-                )
-                enrolment_update = {
-                    "status": "ready",
-                    "current_node_id": target_node_id,
-                    "modified": now,
-                }
-            elif node_type == "send_email":
-                automation_email_id = node.get("automation_email_id")
-                automation_email = _automation_email_obj(
-                    db.row(
-                        """
-                        select id, cid, automation_id, data
-                        from automation_emails
-                        where cid = %s and automation_id = %s and id = %s
-                        """,
-                        cid,
-                        id,
-                        automation_email_id,
-                    )
-                )
-                if automation_email is None:
-                    raise falcon.HTTPBadRequest(
-                        title="Automation email is missing",
-                        description="The published send_email node references an automation email that was not found.",
-                    )
-
-                fromname, fromemail, returnpath, replyto = _automation_email_sender(automation_email)
-
-                route = _automation_execution_route(db, cid)
-
-                imagebucket = os.environ["s3_imagebucket"]
-                oldcid = db.get_cid()
-                db.set_cid(None)
-                try:
-                    company = db.companies.get(cid)
-                    parentcompany = db.companies.get(company["cid"]) if company else None
-                    if parentcompany is not None:
-                        imagebucket = parentcompany.get("s3_imagebucket", imagebucket)
-                finally:
-                    db.set_cid(oldcid)
-
-                html, _ = generate_html(db, automation_email, run_id, imagebucket)
-                subject = remove_newlines(automation_email["subject"])
-                fromdomain = ""
-                if "@" in returnpath:
-                    fromdomain = returnpath.split("@")[-1].strip().lower()
-                elif "@" in fromemail:
-                    fromdomain = fromemail.split("@")[-1].strip().lower()
-                fromaddr = email.utils.formataddr((fromname, fromemail))
-                recipient_email = enrolment["contact_email"]
-
-                try:
-                    send_backend_mail(
-                        db,
-                        cid,
-                        route,
-                        html,
-                        fromaddr,
-                        returnpath,
-                        fromdomain,
-                        replyto,
-                        recipient_email,
-                        recipient_email,
-                        subject,
-                        campid=run_id,
-                        source_type="automation",
-                        source_id=id,
-                        source_ids={
-                            "automation_id": id,
-                            "automation_email_id": automation_email_id,
-                            "enrolment_id": enrolment_id,
-                            "node_id": current_node_id,
-                            "step_run_id": run_id,
-                            "published_revision": automation.get("published_revision"),
-                        },
-                        metadata={
-                            "automation_id": id,
-                            "automation_email_id": automation_email_id,
-                            "enrolment_id": enrolment_id,
-                            "node_id": current_node_id,
-                            "step_run_id": run_id,
-                            "published_revision": automation.get("published_revision"),
-                        },
-                    )
-                except Exception as e:
-                    log.warning("Error sending automation email: %s", e)
-                    raise falcon.HTTPBadRequest(
-                        title="Error sending automation email",
-                        description="Error sending automation email: %s" % e,
-                    )
-
-                success_data.update(
-                    {
-                        "action": "send_email",
-                        "automation_email_id": automation_email_id,
-                        "automation_email_name": automation_email.get("name"),
-                        "subject": subject,
-                        "recipient_email": recipient_email,
-                        "route_id": route["id"],
-                        "sent": True,
-                    }
-                )
-
-                if node_index + 1 < len(nodes):
-                    enrolment_update = {
-                        "status": "ready",
-                        "current_node_id": nodes[node_index + 1]["id"],
-                        "modified": now,
-                    }
-                else:
-                    enrolment_update = {
-                        "status": "completed",
-                        "modified": now,
-                    }
-            else:
-                enrolment_update = {
-                    "status": "exited",
-                    "modified": now,
-                }
-        except falcon.HTTPError as e:
-            fail_now = _utc_now()
-            if run_inserted:
-                _patch_step_run(
-                    db,
-                    cid,
-                    run_id,
-                    {
-                        "status": "failed",
-                        "error": e.description or e.title,
-                        "failed_at": fail_now,
-                    },
-                )
-            _release_run_claim(
-                db,
-                cid,
-                id,
-                enrolment_id,
-                claim_token,
-                original_status,
-                fail_now,
-                {
-                    "last_error": {
-                        "title": e.title,
-                        "description": e.description,
-                        "at": fail_now,
-                    },
-                },
-            )
-            raise
-
-        _patch_step_run(db, cid, run_id, success_data)
-        _advance_claimed_enrolment(
-            db,
-            cid,
-            id,
-            enrolment_id,
-            claim_token,
-            enrolment_update,
-        )
-
-        req.context["result"] = {
-            "enrolment": _enrolment_obj(
-                db.row(
-                    """
-                    select id, cid, automation_id, contact_id, contact_email, data
-                    from automation_enrolments
-                    where cid = %s and automation_id = %s and id = %s
-                    """,
-                    cid,
-                    id,
-                    enrolment_id,
-                )
-            ),
-            "step_run": _step_run_obj(
-                db.row(
-                    """
-                    select id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data
-                    from automation_step_runs
-                    where cid = %s and id = %s
-                    """,
-                    cid,
-                    run_id,
-                )
-            ),
-        }

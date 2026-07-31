@@ -350,6 +350,25 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         )
 
+    def process_enrolments(self, **doc):
+        return self.simulate_post(
+            "/api/automation-enrolments/process",
+            json=doc,
+            headers=self.headers(),
+        )
+
+    def patch_enrolment_data(self, enrolment_id, data):
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where id = %s and cid = %s
+            """,
+            data,
+            enrolment_id,
+            self.user_cookie["cid"],
+        )
+
     def has_tag(self, contact_id, tag):
         return bool(
             self.db.single(
@@ -1932,3 +1951,263 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(self.step_runs(automation["id"], second_enrolment["id"]), [])
 
         self.cleanup(automation["id"])
+
+    def test_processor_processes_ready_enrolment_one_node_only(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add first tag",
+                    "draft_tag": "processor-first",
+                },
+                {
+                    "id": "node_add_tag_2",
+                    "type": "add_tag",
+                    "label": "Add second tag",
+                    "draft_tag": "processor-second",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+        self.assertEqual(result.json["succeeded"], 1)
+        self.assertTrue(self.has_tag(contact_id, "processor-first"))
+        self.assertFalse(self.has_tag(contact_id, "processor-second"))
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["current_node_id"], "node_add_tag_2")
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_processor_processes_elapsed_waiting_enrolment(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
+        enrolment = self.enrol(automation["id"], email)
+        started = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(started.status_code, 200)
+        past = (datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z"
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "wake_at": past,
+                "wait": {
+                    "node_id": "node_wait_1",
+                    "duration": {"days": 0, "hours": 0, "minutes": 5},
+                    "started_at": started.json["enrolment"]["wait"]["started_at"],
+                    "wake_at": past,
+                    "published_revision": automation["published_revision"],
+                },
+            },
+        )
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+        self.assertEqual(result.json["succeeded"], 1)
+        self.assertEqual(result.json["waiting"], 0)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["current_node_id"], "node_exit_1")
+        self.assert_claim_cleared(data)
+
+        self.cleanup(automation["id"])
+
+    def test_processor_does_not_select_non_elapsed_waiting_enrolment(self):
+        email, _ = self.create_contact()
+        automation = self.create_wait_automation()
+        enrolment = self.enrol(automation["id"], email)
+        started = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(started.status_code, 200)
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 0)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "waiting")
+        self.assertEqual(data["wake_at"], started.json["enrolment"]["wake_at"])
+
+        self.cleanup(automation["id"])
+
+    def test_processor_excludes_ineligible_statuses_and_paused_automations(self):
+        statuses = ["held", "paused_ready", "paused_waiting", "completed", "exited", "cancelled", "failed"]
+        automation = self.create_automation(tag="processor-ineligible")
+        for status in statuses:
+            email, _ = self.create_contact()
+            enrolment = self.enrol(automation["id"], email)
+            self.patch_enrolment_data(enrolment["id"], {"status": status})
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 0)
+
+        paused_email, _ = self.create_contact()
+        paused_automation = self.create_automation(tag="processor-paused-automation")
+        self.enrol(paused_automation["id"], paused_email)
+        paused = self.simulate_post(
+            "/api/automations/%s/pause" % paused_automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(paused.status_code, 200, paused.text)
+
+        paused_result = self.process_enrolments(automation_id=paused_automation["id"])
+
+        self.assertEqual(paused_result.status_code, 200, paused_result.text)
+        self.assertEqual(paused_result.json["processed"], 0)
+
+        self.cleanup(automation["id"], paused_automation["id"])
+
+    def test_processor_counts_running_enrolments_without_claiming_them(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(tag="processor-running")
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "status": "running",
+                "running_status": "ready",
+                "claim_token": "test-claim",
+                "claimed_at": datetime.utcnow().isoformat() + "Z",
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+        )
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 0)
+        self.assertEqual(result.json["skipped_running"], 1)
+        self.assertEqual(self.enrolment_data(enrolment["id"])["status"], "running")
+
+        self.cleanup(automation["id"])
+
+    def test_processor_continues_after_one_enrolment_fails(self):
+        bad_email, _ = self.create_contact()
+        good_email, good_contact_id = self.create_contact()
+        automation = self.create_automation(tag="processor-good")
+        bad_enrolment = self.enrol(automation["id"], bad_email)
+        self.enrol(automation["id"], good_email)
+        self.patch_enrolment_data(bad_enrolment["id"], {"current_node_id": "missing-node"})
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 2)
+        self.assertEqual(result.json["succeeded"], 1)
+        self.assertEqual(result.json["failed"], 1)
+        self.assertTrue(result.json["errors"])
+        self.assertTrue(self.has_tag(good_contact_id, "processor-good"))
+
+        self.cleanup(automation["id"])
+
+    def test_processor_enforces_batch_limit(self):
+        automation = self.create_automation(tag="processor-limit")
+        for i in range(2):
+            email, _ = self.create_contact()
+            self.enrol(automation["id"], email)
+
+        result = self.process_enrolments(automation_id=automation["id"], limit=1)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+
+        self.cleanup(automation["id"])
+
+    def test_processor_is_current_account_scoped(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(tag="processor-scope")
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            "update automation_enrolments set cid = %s where id = %s",
+            "other-account-cid",
+            enrolment["id"],
+        )
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 0)
+        self.db.execute(
+            "delete from automation_enrolments where id = %s and cid = %s",
+            enrolment["id"],
+            "other-account-cid",
+        )
+        self.cleanup(automation["id"])
+
+    def test_processor_send_email_uses_debug_path_and_does_not_auto_loop(self):
+        route_id = self.assign_single_debug_route()
+        email, contact_id = self.create_contact()
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_processor_send_%s" % suffix},
+        )
+        automation_email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Processor email",
+                "subject": "Processor subject %s" % suffix,
+                "rawText": "<p>Processor body %s</p>" % suffix,
+                "fromname": "Automation Sender",
+                "returnpath": "automation-sender@example.com",
+            },
+        )
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(
+                nodes=[
+                    {
+                        "id": "node_send_email_1",
+                        "type": "send_email",
+                        "label": "Send email",
+                        "automation_email_id": automation_email["id"],
+                    },
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add after send",
+                        "draft_tag": "processor-send-finished",
+                    },
+                ],
+            ),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+        enrolment = self.enrol(published["id"], email)
+
+        first = self.process_enrolments(automation_id=published["id"])
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json["processed"], 1)
+        self.assertEqual(first.json["succeeded"], 1)
+        self.assertFalse(self.has_tag(contact_id, "processor-send-finished"))
+        first_data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(first_data["status"], "ready")
+        self.assertEqual(first_data["current_node_id"], "node_add_tag_1")
+        logs = self.debug_email_logs(published["id"])
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][2]["recipient_email"], email)
+        self.assertEqual(logs[0][2]["route_id"], route_id)
+        self.assertEqual(logs[0][2]["source_ids"]["automation_id"], published["id"])
+
+        second = self.process_enrolments(automation_id=published["id"])
+
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json["processed"], 1)
+        self.assertTrue(self.has_tag(contact_id, "processor-send-finished"))
+        self.assertEqual(len(self.debug_email_logs(published["id"])), 1)
+        self.assertEqual(self.enrolment_data(enrolment["id"])["status"], "completed")
+
+        self.cleanup(published["id"])
