@@ -125,6 +125,15 @@ class TestAutomationExecution(test_base.TestBase):
         )
         return email, contact_id
 
+    def create_empty_list(self, name=None):
+        suffix = self.unique()
+        lst = self.user_post(
+            "/api/lists",
+            json={"name": name or "automation_execution_empty_%s" % suffix},
+        )
+        self.created_list_ids.append(lst["id"])
+        return lst
+
     def workflow(self, tag="onboarding", nodes=None, reentry=None):
         if nodes is None:
             nodes = [
@@ -370,6 +379,48 @@ class TestAutomationExecution(test_base.TestBase):
             "select count from alltags where cid = %s and tag = %s",
             self.user_cookie["cid"],
             tag,
+        )
+
+    def contact_list_ids(self, contact_id):
+        return [
+            row[0]
+            for row in self.db.execute(
+                f"""select list_id from contacts."contact_lists_{self.user_cookie['cid']}"
+                where contact_id = %s order by list_id""",
+                contact_id,
+            )
+        ]
+
+    def is_in_list(self, contact_id, list_id):
+        return bool(
+            self.db.single(
+                f"""select contact_id from contacts."contact_lists_{self.user_cookie['cid']}"
+                where contact_id = %s and list_id = %s""",
+                contact_id,
+                list_id,
+            )
+        )
+
+    def list_count(self, list_id):
+        return self.db.single(
+            "select coalesce((data->>'count')::int, 0) from lists where id = %s",
+            list_id,
+        )
+
+    def list_domain_count(self, list_id, domain="example.com"):
+        return self.db.single(
+            "select count from list_domains where list_id = %s and domain = %s",
+            list_id,
+            domain,
+        )
+
+    def contact_exists(self, contact_id):
+        return bool(
+            self.db.single(
+                f"""select contact_id from contacts."contacts_{self.user_cookie['cid']}"
+                where contact_id = %s""",
+                contact_id,
+            )
         )
 
     def step_runs(self, automation_id, enrolment_id):
@@ -665,6 +716,264 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["enrolment"]["status"], "ready")
         self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
         self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_add_to_list_adds_membership_and_updates_count(self):
+        email, contact_id = self.create_contact()
+        target_list = self.create_empty_list()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_to_list_1",
+                    "type": "add_to_list",
+                    "label": "Add to target list",
+                    "list_id": target_list["id"],
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(self.is_in_list(contact_id, target_list["id"]))
+        self.assertEqual(self.list_count(target_list["id"]), 1)
+        self.assertEqual(self.list_domain_count(target_list["id"]), 1)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "add_to_list")
+        self.assertEqual(result.json["step_run"]["action"], "add_to_list")
+        self.assertEqual(result.json["step_run"]["list_id"], target_list["id"])
+        self.assertEqual(result.json["step_run"]["list_name"], target_list["name"])
+        self.assertEqual(result.json["step_run"]["added"], True)
+
+        self.cleanup(automation["id"])
+
+    def test_add_to_list_when_already_present_succeeds_without_count_change(self):
+        email, contact_id = self.create_contact()
+        existing_list_id = self.contact_list_ids(contact_id)[0]
+        self.assertEqual(self.list_count(existing_list_id), 1)
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_to_list_1",
+                    "type": "add_to_list",
+                    "label": "Add to existing list",
+                    "list_id": existing_list_id,
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(self.is_in_list(contact_id, existing_list_id))
+        self.assertEqual(self.list_count(existing_list_id), 1)
+        self.assertEqual(result.json["step_run"]["node_type"], "add_to_list")
+        self.assertEqual(result.json["step_run"]["added"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_remove_from_list_removes_membership_and_updates_count(self):
+        email, contact_id = self.create_contact()
+        existing_list_id = self.contact_list_ids(contact_id)[0]
+        self.assertEqual(self.list_count(existing_list_id), 1)
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_remove_from_list_1",
+                    "type": "remove_from_list",
+                    "label": "Remove from source list",
+                    "list_id": existing_list_id,
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(self.is_in_list(contact_id, existing_list_id))
+        self.assertTrue(self.contact_exists(contact_id))
+        self.assertEqual(self.list_count(existing_list_id), 0)
+        self.assertIsNone(self.list_domain_count(existing_list_id))
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "remove_from_list")
+        self.assertEqual(result.json["step_run"]["action"], "remove_from_list")
+        self.assertEqual(result.json["step_run"]["list_id"], existing_list_id)
+        self.assertEqual(result.json["step_run"]["removed"], True)
+
+        self.cleanup(automation["id"])
+
+    def test_remove_from_list_when_absent_succeeds_without_count_change(self):
+        email, contact_id = self.create_contact()
+        target_list = self.create_empty_list()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_remove_from_list_1",
+                    "type": "remove_from_list",
+                    "label": "Remove absent list",
+                    "list_id": target_list["id"],
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(self.is_in_list(contact_id, target_list["id"]))
+        self.assertTrue(self.contact_exists(contact_id))
+        self.assertEqual(self.list_count(target_list["id"]), 0)
+        self.assertEqual(result.json["step_run"]["node_type"], "remove_from_list")
+        self.assertEqual(result.json["step_run"]["removed"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_add_to_list_completes_when_final_node(self):
+        email, contact_id = self.create_contact()
+        target_list = self.create_empty_list()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_to_list_1",
+                    "type": "add_to_list",
+                    "label": "Add final list",
+                    "list_id": target_list["id"],
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(self.is_in_list(contact_id, target_list["id"]))
+        self.assertEqual(result.json["enrolment"]["status"], "completed")
+        self.assertEqual(result.json["step_run"]["node_type"], "add_to_list")
+
+        self.cleanup(automation["id"])
+
+    def test_list_action_does_not_execute_next_node_in_same_request(self):
+        email, contact_id = self.create_contact()
+        target_list = self.create_empty_list()
+        next_tag = "%s_list_next_not_run" % self.test_id
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_to_list_1",
+                    "type": "add_to_list",
+                    "label": "Add list first",
+                    "list_id": target_list["id"],
+                },
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add next tag",
+                    "draft_tag": next_tag,
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(self.is_in_list(contact_id, target_list["id"]))
+        self.assertFalse(self.has_tag(contact_id, next_tag))
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_list_action_execution_missing_or_unowned_list_is_rejected_clearly(self):
+        email, _ = self.create_contact()
+        target_list = self.create_empty_list()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_to_list_1",
+                    "type": "add_to_list",
+                    "label": "Add to target list",
+                    "list_id": target_list["id"],
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            "update lists set cid = %s where id = %s",
+            "other-account-cid",
+            target_list["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("contact list that was not found", result.text)
+
+        self.db.execute(
+            "delete from lists where id = %s and cid = %s",
+            target_list["id"],
+            "other-account-cid",
+        )
+        self.cleanup(automation["id"])
+
+    def test_list_action_paused_enrolment_rejection_remains_intact(self):
+        email, contact_id = self.create_contact()
+        target_list = self.create_empty_list()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_to_list_1",
+                    "type": "add_to_list",
+                    "label": "Add to target list",
+                    "list_id": target_list["id"],
+                },
+            ]
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {"status": "held"},
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Enrolment is paused", result.text)
+        self.assertFalse(self.is_in_list(contact_id, target_list["id"]))
 
         self.cleanup(automation["id"])
 

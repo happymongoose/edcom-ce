@@ -117,6 +117,15 @@ export function automationHistoryLog(history) {
       if (event.tag) {
         parts.push('tag=' + event.tag);
       }
+      if (event.list_id) {
+        parts.push('list=' + event.list_id);
+      }
+      if (event.list_name) {
+        parts.push('list_name="' + event.list_name + '"');
+      }
+      if (event.added !== undefined && event.added !== null) {
+        parts.push('added=' + event.added);
+      }
       if (event.removed !== undefined && event.removed !== null) {
         parts.push('removed=' + event.removed);
       }
@@ -343,11 +352,19 @@ class Automation extends Component {
     }));
   }
 
+  listOptions() {
+    return _.map(this.props.lists || [], list => ({
+      id: list.id,
+      name: (list.name || 'Untitled list') +
+        (list.count !== undefined && list.count !== null ? ' (' + list.count + ' contacts)' : ''),
+    }));
+  }
+
   addNode = type => {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
     };
 
     if (type === 'add_tag' || type === 'remove_tag') {
@@ -371,6 +388,10 @@ class Automation extends Component {
     if (type === 'send_email') {
       const emails = this.props.emails || [];
       node.automation_email_id = emails.length ? emails[0].id : '';
+    }
+    if (type === 'add_to_list' || type === 'remove_from_list') {
+      const lists = this.props.lists || [];
+      node.list_id = lists.length ? lists[0].id : '';
     }
 
     this.props.update({
@@ -748,6 +769,29 @@ class Automation extends Component {
       );
     }
 
+    if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
+      const options = this.listOptions();
+      if (!options.length) {
+        return (
+          <div style={{minWidth: '220px'}}>
+            <p className="help-block">Create a contact list before selecting this node.</p>
+          </div>
+        );
+      }
+
+      return (
+        <div style={{minWidth: '220px'}}>
+          <SelectLabel
+            id="list_id"
+            obj={node}
+            onChange={this.nodeTargetChange.bind(this, index)}
+            options={options}
+            emptyVal="Select list"
+          />
+        </div>
+      );
+    }
+
     return null;
   }
 
@@ -757,6 +801,12 @@ class Automation extends Component {
     }
     if (type === 'remove_tag') {
       return 'Remove tag';
+    }
+    if (type === 'add_to_list') {
+      return 'Add to list';
+    }
+    if (type === 'remove_from_list') {
+      return 'Remove from list';
     }
     if (type === 'wait_duration') {
       return 'Wait';
@@ -1167,6 +1217,18 @@ class Automation extends Component {
                 >
                   <MenuItem onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'remove_tag')}>Remove Tag Node</MenuItem>
+                  <MenuItem
+                    onClick={this.addNode.bind(this, 'add_to_list')}
+                    disabled={!((this.props.lists || []).length)}
+                  >
+                    Add To List Node
+                  </MenuItem>
+                  <MenuItem
+                    onClick={this.addNode.bind(this, 'remove_from_list')}
+                    disabled={!((this.props.lists || []).length)}
+                  >
+                    Remove From List Node
+                  </MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'go_to')}>Go To Node</MenuItem>
@@ -1184,6 +1246,12 @@ class Automation extends Component {
                   null
                 :
                   <p className="help-block">Create an automation email before adding a send email node.</p>
+              }
+              {
+                (this.props.lists || []).length ?
+                  null
+                :
+                  <p className="help-block">Create a contact list before adding list action nodes.</p>
               }
               {
                 nodes.length ?
@@ -1259,6 +1327,7 @@ export default withLoadSave({
   extra: {
     tags: async () => (await axios.get('/api/recenttags')).data,
     emails: async ({id}) => (await axios.get('/api/automations/' + id + '/emails')).data,
+    lists: async () => _.sortBy((await axios.get('/api/lists')).data, l => (l.name || '').toLowerCase()),
     enrolments: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments')).data,
     historyData: async ({id}) => (await axios.get('/api/automations/' + id + '/history')).data,
   },

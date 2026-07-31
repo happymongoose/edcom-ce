@@ -7,6 +7,7 @@ class TestAutomationCRUD(test_base.TestBase):
         super(TestAutomationCRUD, self).setUp()
         self.created_automation_ids = []
         self.created_email_ids = []
+        self.created_list_ids = []
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
@@ -35,6 +36,21 @@ class TestAutomationCRUD(test_base.TestBase):
             self.db.execute(
                 "delete from automations where id = any(%s) and cid in (%s, %s)",
                 self.created_automation_ids,
+                cid,
+                "other-account-cid",
+            )
+        if self.created_list_ids:
+            self.db.execute(
+                f"""delete from contacts."contact_lists_{cid}" where list_id = any(%s)""",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from list_domains where list_id = any(%s)",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from lists where id = any(%s) and cid in (%s, %s)",
+                self.created_list_ids,
                 cid,
                 "other-account-cid",
             )
@@ -157,6 +173,11 @@ class TestAutomationCRUD(test_base.TestBase):
                 "nodes": nodes,
             },
         }
+
+    def create_contact_list(self, name="automation_crud_list"):
+        lst = self.user_post("/api/lists", json={"name": name})
+        self.created_list_ids.append(lst["id"])
+        return lst
 
     def go_to_workflow(self, go_to=None):
         if go_to is None:
@@ -743,6 +764,117 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.assert_publish_fails(workflow, "Remove tag nodes must have draft tag configuration.")
 
+    def test_valid_add_to_list_node_publishes(self):
+        lst = self.create_contact_list("automation_crud_add_to_list")
+        created = self.user_post("/api/automations", json={"name": "Add To List"})
+        automation_id = created["id"]
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_to_list_1",
+                "type": "add_to_list",
+                "label": "Add to list",
+                "list_id": lst["id"],
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][0]["type"], "add_to_list")
+        self.assertEqual(published["published"]["nodes"][0]["list_id"], lst["id"])
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_valid_remove_from_list_node_publishes(self):
+        lst = self.create_contact_list("automation_crud_remove_from_list")
+        created = self.user_post("/api/automations", json={"name": "Remove From List"})
+        automation_id = created["id"]
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_remove_from_list_1",
+                "type": "remove_from_list",
+                "label": "Remove from list",
+                "list_id": lst["id"],
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.user_patch("/api/automations/%s" % automation_id, json=workflow)
+        published = self.user_publish(automation_id)
+
+        self.assertEqual(published["published"]["nodes"][0]["type"], "remove_from_list")
+        self.assertEqual(published["published"]["nodes"][0]["list_id"], lst["id"])
+
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.remove(automation_id)
+
+    def test_list_action_missing_list_id_fails_publish_validation(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_to_list_1",
+                "type": "add_to_list",
+                "label": "Add to list",
+                "list_id": "",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "add_to_list nodes must select a contact list.")
+
+    def test_list_action_unknown_list_fails_publish_validation(self):
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_remove_from_list_1",
+                "type": "remove_from_list",
+                "label": "Remove from list",
+                "list_id": "missing-list-id",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "must reference a contact list from this account")
+
+    def test_list_action_unowned_list_fails_publish_validation(self):
+        lst = self.create_contact_list("automation_crud_unowned_list")
+        self.db.execute(
+            "update lists set cid = %s where id = %s",
+            "other-account-cid",
+            lst["id"],
+        )
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_to_list_1",
+                "type": "add_to_list",
+                "label": "Add to list",
+                "list_id": lst["id"],
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "must reference a contact list from this account")
+
     def test_wait_duration_below_five_minutes_fails_publish_validation(self):
         created = self.user_post("/api/automations", json={"name": "Short Wait"})
         automation_id = created["id"]
@@ -1092,6 +1224,32 @@ class TestAutomationCRUD(test_base.TestBase):
                 "label": "If contact has tag",
                 "draft_tag": "vip",
                 "yes_node_id": "node_remove_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+
+    def test_list_action_linear_progression_is_counted_in_cycle_detection(self):
+        lst = self.create_contact_list("automation_crud_cycle_list")
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_to_list_1",
+                "type": "add_to_list",
+                "label": "Add to list before condition",
+                "list_id": lst["id"],
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_has_tag",
+                "label": "If contact has tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_to_list_1",
                 "no_node_id": "node_exit_1",
             },
             {

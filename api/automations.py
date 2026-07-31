@@ -92,6 +92,52 @@ REMOVE_TAG_NODE_SCHEMA = {
 }
 
 
+ADD_TO_LIST_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "list_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["add_to_list"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "list_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+REMOVE_FROM_LIST_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "list_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["remove_from_list"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "list_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 WAIT_DURATION_SCHEMA = {
     "type": "object",
     "required": ["days", "hours", "minutes"],
@@ -261,6 +307,8 @@ DRAFT_SCHEMA = {
                 "oneOf": [
                     ADD_TAG_NODE_SCHEMA,
                     REMOVE_TAG_NODE_SCHEMA,
+                    ADD_TO_LIST_NODE_SCHEMA,
+                    REMOVE_FROM_LIST_NODE_SCHEMA,
                     WAIT_DURATION_NODE_SCHEMA,
                     IF_HAS_TAG_NODE_SCHEMA,
                     GO_TO_NODE_SCHEMA,
@@ -585,6 +633,165 @@ def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
     )
 
 
+def _contact_list_counter_flags(contact: JsonObj) -> tuple[int, int, int, int]:
+    props = contact.get("props") or {}
+
+    def is_truthy(name: str) -> int:
+        values = props.get(name) or []
+        if not values:
+            return 0
+        value = values[0]
+        if value is None or value == "":
+            return 0
+        return 1 if str(value).lower() == "true" else 0
+
+    return (
+        is_truthy("Bounced"),
+        is_truthy("Unsubscribed"),
+        is_truthy("Complained"),
+        is_truthy("Soft Bounced"),
+    )
+
+
+def _contact_domain(email_address: str) -> str:
+    if "@" not in email_address:
+        return ""
+    return email_address.rsplit("@", 1)[-1].strip().lower()
+
+
+def _add_contact_to_list(
+    db: DB,
+    cid: str,
+    contact_id: int,
+    contact_email: str,
+    list_id: str,
+) -> JsonObj:
+    lst = db.lists.get(list_id)
+    if lst is None:
+        raise falcon.HTTPBadRequest(
+            title="Automation list is missing",
+            description="The published list node references a contact list that was not found.",
+        )
+
+    inserted = db.single(
+        f"""
+        insert into contacts."contact_lists_{cid}" (contact_id, list_id)
+        values (%s, %s)
+        on conflict (contact_id, list_id) do nothing
+        returning list_id
+        """,
+        contact_id,
+        list_id,
+    )
+    added = inserted is not None
+
+    if added:
+        contact = db.row_or_error(
+            f"""select props from contacts."contacts_{cid}" where contact_id = %s""",
+            contact_id,
+        )
+        bounced, unsubscribed, complained, soft_bounced = _contact_list_counter_flags(
+            {"props": contact[0]}
+        )
+        domain = _contact_domain(contact_email)
+        if domain:
+            db.execute(
+                """
+                insert into list_domains (list_id, domain, count) values (%s, %s, 1)
+                on conflict (list_id, domain) do update set count = list_domains.count + 1
+                """,
+                list_id,
+                domain,
+            )
+        contacts.patch_list(
+            db,
+            list_id,
+            1,
+            bounced,
+            unsubscribed,
+            complained,
+            soft_bounced,
+        )
+
+    return {
+        "list_id": list_id,
+        "list_name": lst.get("name"),
+        "added": added,
+    }
+
+
+def _remove_contact_from_list(
+    db: DB,
+    cid: str,
+    contact_id: int,
+    contact_email: str,
+    list_id: str,
+) -> JsonObj:
+    lst = db.lists.get(list_id)
+    if lst is None:
+        raise falcon.HTTPBadRequest(
+            title="Automation list is missing",
+            description="The published list node references a contact list that was not found.",
+        )
+
+    contact = db.row(
+        f"""
+        select c.props
+        from contacts."contacts_{cid}" c
+        join contacts."contact_lists_{cid}" l on l.contact_id = c.contact_id
+        where c.contact_id = %s and l.list_id = %s
+        """,
+        contact_id,
+        list_id,
+    )
+    removed = False
+
+    if contact is not None:
+        deleted = db.execute(
+            f"""
+            delete from contacts."contact_lists_{cid}"
+            where contact_id = %s and list_id = %s
+            """,
+            contact_id,
+            list_id,
+        ).rowcount
+        removed = deleted > 0
+
+        if removed:
+            bounced, unsubscribed, complained, soft_bounced = _contact_list_counter_flags(
+                {"props": contact[0]}
+            )
+            domain = _contact_domain(contact_email)
+            if domain:
+                db.execute(
+                    """
+                    update list_domains set count = count - 1
+                    where list_id = %s and domain = %s
+                    """,
+                    list_id,
+                    domain,
+                )
+                db.execute(
+                    "delete from list_domains where list_id = %s and count <= 0",
+                    list_id,
+                )
+            contacts.patch_list(
+                db,
+                list_id,
+                -1,
+                -bounced,
+                -unsubscribed,
+                -complained,
+                -soft_bounced,
+            )
+
+    return {
+        "list_id": list_id,
+        "list_name": lst.get("name"),
+        "removed": removed,
+    }
+
+
 def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
     if not automation.get("name") or not automation.get("name").strip():
         _validation_error("Automation must have a name before publishing.")
@@ -618,6 +825,15 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
             _validation_error("Add tag nodes must have draft tag configuration.")
         if node.get("type") == "remove_tag" and not node.get("draft_tag"):
             _validation_error("Remove tag nodes must have draft tag configuration.")
+        if node.get("type") in ("add_to_list", "remove_from_list"):
+            list_id = node.get("list_id")
+            if not list_id:
+                _validation_error("%s nodes must select a contact list." % node.get("type"))
+            if db.lists.get(list_id) is None:
+                _validation_error(
+                    "%s node at step %s must reference a contact list from this account."
+                    % (node.get("type"), index + 1)
+                )
         if node.get("type") == "if_has_tag":
             if not node.get("draft_tag"):
                 _validation_error("If has tag nodes must have draft tag configuration.")
@@ -2233,6 +2449,9 @@ class AutomationHistory(object):
                     "node_type": step_run["node_type"],
                     "node_label": step_run.get("node_label"),
                     "tag": step_run.get("tag"),
+                    "list_id": step_run.get("list_id"),
+                    "list_name": step_run.get("list_name"),
+                    "added": step_run.get("added"),
                     "removed": step_run.get("removed"),
                     "duration": step_run.get("duration"),
                     "wake_at": step_run.get("wake_at"),
@@ -2331,12 +2550,12 @@ class AutomationEnrolmentRunNext(object):
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "remove_tag", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
+        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, remove_tag, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
+                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -2490,6 +2709,76 @@ class AutomationEnrolmentRunNext(object):
                     "action": "remove_tag",
                     "tag": tag,
                     "removed": removed,
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "add_to_list":
+            list_id = node.get("list_id")
+            if not list_id:
+                raise falcon.HTTPBadRequest(
+                    title="Add to list node is missing list configuration",
+                    description="The published add_to_list node does not include a contact list.",
+                )
+
+            list_result = _add_contact_to_list(
+                db,
+                cid,
+                enrolment["contact_id"],
+                enrolment["contact_email"],
+                list_id,
+            )
+            run_data.update(
+                {
+                    "action": "add_to_list",
+                    "list_id": list_result["list_id"],
+                    "list_name": list_result.get("list_name"),
+                    "added": list_result["added"],
+                }
+            )
+
+            if node_index + 1 < len(nodes):
+                enrolment_update = {
+                    "status": "ready",
+                    "current_node_id": nodes[node_index + 1]["id"],
+                    "modified": now,
+                }
+            else:
+                enrolment_update = {
+                    "status": "completed",
+                    "modified": now,
+                }
+        elif node_type == "remove_from_list":
+            list_id = node.get("list_id")
+            if not list_id:
+                raise falcon.HTTPBadRequest(
+                    title="Remove from list node is missing list configuration",
+                    description="The published remove_from_list node does not include a contact list.",
+                )
+
+            list_result = _remove_contact_from_list(
+                db,
+                cid,
+                enrolment["contact_id"],
+                enrolment["contact_email"],
+                list_id,
+            )
+            run_data.update(
+                {
+                    "action": "remove_from_list",
+                    "list_id": list_result["list_id"],
+                    "list_name": list_result.get("list_name"),
+                    "removed": list_result["removed"],
                 }
             )
 
