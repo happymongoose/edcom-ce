@@ -101,6 +101,33 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('revision=3');
   });
 
+  it('can format automation history newest first for the all-history log', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'enrolment',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'old-pass',
+          status: 'completed',
+          published_revision: 1,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T11:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'new-pass',
+          node_id: 'node_send_1',
+          node_type: 'send_email',
+          status: 'succeeded',
+          published_revision: 2,
+        },
+      ],
+    }, {newestFirst: true});
+
+    expect(log.indexOf('enrolment new-pass')).toBeLessThan(log.indexOf('enrolment old-pass'));
+  });
+
   it('shows waiting and continue actions for waiting enrolments', () => {
     const waiting = automationEnrolmentAction(
       {

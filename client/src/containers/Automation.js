@@ -76,8 +76,11 @@ function formatDebugTime(value) {
   return value ? moment(value).format('lll') : '';
 }
 
-export function automationHistoryLog(history) {
-  const events = (history && history.events) || [];
+export function automationHistoryLog(history, options) {
+  const events = options && options.newestFirst ?
+    ((history && history.events) || []).slice().reverse()
+  :
+    (history && history.events) || [];
   if (!events.length) {
     return 'No automation history yet.';
   }
@@ -1167,7 +1170,7 @@ class Automation extends Component {
   renderHistory() {
     const history = this.props.historyData || {};
     const contacts = automationHistoryContacts(history);
-    const log = automationHistoryLog(history);
+    const log = automationHistoryLog(history, {newestFirst: true});
 
     return (
       <EDFormBox space>
