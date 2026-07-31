@@ -19,10 +19,11 @@ from .shared.crud import (
     check_noadmin,
     get_orig,
 )
-from .shared.db import DB, JsonObj, open_db
+from .shared.db import DB, JsonObj, json_obj, open_db
 from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
+from .shared.utils import fix_tag
 from .shared.utils import generate_html, remove_newlines
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
 from .shared.send import check_test_limit, send_backend_mail
@@ -387,6 +388,75 @@ AUTOMATION_ENROLMENT_SCHEMA = {
         "email": {
             "type": "string",
             "minLength": 1,
+        },
+    },
+    "additionalProperties": False,
+}
+
+AUTOMATION_TRIGGER_EVENT_SCHEMA = {
+    "type": "object",
+    "required": ["event_type", "contact_email", "tag"],
+    "properties": {
+        "event_type": {
+            "type": "string",
+            "enum": ["tag_added"],
+        },
+        "contact_email": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 320,
+        },
+        "tag": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "source": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["manual", "debug", "automation", "api"],
+                },
+                "automation_id": {
+                    "type": ["string", "null"],
+                    "maxLength": 128,
+                },
+                "enrolment_id": {
+                    "type": ["string", "null"],
+                    "maxLength": 128,
+                },
+                "node_id": {
+                    "type": ["string", "null"],
+                    "maxLength": 128,
+                },
+                "step_run_id": {
+                    "type": ["string", "null"],
+                    "maxLength": 128,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "correlation_id": {
+            "type": "string",
+            "maxLength": 128,
+        },
+        "depth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+        },
+    },
+    "additionalProperties": False,
+}
+
+AUTOMATION_TRIGGER_PROCESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
         },
     },
     "additionalProperties": False,
@@ -1294,6 +1364,10 @@ AUTOMATION_PROCESS_MAX_LIMIT = 100
 AUTOMATION_PROCESS_ERROR_LIMIT = 100
 AUTOMATION_PROCESS_ACCOUNT_LIMIT = 50
 CHECK_AUTOMATION_ENROLMENTS_LOCK = 58413921
+AUTOMATION_TRIGGER_DEFAULT_LIMIT = 25
+AUTOMATION_TRIGGER_MAX_LIMIT = 100
+AUTOMATION_TRIGGER_DETAIL_LIMIT = 100
+AUTOMATION_TRIGGER_COOLDOWN_MINUTES = 15
 
 
 def _claim_clear_patch() -> JsonObj:
@@ -3328,6 +3402,56 @@ def _automation_processing_enabled() -> bool:
     )
 
 
+def _automation_triggers_enabled() -> bool:
+    return (os.environ.get("automation_triggers_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _automation_trigger_manual_events_enabled() -> bool:
+    return (os.environ.get("automation_trigger_manual_events_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _automation_trigger_limit(value: object) -> int:
+    if value is None:
+        return AUTOMATION_TRIGGER_DEFAULT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation trigger process limit",
+            description="limit must be a positive integer.",
+        )
+    if limit < 1:
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation trigger process limit",
+            description="limit must be at least 1.",
+        )
+    return min(limit, AUTOMATION_TRIGGER_MAX_LIMIT)
+
+
+def _automation_trigger_max_depth() -> int:
+    try:
+        return max(1, int(os.environ.get("automation_trigger_max_depth") or 3))
+    except ValueError:
+        return 3
+
+
+def _automation_trigger_cooldown_minutes() -> int:
+    try:
+        return max(0, int(os.environ.get("automation_trigger_cooldown_minutes") or AUTOMATION_TRIGGER_COOLDOWN_MINUTES))
+    except ValueError:
+        return AUTOMATION_TRIGGER_COOLDOWN_MINUTES
+
+
 def _automation_scheduler_account_limit() -> int:
     value = os.environ.get("automation_processing_account_limit")
     if value is None:
@@ -3344,6 +3468,460 @@ def _automation_scheduler_process_limit() -> int:
         return _automation_process_limit(os.environ.get("automation_processing_limit"))
     except falcon.HTTPBadRequest:
         return AUTOMATION_PROCESS_DEFAULT_LIMIT
+
+
+def _trigger_event_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+    event_id, cid, contact_id, contact_email, event_type, ts, data = row
+    ret = copy.deepcopy(data)
+    ret["id"] = event_id
+    ret["cid"] = cid
+    ret["contact_id"] = contact_id
+    ret["contact_email"] = contact_email
+    ret["event_type"] = event_type
+    ret["ts"] = ts.isoformat() if hasattr(ts, "isoformat") else ts
+    return ret
+
+
+def _automation_trigger_source(source: JsonObj | None) -> JsonObj:
+    source = source or {}
+    ret = {
+        "type": source.get("type") or "manual",
+    }
+    for key in ("automation_id", "enrolment_id", "node_id", "step_run_id"):
+        value = source.get(key)
+        if value:
+            ret[key] = value
+    return ret
+
+
+def _create_automation_trigger_event(
+    db: DB,
+    cid: str,
+    event_type: str,
+    contact_email: str,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+    created_by: str | None = None,
+    manual_debug: bool = False,
+) -> JsonObj:
+    if event_type != "tag_added":
+        raise falcon.HTTPBadRequest(
+            title="Unsupported trigger event",
+            description="Only tag_added trigger events are supported.",
+        )
+
+    tag = fix_tag(tag)
+    if not tag:
+        raise falcon.HTTPBadRequest(
+            title="Trigger tag is required",
+            description="Tag added trigger events require a tag.",
+        )
+
+    if not contact_email or len(contact_email) > 320:
+        raise falcon.HTTPBadRequest(
+            title="Contact email is required",
+            description="Trigger events require an existing contact email.",
+        )
+
+    contact = db.row(
+        f"""
+        select contact_id, email
+        from contacts."contacts_{cid}"
+        where lower(email) = lower(%s)
+        order by contact_id
+        limit 1
+        """,
+        contact_email,
+    )
+    if contact is None:
+        raise falcon.HTTPBadRequest(
+            title="Contact not found",
+            description="Trigger events require an existing contact in this account.",
+        )
+    contact_id, stored_email = contact
+
+    source_data = _automation_trigger_source(source)
+    source_automation_id = source_data.get("automation_id")
+    if source_automation_id:
+        db.set_cid(cid)
+        if db.automations.get(source_automation_id) is None:
+            raise falcon.HTTPBadRequest(
+                title="Source automation not found",
+                description="The source automation must belong to this account.",
+            )
+
+    now = datetime.utcnow()
+    event_id = shortuuid.uuid()
+    data = {
+        "status": "pending",
+        "tag": tag,
+        "source": source_data,
+        "correlation_id": correlation_id or shortuuid.uuid(),
+        "depth": depth,
+        "manual_debug": manual_debug,
+        "created_by": created_by,
+        "created": now.isoformat() + "Z",
+        "processed_at": None,
+        "results": [],
+    }
+    db.execute(
+        """
+        insert into automation_trigger_events
+            (id, cid, contact_id, contact_email, event_type, ts, data)
+        values (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        event_id,
+        cid,
+        contact_id,
+        stored_email,
+        event_type,
+        now,
+        data,
+    )
+    return _trigger_event_obj(
+        db.row(
+            """
+            select id, cid, contact_id, contact_email, event_type, ts, data
+            from automation_trigger_events
+            where cid = %s and id = %s
+            """,
+            cid,
+            event_id,
+        )
+    )
+
+
+def _claim_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> List[JsonObj]:
+    now = _utc_now()
+    with db.transaction():
+        rows = db.execute(
+            """
+            with candidates as (
+                select id
+                from automation_trigger_events
+                where cid = %s and data->>'status' = 'pending'
+                order by ts, id
+                limit %s
+                for update skip locked
+            )
+            update automation_trigger_events e
+            set data = e.data || jsonb_build_object(
+                'status', 'processing',
+                'claimed_at', %s
+            )
+            from candidates
+            where e.id = candidates.id
+            returning e.id, e.cid, e.contact_id, e.contact_email, e.event_type, e.ts, e.data
+            """,
+            cid,
+            limit,
+            now,
+        ).fetchall()
+    return [_trigger_event_obj(row) for row in rows]
+
+
+def _matching_trigger_automations(db: DB, cid: str, event: JsonObj) -> List[JsonObj]:
+    if event.get("event_type") != "tag_added":
+        return []
+    rows = db.execute(
+        """
+        select id, cid, data
+        from automations
+        where cid = %s
+            and data->>'status' in ('published', 'paused')
+            and data->'published' is not null
+            and data->'published'->'entry'->>'type' = 'tag_added'
+            and data->'published'->'entry'->>'tag' = %s
+        order by data->>'name', id
+        """,
+        cid,
+        event.get("tag"),
+    ).fetchall()
+    return [automation for automation in (json_obj(row) for row in rows) if automation is not None]
+
+
+def _trigger_cooldown_active(
+    db: DB,
+    cid: str,
+    event: JsonObj,
+    automation_id: str,
+) -> bool:
+    cooldown_minutes = _automation_trigger_cooldown_minutes()
+    if cooldown_minutes <= 0:
+        return False
+    return bool(
+        db.single(
+            """
+            select e.id
+            from automation_trigger_events e
+            cross join lateral jsonb_array_elements(coalesce(e.data->'results', '[]'::jsonb)) r
+            where e.cid = %s
+                and e.id <> %s
+                and e.contact_id = %s
+                and e.event_type = %s
+                and e.data->>'tag' = %s
+                and e.ts >= (now() at time zone 'utc') - (%s::text || ' minutes')::interval
+                and r->>'automation_id' = %s
+                and r->>'status' = 'enrolled'
+            limit 1
+            """,
+            cid,
+            event.get("id"),
+            event.get("contact_id"),
+            event.get("event_type"),
+            event.get("tag"),
+            cooldown_minutes,
+            automation_id,
+        )
+    )
+
+
+def _trigger_detail(result: JsonObj, detail: JsonObj) -> None:
+    if len(result["details"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+        result["details"].append(detail)
+
+
+def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonObj:
+    result: JsonObj = {
+        "processed": 1,
+        "enrolled": 0,
+        "suppressed": 0,
+        "failed": 0,
+        "no_match": 0,
+        "details": [],
+        "errors": [],
+        "event_results": [],
+    }
+    tag = event.get("tag")
+    depth = int(event.get("depth") or 0)
+    source = event.get("source") or {}
+
+    def record_event_result(item: JsonObj) -> None:
+        if len(result["event_results"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+            result["event_results"].append(item)
+
+    if event.get("event_type") != "tag_added" or not tag:
+        result["failed"] += 1
+        error = {
+            "event_id": event.get("id"),
+            "reason": "invalid_event",
+            "description": "Trigger event is missing a supported type or tag.",
+        }
+        result["errors"].append(error)
+        record_event_result({"status": "failed", **error})
+        return result
+
+    if depth >= _automation_trigger_max_depth():
+        result["suppressed"] += 1
+        detail = {
+            "event_id": event.get("id"),
+            "status": "suppressed",
+            "reason": "max_depth",
+            "description": "Trigger event depth exceeded the configured limit.",
+        }
+        _trigger_detail(result, detail)
+        record_event_result(detail)
+        return result
+
+    automations = _matching_trigger_automations(db, cid, event)
+    if not automations:
+        result["no_match"] += 1
+        detail = {
+            "event_id": event.get("id"),
+            "status": "no_match",
+            "reason": "no_matching_trigger",
+            "description": "No published automation trigger matched this event.",
+        }
+        _trigger_detail(result, detail)
+        record_event_result(detail)
+        return result
+
+    for automation in automations:
+        automation_id = automation.get("id")
+        base_detail = {
+            "event_id": event.get("id"),
+            "automation_id": automation_id,
+            "automation_name": automation.get("name"),
+            "contact_id": event.get("contact_id"),
+            "contact_email": event.get("contact_email"),
+            "event_type": event.get("event_type"),
+            "tag": tag,
+        }
+        try:
+            if source.get("type") == "automation" and source.get("automation_id") == automation_id:
+                result["suppressed"] += 1
+                detail = {
+                    **base_detail,
+                    "status": "suppressed",
+                    "reason": "same_automation_source",
+                    "description": "Trigger event was caused by the same automation.",
+                }
+                _trigger_detail(result, detail)
+                record_event_result(detail)
+                continue
+
+            if _trigger_cooldown_active(db, cid, event, automation_id):
+                result["suppressed"] += 1
+                detail = {
+                    **base_detail,
+                    "status": "suppressed",
+                    "reason": "cooldown",
+                    "description": "A recent matching trigger already enrolled this contact.",
+                }
+                _trigger_detail(result, detail)
+                record_event_result(detail)
+                continue
+
+            outcome = _create_enrolment_for_contact(
+                db,
+                cid,
+                automation_id,
+                automation,
+                int(event.get("contact_id")),
+                event.get("contact_email"),
+                "trigger:%s" % event.get("id"),
+            )
+            if outcome.get("status") == "enrolled":
+                result["enrolled"] += 1
+                detail = {
+                    **base_detail,
+                    "status": "enrolled",
+                    "enrolment_id": outcome.get("enrolment_id"),
+                }
+                _trigger_detail(result, detail)
+                record_event_result(detail)
+            elif outcome.get("status") == "skipped":
+                result["suppressed"] += 1
+                detail = {
+                    **base_detail,
+                    "status": "suppressed",
+                    "reason": outcome.get("reason"),
+                    "description": outcome.get("description"),
+                    "existing_enrolment_id": outcome.get("existing_enrolment_id"),
+                }
+                _trigger_detail(result, detail)
+                record_event_result(detail)
+            else:
+                result["failed"] += 1
+                detail = {
+                    **base_detail,
+                    "status": "failed",
+                    "description": outcome.get("description") or "Trigger enrolment failed.",
+                }
+                if len(result["errors"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                    result["errors"].append(detail)
+                record_event_result(detail)
+        except Exception as e:
+            result["failed"] += 1
+            detail = {
+                **base_detail,
+                "status": "failed",
+                "description": str(e),
+            }
+            if len(result["errors"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["errors"].append(detail)
+            record_event_result(detail)
+
+    return result
+
+
+def _finish_automation_trigger_event(
+    db: DB,
+    cid: str,
+    event_id: str,
+    event_result: JsonObj,
+) -> None:
+    now = _utc_now()
+    status = "processed"
+    if event_result.get("failed") and not (
+        event_result.get("enrolled") or event_result.get("suppressed") or event_result.get("no_match")
+    ):
+        status = "failed"
+    db.execute(
+        """
+        update automation_trigger_events
+        set data = data || jsonb_build_object(
+            'status', %s,
+            'processed_at', %s,
+            'results', %s::jsonb->'items',
+            'error', %s::jsonb->'items'
+        )
+        where cid = %s and id = %s and data->>'status' = 'processing'
+        """,
+        status,
+        now,
+        {"items": event_result.get("event_results") or []},
+        {"items": event_result.get("errors") or []},
+        cid,
+        event_id,
+    )
+
+
+def _process_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> JsonObj:
+    if not _automation_triggers_enabled():
+        log.info("Automation trigger processing is disabled; set automation_triggers_enabled=true to enable processing.")
+        return {
+            "enabled": False,
+            "processed": 0,
+            "enrolled": 0,
+            "suppressed": 0,
+            "failed": 0,
+            "no_match": 0,
+            "details": [],
+            "errors": [],
+        }
+
+    result: JsonObj = {
+        "enabled": True,
+        "processed": 0,
+        "enrolled": 0,
+        "suppressed": 0,
+        "failed": 0,
+        "no_match": 0,
+        "details": [],
+        "errors": [],
+    }
+
+    for event in _claim_pending_automation_trigger_events(db, cid, limit):
+        try:
+            event_result = _process_automation_trigger_event(db, cid, event)
+        except Exception as e:
+            event_result = {
+                "processed": 1,
+                "enrolled": 0,
+                "suppressed": 0,
+                "failed": 1,
+                "no_match": 0,
+                "details": [],
+                "errors": [{
+                    "event_id": event.get("id"),
+                    "description": str(e),
+                }],
+                "event_results": [{
+                    "status": "failed",
+                    "reason": "processor_error",
+                    "description": str(e),
+                }],
+            }
+
+        _finish_automation_trigger_event(db, cid, event.get("id"), event_result)
+        result["processed"] += int(event_result.get("processed", 0) or 0)
+        result["enrolled"] += int(event_result.get("enrolled", 0) or 0)
+        result["suppressed"] += int(event_result.get("suppressed", 0) or 0)
+        result["failed"] += int(event_result.get("failed", 0) or 0)
+        result["no_match"] += int(event_result.get("no_match", 0) or 0)
+        for detail in event_result.get("details", []):
+            if len(result["details"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["details"].append(detail)
+        for error in event_result.get("errors", []):
+            if len(result["errors"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["errors"].append(error)
+
+    return result
 
 
 def _eligible_automation_enrolments(
@@ -3645,6 +4223,66 @@ class AutomationEnrolmentProcessor(object):
             cid,
             limit,
             automation_id,
+        )
+
+
+class AutomationTriggerEvents(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        if not _automation_trigger_manual_events_enabled():
+            raise falcon.HTTPForbidden(
+                title="Manual trigger events are disabled",
+                description="Set automation_trigger_manual_events_enabled=true to create manual trigger events.",
+            )
+
+        doc = req.context.get("doc")
+        if not doc:
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+        _validate_doc(doc, AUTOMATION_TRIGGER_EVENT_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        event = _create_automation_trigger_event(
+            db,
+            cid,
+            doc["event_type"],
+            doc["contact_email"],
+            doc["tag"],
+            doc.get("source"),
+            doc.get("correlation_id"),
+            int(doc.get("depth") or 0),
+            req.context.get("uid"),
+            True,
+        )
+        resp.status = falcon.HTTP_201
+        req.context["result"] = event
+
+
+class AutomationTriggerEventProcessor(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc") or {}
+        if not isinstance(doc, dict):
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+        _validate_doc(doc, AUTOMATION_TRIGGER_PROCESS_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit = _automation_trigger_limit(doc.get("limit"))
+        req.context["result"] = _process_pending_automation_trigger_events(
+            db,
+            cid,
+            limit,
         )
 
 
