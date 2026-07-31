@@ -3433,6 +3433,34 @@ def _process_eligible_automation_enrolments(
     return result
 
 
+@tasks.task(priority=HIGH_PRIORITY)
+def process_automation_enrolments_task(
+    cid: str,
+    automation_id: str | None = None,
+    limit: int = AUTOMATION_PROCESS_DEFAULT_LIMIT,
+) -> JsonObj:
+    with open_db() as db:
+        db.set_cid(cid)
+        limit = _automation_process_limit(limit)
+        if automation_id and db.automations.get(automation_id) is None:
+            raise ValueError("Automation %s was not found for cid %s" % (automation_id, cid))
+
+        result = _process_eligible_automation_enrolments(
+            db,
+            cid,
+            limit,
+            automation_id,
+        )
+        log.info(
+            "Processed automation enrolments cid=%s automation_id=%s limit=%s result=%s",
+            cid,
+            automation_id,
+            limit,
+            result,
+        )
+        return result
+
+
 class AutomationEnrolmentProcessor(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:

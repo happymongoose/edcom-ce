@@ -357,6 +357,13 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         )
 
+    def process_enrolments_task(self, automation_id=None, limit=25):
+        return automations.process_automation_enrolments_task(
+            self.user_cookie["cid"],
+            automation_id,
+            limit,
+        )
+
     def patch_enrolment_data(self, enrolment_id, data):
         self.db.execute(
             """
@@ -2228,3 +2235,160 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(self.enrolment_data(enrolment["id"])["status"], "completed")
 
         self.cleanup(published["id"])
+
+    def test_processor_task_processes_ready_enrolment(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="processor-task-ready")
+        self.enrol(automation["id"], email)
+
+        result = self.process_enrolments_task(automation["id"], 25)
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertTrue(self.has_tag(contact_id, "processor-task-ready"))
+
+        self.cleanup(automation["id"])
+
+    def test_processor_task_respects_automation_id(self):
+        selected_email, selected_contact_id = self.create_contact()
+        other_email, other_contact_id = self.create_contact()
+        selected = self.create_automation(tag="processor-task-selected")
+        other = self.create_automation(tag="processor-task-other")
+        self.enrol(selected["id"], selected_email)
+        self.enrol(other["id"], other_email)
+
+        result = self.process_enrolments_task(selected["id"], 25)
+
+        self.assertEqual(result["processed"], 1)
+        self.assertTrue(self.has_tag(selected_contact_id, "processor-task-selected"))
+        self.assertFalse(self.has_tag(other_contact_id, "processor-task-other"))
+
+        self.cleanup(selected["id"], other["id"])
+
+    def test_processor_task_respects_limit_and_runs_one_node_only(self):
+        first_email, first_contact_id = self.create_contact()
+        second_email, second_contact_id = self.create_contact()
+        automation = self.create_automation(
+            nodes=[
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add first task tag",
+                    "draft_tag": "processor-task-first-node",
+                },
+                {
+                    "id": "node_add_tag_2",
+                    "type": "add_tag",
+                    "label": "Add second task tag",
+                    "draft_tag": "processor-task-second-node",
+                },
+            ]
+        )
+        first_enrolment = self.enrol(automation["id"], first_email)
+        self.enrol(automation["id"], second_email)
+
+        result = self.process_enrolments_task(automation["id"], 1)
+
+        self.assertEqual(result["processed"], 1)
+        self.assertTrue(self.has_tag(first_contact_id, "processor-task-first-node"))
+        self.assertFalse(self.has_tag(first_contact_id, "processor-task-second-node"))
+        self.assertFalse(self.has_tag(second_contact_id, "processor-task-first-node"))
+        data = self.enrolment_data(first_enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["current_node_id"], "node_add_tag_2")
+
+        self.cleanup(automation["id"])
+
+    def test_processor_task_excludes_paused_automation(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="processor-task-paused")
+        self.enrol(automation["id"], email)
+        paused = self.simulate_post(
+            "/api/automations/%s/pause" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(paused.status_code, 200, paused.text)
+
+        result = self.process_enrolments_task(automation["id"], 25)
+
+        self.assertEqual(result["processed"], 0)
+        self.assertFalse(self.has_tag(contact_id, "processor-task-paused"))
+
+        self.cleanup(automation["id"])
+
+    def test_processor_task_uses_existing_send_debug_path(self):
+        route_id = self.assign_single_debug_route()
+        email, contact_id = self.create_contact()
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_processor_task_send_%s" % suffix},
+        )
+        automation_email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Processor task email",
+                "subject": "Processor task subject %s" % suffix,
+                "rawText": "<p>Processor task body %s</p>" % suffix,
+                "fromname": "Automation Sender",
+                "returnpath": "automation-sender@example.com",
+            },
+        )
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(
+                nodes=[
+                    {
+                        "id": "node_send_email_1",
+                        "type": "send_email",
+                        "label": "Send email",
+                        "automation_email_id": automation_email["id"],
+                    },
+                    {
+                        "id": "node_add_tag_1",
+                        "type": "add_tag",
+                        "label": "Add after task send",
+                        "draft_tag": "processor-task-send-finished",
+                    },
+                ],
+            ),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+        enrolment = self.enrol(published["id"], email)
+
+        result = self.process_enrolments_task(published["id"], 25)
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertFalse(self.has_tag(contact_id, "processor-task-send-finished"))
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["current_node_id"], "node_add_tag_1")
+        logs = self.debug_email_logs(published["id"])
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][2]["recipient_email"], email)
+        self.assertEqual(logs[0][2]["route_id"], route_id)
+        self.assertEqual(logs[0][2]["source_ids"]["automation_id"], published["id"])
+
+        self.cleanup(published["id"])
+
+    def test_processor_task_result_shape_matches_manual_processor(self):
+        manual_email, _ = self.create_contact()
+        task_email, _ = self.create_contact()
+        manual = self.create_automation(tag="processor-manual-shape")
+        task = self.create_automation(tag="processor-task-shape")
+        self.enrol(manual["id"], manual_email)
+        self.enrol(task["id"], task_email)
+
+        manual_result = self.process_enrolments(automation_id=manual["id"]).json
+        task_result = self.process_enrolments_task(task["id"], 25)
+
+        self.assertEqual(set(task_result.keys()), set(manual_result.keys()))
+        for key in ("processed", "succeeded", "waiting", "completed", "exited", "failed", "skipped_running"):
+            self.assertIn(key, task_result)
+        self.assertIn("errors", task_result)
+
+        self.cleanup(manual["id"], task["id"])
