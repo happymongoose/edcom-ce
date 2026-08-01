@@ -3032,6 +3032,11 @@ def _run_next_automation_enrolment(
                 )
 
             tagcounts = {}
+            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            try:
+                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
+            except (TypeError, ValueError):
+                trigger_depth = 1
             contacts.remove_tag(
                 db,
                 cid,
@@ -3040,6 +3045,16 @@ def _run_next_automation_enrolment(
                 tag,
                 tagcounts,
                 [],
+                {
+                    "type": "automation",
+                    "automation_id": id,
+                    "enrolment_id": enrolment_id,
+                    "node_id": node.get("id"),
+                    "step_run_id": run_id,
+                    "published_revision": automation.get("published_revision"),
+                },
+                trigger_correlation_id,
+                trigger_depth,
             )
             removed = bool(tagcounts.get(tag))
             for tagname, cnt in tagcounts.items():

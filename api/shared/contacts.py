@@ -82,7 +82,7 @@ def sanitize_automation_trigger_source(source: JsonObj | None) -> JsonObj:
     return ret
 
 
-def matching_tag_added_automation_exists(db: DB, cid: str, tag: str) -> bool:
+def matching_tag_trigger_automation_exists(db: DB, cid: str, event_type: str, tag: str) -> bool:
     return bool(
         db.single(
             """
@@ -91,21 +91,23 @@ def matching_tag_added_automation_exists(db: DB, cid: str, tag: str) -> bool:
             where cid = %s
                 and data->>'status' in ('published', 'paused')
                 and data->'published' is not null
-                and data->'published'->'entry'->>'type' = 'tag_added'
+                and data->'published'->'entry'->>'type' = %s
                 and data->'published'->'entry'->>'tag' = %s
             limit 1
             """,
             cid,
+            event_type,
             tag,
         )
     )
 
 
-def maybe_insert_tag_added_trigger_event(
+def maybe_insert_tag_trigger_event(
     db: DB,
     cid: str,
     email: str,
     contact_id: int,
+    event_type: str,
     tag: str,
     source: JsonObj | None = None,
     correlation_id: str | None = None,
@@ -113,7 +115,9 @@ def maybe_insert_tag_added_trigger_event(
 ) -> str | None:
     if not automation_trigger_emission_enabled():
         return None
-    if not matching_tag_added_automation_exists(db, cid, tag):
+    if event_type not in ("tag_added", "tag_removed"):
+        return None
+    if not matching_tag_trigger_automation_exists(db, cid, event_type, tag):
         return None
 
     now = datetime.utcnow()
@@ -138,16 +142,63 @@ def maybe_insert_tag_added_trigger_event(
         """
         insert into automation_trigger_events
             (id, cid, contact_id, contact_email, event_type, ts, data)
-        values (%s, %s, %s, %s, 'tag_added', %s, %s)
+        values (%s, %s, %s, %s, %s, %s, %s)
         """,
         event_id,
         cid,
         contact_id,
         email,
+        event_type,
         now,
         data,
     )
     return event_id
+
+
+def maybe_insert_tag_added_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_tag_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "tag_added",
+        tag,
+        source,
+        correlation_id,
+        depth,
+    )
+
+
+def maybe_insert_tag_removed_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_tag_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "tag_removed",
+        tag,
+        source,
+        correlation_id,
+        depth,
+    )
 
 
 def load_campaign_or_message(db: DB, campid: str) -> Tuple[JsonObj | None, bool]:
@@ -353,7 +404,18 @@ def update_tags(
             )
 
         for tag in remove_tags:
-            remove_tag(db, cid, email, contact_id, tag, tagcounts, webhook_msgs)
+            remove_tag(
+                db,
+                cid,
+                email,
+                contact_id,
+                tag,
+                tagcounts,
+                webhook_msgs,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
 
         if funnel is not None:
             assert respfunnels is not None
@@ -434,7 +496,10 @@ def remove_tag(
     tag: str,
     tagcounts: Dict[str, int],
     webhook_msgs: List[JsonObj],
-) -> None:
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
+) -> bool:
     is_del = db.execute(
         f"""delete from contacts."contact_values_{cid}"
                             where contact_id = %s and type = 'tag' and value = %s""",
@@ -453,6 +518,23 @@ def remove_tag(
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
         )
+
+        try:
+            maybe_insert_tag_removed_trigger_event(
+                db,
+                cid,
+                email,
+                contact_id,
+                tag,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
+        except Exception:
+            log.exception("failed to emit automation tag_removed trigger event")
+        return True
+
+    return False
 
 
 def erase(db: DB, cid: str, emails: List[str], unsublog: bool = False) -> None:

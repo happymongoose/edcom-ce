@@ -201,6 +201,33 @@ class TestAutomationTriggers(test_base.TestBase):
             },
         }
 
+    def remove_tag_workflow(self, remove_tag, entry_type="manual", entry_tag=None, reentry="once"):
+        entry = {"type": "manual"}
+        if entry_type in ("tag_added", "tag_removed"):
+            entry = {
+                "type": entry_type,
+                "tag": entry_tag or remove_tag,
+            }
+        return {
+            "entry": entry,
+            "reentry": reentry,
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_remove_tag_1",
+                        "type": "remove_tag",
+                        "label": "Remove tag",
+                        "draft_tag": remove_tag,
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
     def create_automation(self, tag, reentry="once", paused=False, entry_type="tag_added"):
         automation = self.user_post(
             "/api/automations",
@@ -234,6 +261,23 @@ class TestAutomationTriggers(test_base.TestBase):
         self.user_patch(
             "/api/automations/%s" % automation["id"],
             json=self.add_tag_workflow(add_tag, entry_type, entry_tag),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(published.status_code, 200)
+        return published.json
+
+    def create_remove_tag_automation(self, remove_tag, entry_type="manual", entry_tag=None):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_remove_tag_automation_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.remove_tag_workflow(remove_tag, entry_type, entry_tag),
         )
         published = self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
@@ -560,31 +604,132 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
         self.assertEqual(self.event_status(event["id"]), "processed")
 
-    def test_contact_remove_tag_does_not_emit_tag_removed_event_yet(self):
-        self.enable_emission()
-        self.enable_processing()
+    def test_tag_removed_emission_flag_off_does_not_create_event_even_with_match(self):
         email, contact_id = self.create_contact()
-        tag = "%s_removed_no_emit" % self.test_id
-        automation = self.create_automation(tag, entry_type="tag_removed")
+        tag = "%s_removed_emit_off" % self.test_id
+        self.create_automation(tag, entry_type="tag_removed")
         self.add_contact_tag(email, contact_id, tag)
+
+        removed = contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            {},
+            [],
+        )
+
+        self.assertTrue(removed)
         self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 0)
 
-        tagcounts = {}
+    def test_tag_removed_noop_does_not_create_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_removed_noop" % self.test_id
+        self.create_automation(tag, entry_type="tag_removed")
+
+        removed = contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            {},
+            [],
+        )
+
+        self.assertFalse(removed)
+        self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 0)
+
+    def test_tag_removed_emission_enabled_without_matching_automation_does_not_create_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_removed_no_match" % self.test_id
+        self.add_contact_tag(email, contact_id, tag)
+
+        removed = contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            {},
+            [],
+        )
+
+        self.assertTrue(removed)
+        self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 0)
+
+    def test_matching_published_tag_removed_automation_creates_pending_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_removed_emit_published" % self.test_id
+        self.create_automation(tag, entry_type="tag_removed")
+        self.add_contact_tag(email, contact_id, tag)
+
+        removed = contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            {},
+            [],
+        )
+
+        events = self.emitted_events(tag, "tag_removed")
+        self.assertTrue(removed)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
+        self.assertEqual(events[0][1]["source"]["type"], "manual")
+        self.assertEqual(events[0][1]["depth"], 0)
+
+    def test_matching_paused_tag_removed_automation_creates_pending_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_removed_emit_paused" % self.test_id
+        self.create_automation(tag, paused=True, entry_type="tag_removed")
+        self.add_contact_tag(email, contact_id, tag)
+
         contacts.remove_tag(
             self.db,
             self.user_cookie["cid"],
             email,
             contact_id,
             tag,
-            tagcounts,
+            {},
             [],
         )
+
+        events = self.emitted_events(tag, "tag_removed")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
+
+    def test_processing_emitted_tag_removed_event_creates_enrolment(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, contact_id = self.create_contact()
+        tag = "%s_removed_emit_process" % self.test_id
+        automation = self.create_automation(tag, entry_type="tag_removed")
+        self.add_contact_tag(email, contact_id, tag)
+
+        contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            {},
+            [],
+        )
+        events = self.emitted_events(tag, "tag_removed")
         result = self.process_events()
 
-        self.assertEqual(tagcounts[tag], -1)
-        self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 0)
-        self.assertEqual(result["processed"], 0)
-        self.assertEqual(len(self.enrolment_rows(automation["id"])), 0)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % events[0][0])
 
     def test_emission_flag_off_does_not_create_event_even_with_match(self):
         email, contact_id = self.create_contact()
@@ -687,12 +832,62 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(result["enrolled"], 1)
         self.assertEqual(len(self.enrolment_rows(target_automation["id"])), 1)
 
+    def test_automation_remove_tag_emits_source_metadata_when_another_automation_matches(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, contact_id = self.create_contact()
+        tag = "%s_remove_automation_source" % self.test_id
+        self.add_contact_tag(email, contact_id, tag)
+        source_automation = self.create_remove_tag_automation(tag)
+        target_automation = self.create_automation(tag, reentry="multiple", entry_type="tag_removed")
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200)
+        events = self.emitted_events(tag, "tag_removed")
+        self.assertEqual(len(events), 1)
+        source = events[0][1]["source"]
+        self.assertEqual(source["type"], "automation")
+        self.assertEqual(source["automation_id"], source_automation["id"])
+        self.assertEqual(source["enrolment_id"], enrolment["id"])
+        self.assertEqual(source["node_id"], "node_remove_tag_1")
+        self.assertEqual(source["step_run_id"], run.json["step_run"]["id"])
+        self.assertEqual(source["published_revision"], str(source_automation["published_revision"]))
+
+        result = self.process_events()
+
+        self.assertEqual(result["enrolled"], 1)
+        self.assertEqual(len(self.enrolment_rows(target_automation["id"])), 1)
+
     def test_same_automation_source_emitted_event_is_suppressed(self):
         self.enable_emission()
         self.enable_processing()
         email, _ = self.create_contact()
         tag = "%s_same_auto_emit" % self.test_id
         automation = self.create_add_tag_automation(tag, "tag_added", tag)
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200)
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "same_automation_source")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
+    def test_same_automation_source_tag_removed_event_is_suppressed(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, contact_id = self.create_contact()
+        tag = "%s_same_auto_remove_emit" % self.test_id
+        self.add_contact_tag(email, contact_id, tag)
+        automation = self.create_remove_tag_automation(tag, "tag_removed", tag)
         enrolment = self.user_post(
             "/api/automations/%s/enrolments" % automation["id"],
             json={"email": email},
@@ -734,6 +929,37 @@ class TestAutomationTriggers(test_base.TestBase):
         events = self.emitted_events(tag)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][1]["correlation_id"], "%s_existing_correlation" % self.test_id)
+        self.assertEqual(events[0][1]["depth"], 3)
+
+    def test_depth_increments_for_automation_caused_tag_removed_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_remove_depth_increment" % self.test_id
+        self.add_contact_tag(email, contact_id, tag)
+        source_automation = self.create_remove_tag_automation(tag)
+        self.create_automation(tag, entry_type="tag_removed")
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+        self.patch_enrolment_status(enrolment["id"], "ready")
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || jsonb_build_object('trigger_correlation_id', %s, 'trigger_depth', 2)
+            where cid = %s and id = %s
+            """,
+            "%s_existing_remove_correlation" % self.test_id,
+            self.user_cookie["cid"],
+            enrolment["id"],
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200)
+
+        events = self.emitted_events(tag, "tag_removed")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["correlation_id"], "%s_existing_remove_correlation" % self.test_id)
         self.assertEqual(events[0][1]["depth"], 3)
 
     def test_source_payload_is_bounded_and_sanitized(self):
