@@ -344,6 +344,20 @@ class TestAutomationEnrolments(test_base.TestBase):
 
         self.cleanup(completed_automation["id"], exited_automation["id"])
 
+    def test_once_blocks_after_failed_enrolment(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="once")
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.set_enrolment_status(first.json["id"], "failed")
+
+        again = self.enrol(automation["id"], email)
+
+        self.assertEqual(again.status_code, 400)
+        self.assertIn("only allows a contact to enter once", again.text)
+
+        self.cleanup(automation["id"])
+
     def test_multiple_blocks_duplicate_ready_enrolment(self):
         email, _, _ = self.create_contact()
         automation = self.create_automation(reentry="multiple")
@@ -427,6 +441,22 @@ class TestAutomationEnrolments(test_base.TestBase):
         first = self.enrol(automation["id"], email)
         self.assertEqual(first.status_code, 201)
         self.set_enrolment_status(first.json["id"], "cancelled")
+
+        second = self.enrol(automation["id"], email)
+        self.assertEqual(second.status_code, 201)
+
+        enrolments = self.list_enrolments(automation["id"])
+        self.assertEqual(len(enrolments), 2)
+
+        self.cleanup(automation["id"])
+
+    def test_multiple_allows_new_enrolment_after_failed(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(reentry="multiple")
+
+        first = self.enrol(automation["id"], email)
+        self.assertEqual(first.status_code, 201)
+        self.set_enrolment_status(first.json["id"], "failed")
 
         second = self.enrol(automation["id"], email)
         self.assertEqual(second.status_code, 201)

@@ -314,7 +314,7 @@ REENTRY_SCHEMA = {
     "enum": ["once", "multiple"],
 }
 
-TERMINAL_ENROLMENT_STATUSES = ("completed", "exited", "cancelled")
+TERMINAL_ENROLMENT_STATUSES = ("completed", "exited", "cancelled", "failed")
 
 
 ENTRY_SCHEMA = {
