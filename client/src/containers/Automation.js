@@ -258,6 +258,29 @@ export function automationHistoryContacts(history) {
     .value();
 }
 
+export function filterAutomationHistoryContacts(contacts, search) {
+  const term = (search || '').trim().toLowerCase();
+  if (!term) {
+    return contacts || [];
+  }
+  return _.filter(contacts || [], contact => (contact.email || '').toLowerCase().indexOf(term) !== -1);
+}
+
+export function paginateAutomationHistoryContacts(contacts, page, pageSize) {
+  const size = pageSize || 50;
+  const total = (contacts || []).length;
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  const currentPage = Math.min(Math.max(parseInt(page, 10) || 1, 1), totalPages);
+  const start = (currentPage - 1) * size;
+  return {
+    contacts: (contacts || []).slice(start, start + size),
+    page: currentPage,
+    pageSize: size,
+    total: total,
+    totalPages: totalPages,
+  };
+}
+
 export function automationEnrolmentAction(enrolment, automation, now) {
   if (_.contains(['held', 'paused_ready', 'paused_waiting'], enrolment.status)) {
     return {
@@ -321,6 +344,8 @@ class Automation extends Component {
       isCreatingEmail: false,
       deletingEmailId: null,
       duplicatingEmailId: null,
+      historyContactSearch: '',
+      historyContactPage: 1,
     };
   }
 
@@ -334,6 +359,17 @@ class Automation extends Component {
 
   enrolEmailChange = event => {
     this.setState({enrolEmail: event.target.value});
+  }
+
+  historyContactSearchChange = event => {
+    this.setState({
+      historyContactSearch: event.target.value,
+      historyContactPage: 1,
+    });
+  }
+
+  historyContactPageChange = page => {
+    this.setState({historyContactPage: page});
   }
 
   nodeChange = (index, event) => {
@@ -1330,6 +1366,8 @@ class Automation extends Component {
   renderHistory() {
     const history = this.props.historyData || {};
     const contacts = automationHistoryContacts(history);
+    const filteredContacts = filterAutomationHistoryContacts(contacts, this.state.historyContactSearch);
+    const contactPage = paginateAutomationHistoryContacts(filteredContacts, this.state.historyContactPage, 50);
     const log = automationHistoryLog(history, {newestFirst: true});
 
     return (
@@ -1342,11 +1380,31 @@ class Automation extends Component {
           </Panel.Heading>
           <Panel.Collapse>
             <Panel.Body>
+              <div className="flex-items space-between" style={{marginBottom: '12px'}}>
+                <div style={{width: '360px', maxWidth: '100%'}}>
+                  <FormControl
+                    type="text"
+                    placeholder="Search contacts by email"
+                    value={this.state.historyContactSearch}
+                    onChange={this.historyContactSearchChange}
+                  />
+                </div>
+                <div className="text-right" style={{paddingTop: '8px'}}>
+                  <span>
+                    {
+                      filteredContacts.length ?
+                        'Showing ' + (((contactPage.page - 1) * contactPage.pageSize) + 1) + '-' + (((contactPage.page - 1) * contactPage.pageSize) + contactPage.contacts.length) + ' of ' + filteredContacts.length + ' contacts'
+                      :
+                        'Showing 0 contacts'
+                    }
+                  </span>
+                </div>
+              </div>
               {
-                contacts.length ?
+                contactPage.contacts.length ?
                   <PanelGroup accordion id="automation-history-contacts-accordion">
                     {
-                      _.map(contacts, (contact, contactIndex) =>
+                      _.map(contactPage.contacts, (contact, contactIndex) =>
                         <Panel eventKey={contact.id} key={contact.id}>
                           <Panel.Heading>
                             <Panel.Title toggle style={{fontSize: '14px'}}>
@@ -1386,7 +1444,29 @@ class Automation extends Component {
                     }
                   </PanelGroup>
                 :
-                  <p>No automation history yet.</p>
+                  <p>{this.state.historyContactSearch ? 'No contacts match that email search.' : 'No automation history yet.'}</p>
+              }
+              {
+                contactPage.totalPages > 1 ?
+                  <div className="flex-items space-between" style={{marginTop: '12px', marginBottom: '16px'}}>
+                    <Button
+                      bsSize="small"
+                      disabled={contactPage.page <= 1}
+                      onClick={this.historyContactPageChange.bind(this, contactPage.page - 1)}
+                    >
+                      Previous
+                    </Button>
+                    <span>Page {contactPage.page} of {contactPage.totalPages}</span>
+                    <Button
+                      bsSize="small"
+                      disabled={contactPage.page >= contactPage.totalPages}
+                      onClick={this.historyContactPageChange.bind(this, contactPage.page + 1)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                :
+                  null
               }
               <div className="flex-items space-between" style={{marginTop: '16px', marginBottom: '6px', position: 'relative', zIndex: 2}}>
                 <h4>Plain text log</h4>

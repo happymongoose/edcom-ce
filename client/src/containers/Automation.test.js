@@ -2,9 +2,11 @@ import _ from 'underscore';
 
 import {
   automationEnrolmentAction,
+  filterAutomationHistoryContacts,
   automationHistoryContacts,
   automationHistoryLogForEnrolment,
   automationHistoryLog,
+  paginateAutomationHistoryContacts,
   canReEnrolAutomation,
   displayAutomationEnrolments,
 } from './Automation';
@@ -373,6 +375,37 @@ describe('automation enrolment display helpers', () => {
     expect(contacts[0].email).toBe('contact@example.com');
     expect(_.pluck(contacts[0].enrolments, 'id')).toEqual(['newer-pass', 'older-pass']);
     expect(contacts[1].email).toBe('other@example.com');
+  });
+
+  it('filters debug history contacts by email address', () => {
+    const contacts = [
+      {email: 'sarah@example.com'},
+      {email: 'simon@example.com'},
+      {email: 'admin@test.com'},
+    ];
+
+    expect(_.pluck(filterAutomationHistoryContacts(contacts, 'SIM'), 'email')).toEqual(['simon@example.com']);
+    expect(_.pluck(filterAutomationHistoryContacts(contacts, 'example.com'), 'email')).toEqual(['sarah@example.com', 'simon@example.com']);
+    expect(filterAutomationHistoryContacts(contacts, '')).toEqual(contacts);
+  });
+
+  it('paginates debug history contacts in groups of 50', () => {
+    const contacts = _.map(_.range(0, 121), index => ({email: 'contact-' + index + '@example.com'}));
+
+    const first = paginateAutomationHistoryContacts(contacts, 1, 50);
+    expect(first.total).toBe(121);
+    expect(first.totalPages).toBe(3);
+    expect(first.page).toBe(1);
+    expect(first.contacts).toHaveLength(50);
+    expect(first.contacts[0].email).toBe('contact-0@example.com');
+
+    const third = paginateAutomationHistoryContacts(contacts, 3, 50);
+    expect(third.page).toBe(3);
+    expect(third.contacts).toHaveLength(21);
+    expect(third.contacts[0].email).toBe('contact-100@example.com');
+
+    const clamped = paginateAutomationHistoryContacts(contacts, 99, 50);
+    expect(clamped.page).toBe(3);
   });
 
   it('formats copy-friendly history text for one pass only', () => {
