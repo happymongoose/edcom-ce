@@ -244,6 +244,11 @@ class TestAutomationEmailEvents(test_base.TestBase):
             step_run_id,
         ).fetchall()
 
+    def event_row(self, step_run_id, event_type):
+        rows = [row for row in self.event_rows(step_run_id) if row[0] == event_type]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
     def test_automation_open_tracking_writes_event(self):
         email, contact_id = self.create_contact()
         send = self.create_automation_send_step_run(contact_id, email)
@@ -295,14 +300,21 @@ class TestAutomationEmailEvents(test_base.TestBase):
         self.assertEqual(result.status_code, 301)
         self.assertEqual(result.headers["location"], "https://example.com/offer")
         rows = self.event_rows(send["step_run_id"])
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
+        self.assertEqual(len(rows), 2)
+        row = self.event_row(send["step_run_id"], "click")
         self.assertEqual(row[0], "click")
         self.assertEqual(row[2], contact_id)
         self.assertEqual(row[5], send["automation_email_id"])
         self.assertEqual(row[9]["link_id"], link_id)
         self.assertEqual(row[9]["link_index"], 2)
         self.assertEqual(row[9]["link_url"], "https://example.com/offer")
+        open_row = self.event_row(send["step_run_id"], "open")
+        self.assertEqual(open_row[2], contact_id)
+        self.assertEqual(open_row[5], send["automation_email_id"])
+        self.assertEqual(open_row[9]["inferred"], True)
+        self.assertEqual(open_row[9]["inferred_from_event_type"], "click")
+        self.assertEqual(open_row[9]["inferred_from_link_id"], link_id)
+        self.assertEqual(open_row[9]["inferred_from_link_index"], 2)
         self.assertIsNone(
             self.db.single(
                 f"""select ts from contacts."contact_click_logs_{self.user_cookie['cid']}" where contact_id = %s and campid = %s""",
@@ -339,7 +351,33 @@ class TestAutomationEmailEvents(test_base.TestBase):
         self.assertEqual(self.track("click", send["step_run_id"], email, tracking_id, link_id).status_code, 301)
         self.assertEqual(self.track("click", send["step_run_id"], email, tracking_id, link_id).status_code, 301)
 
-        self.assertEqual(len(self.event_rows(send["step_run_id"])), 1)
+        rows = self.event_rows(send["step_run_id"])
+        self.assertEqual(len([row for row in rows if row[0] == "click"]), 1)
+        self.assertEqual(len([row for row in rows if row[0] == "open"]), 1)
+
+    def test_explicit_automation_open_before_click_is_not_duplicated(self):
+        email, contact_id = self.create_contact()
+        send = self.create_automation_send_step_run(contact_id, email)
+        tracking_id = self.create_mailgun_tracking()
+        link_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into links (id, url, campaign, index, track) values (%s, %s, %s, %s, %s)",
+            link_id,
+            "https://example.com/offer",
+            send["step_run_id"],
+            2,
+            True,
+        )
+        self.created_link_ids.append(link_id)
+
+        self.assertEqual(self.track("open", send["step_run_id"], email, tracking_id).status_code, 200)
+        self.assertEqual(self.track("click", send["step_run_id"], email, tracking_id, link_id).status_code, 301)
+
+        rows = self.event_rows(send["step_run_id"])
+        self.assertEqual(len([row for row in rows if row[0] == "click"]), 1)
+        self.assertEqual(len([row for row in rows if row[0] == "open"]), 1)
+        open_row = self.event_row(send["step_run_id"], "open")
+        self.assertNotEqual(open_row[9].get("inferred"), True)
 
     def test_provider_event_endpoint_captures_automation_open(self):
         email, contact_id = self.create_contact()

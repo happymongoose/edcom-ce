@@ -821,6 +821,41 @@ def write_automation_engagement_event(
         event_ts,
         data,
     )
+    if t == "click":
+        inferred_open_data = {
+            "provider": sinkid,
+            "settings_id": settingsid,
+            "tracking_id": tracking_id,
+            "ip": clientip or ip,
+            "user_agent": useragent,
+            "created": datetime.utcnow().isoformat() + "Z",
+            "inferred": True,
+            "inferred_from_event_type": "click",
+            "inferred_from_link_id": link_id or "",
+            "inferred_from_link_index": linkindex,
+        }
+        db.execute(
+            """
+            insert into automation_email_events
+                (
+                    id, cid, contact_id, contact_email, automation_id, automation_email_id,
+                    enrolment_id, send_node_id, send_step_run_id, event_type, ts, data
+                )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s)
+            on conflict do nothing
+            """,
+            shortuuid.uuid(),
+            cid,
+            contact_id,
+            contact_email,
+            automation_id,
+            automation_email_id,
+            enrolment_id,
+            send_node_id,
+            send_step_run_id,
+            event_ts,
+            inferred_open_data,
+        )
     return True
 
 

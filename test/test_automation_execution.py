@@ -1960,6 +1960,32 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_if_opened_email_true_branch_when_inferred_open_exists(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_opened_email")
+        enrolment = self.enrol(automation["id"], email)
+        event_id = self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+        )
+        self.db.execute(
+            "update automation_email_events set data = data || %s where id = %s",
+            {"inferred": True, "inferred_from_event_type": "click"},
+            event_id,
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["result"], True)
+        self.assertEqual(result.json["step_run"]["branch"], "yes")
+
+        self.cleanup(automation["id"])
+
     def test_if_opened_email_ignores_open_from_another_enrolment(self):
         email, contact_id = self.create_contact()
         automation = self.create_email_engagement_condition_automation("if_opened_email")
