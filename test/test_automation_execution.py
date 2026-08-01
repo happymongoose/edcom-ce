@@ -1437,6 +1437,10 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Automation email is missing", result.text)
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -1451,6 +1455,10 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("missing From Name", result.text)
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -1465,6 +1473,10 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("missing Sender Email Address", result.text)
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -1479,6 +1491,10 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("No postal route available", result.text)
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -1495,6 +1511,10 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Multiple postal routes available", result.text)
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -1677,13 +1697,79 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertIn("Drop All Mail", result.text)
         data = self.enrolment_data(enrolment["id"])
         self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["retry_count"], 1)
+        self.assertIsNotNone(data["retry_after"])
+        self.assertEqual(data["last_failure_retryable"], True)
+        self.assertEqual(data["last_failure_class"], "provider")
         self.assert_claim_cleared(data)
         runs = self.step_runs(automation["id"], enrolment["id"])
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0][6], "send_email")
         self.assertEqual(runs[0][7]["status"], "failed")
         self.assertIn("Drop All Mail", runs[0][7]["error"])
+        self.assertEqual(runs[0][7]["retryable"], True)
+        self.assertEqual(runs[0][7]["retry_count"], 1)
+        self.assertIsNotNone(runs[0][7]["retry_after"])
         self.assertEqual(self.debug_email_logs(automation["id"]), [])
+
+        self.cleanup(automation["id"])
+
+    def test_retryable_send_email_failure_marks_failed_after_max_retries(self):
+        email, _ = self.create_contact()
+        route_id = self.create_drop_all_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "retry_count": 3,
+                "retry_after": (datetime.utcnow() + timedelta(hours=1)).isoformat() + "Z",
+            },
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 400)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["retry_count"], 4)
+        self.assertIsNone(data.get("retry_after"))
+        self.assertEqual(data["last_error"]["status"], "failed")
+        self.assert_claim_cleared(data)
+
+        self.cleanup(automation["id"])
+
+    def test_success_clears_retry_failure_metadata_and_manual_run_bypasses_backoff(self):
+        email, _ = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "retry_count": 1,
+                "retry_after": (datetime.utcnow() + timedelta(hours=1)).isoformat() + "Z",
+                "last_error": {"title": "Previous failure"},
+                "last_failed_node_id": "node_send_email_1",
+                "last_failed_node_type": "send_email",
+                "last_failed_step_run_id": "previous-step-run",
+                "last_failure_retryable": True,
+                "last_failure_class": "provider",
+            },
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertIsNone(data.get("retry_count"))
+        self.assertIsNone(data.get("retry_after"))
+        self.assertIsNone(data.get("last_error"))
+        self.assertIsNone(data.get("last_failed_node_id"))
+        self.assertIsNone(data.get("last_failed_step_run_id"))
+        self.assertEqual(len(self.debug_email_logs(automation["id"])), 1)
 
         self.cleanup(automation["id"])
 
@@ -1909,6 +1995,10 @@ class TestAutomationExecution(test_base.TestBase):
         result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
         self.assertIn("if_has_tag yes target was not found", result.text)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -2317,6 +2407,10 @@ class TestAutomationExecution(test_base.TestBase):
         result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
         self.assertIn("go_to target was not found", result.text)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
 
         self.cleanup(automation["id"])
 
@@ -2673,6 +2767,58 @@ class TestAutomationExecution(test_base.TestBase):
         data = self.enrolment_data(enrolment["id"])
         self.assertEqual(data["status"], "waiting")
         self.assertEqual(data["wake_at"], started.json["enrolment"]["wake_at"])
+
+        self.cleanup(automation["id"])
+
+    def test_processor_skips_future_retry_after(self):
+        email, _ = self.create_contact()
+        route_id = self.create_drop_all_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "retry_count": 1,
+                "retry_after": (datetime.utcnow() + timedelta(hours=1)).isoformat() + "Z",
+            },
+        )
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 0)
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 0)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["retry_count"], 1)
+
+        self.cleanup(automation["id"])
+
+    def test_processor_retries_after_elapsed_retry_after(self):
+        email, _ = self.create_contact()
+        route_id = self.create_drop_all_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "retry_count": 1,
+                "retry_after": (datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z",
+            },
+        )
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+        self.assertEqual(result.json["failed"], 1)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["retry_count"], 2)
+        self.assertIsNotNone(data["retry_after"])
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
 
         self.cleanup(automation["id"])
 

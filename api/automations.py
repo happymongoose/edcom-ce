@@ -1515,6 +1515,9 @@ def _automation_email_sender(email_doc: JsonObj) -> tuple[str, str, str, str]:
 
 
 CLAIM_STALE_AFTER = timedelta(minutes=30)
+AUTOMATION_RETRY_BACKOFFS = (timedelta(minutes=5), timedelta(minutes=15), timedelta(minutes=60))
+AUTOMATION_MAX_RETRIES = len(AUTOMATION_RETRY_BACKOFFS)
+AUTOMATION_ERROR_TEXT_LIMIT = 1000
 AUTOMATION_PROCESS_DEFAULT_LIMIT = 25
 AUTOMATION_PROCESS_MAX_LIMIT = 100
 AUTOMATION_PROCESS_ERROR_LIMIT = 100
@@ -1553,6 +1556,98 @@ def _claim_clear_patch() -> JsonObj:
         "claimed_node_id": None,
         "claimed_published_revision": None,
     }
+
+
+def _retry_clear_patch() -> JsonObj:
+    return {
+        "retry_count": None,
+        "retry_after": None,
+        "last_error": None,
+        "last_failed_node_id": None,
+        "last_failed_node_type": None,
+        "last_failed_step_run_id": None,
+        "last_failure_retryable": None,
+        "last_failure_class": None,
+    }
+
+
+def _bounded_error_text(value: object) -> str:
+    text = str(value or "")
+    if len(text) > AUTOMATION_ERROR_TEXT_LIMIT:
+        return text[:AUTOMATION_ERROR_TEXT_LIMIT] + "... [truncated]"
+    return text
+
+
+def _automation_failure_is_retryable(error: falcon.HTTPError) -> bool:
+    return error.title == "Error sending automation email"
+
+
+def _automation_failure_class(error: falcon.HTTPError, retryable: bool) -> str:
+    if retryable:
+        return "provider"
+    if error.title in (
+        "Automation email is missing",
+        "Automation email sender is incomplete",
+        "No postal route available",
+        "Multiple postal routes available",
+        "Automation branch target is missing",
+        "Automation go to target is missing",
+        "Current automation node is missing",
+        "Unsupported automation node",
+    ):
+        return "configuration"
+    return "validation"
+
+
+def _automation_failure_update(
+    enrolment: JsonObj,
+    error: falcon.HTTPError,
+    original_status: str,
+    node: JsonObj,
+    node_type: str,
+    run_id: str | None,
+    failed_at: str,
+) -> tuple[str, JsonObj]:
+    retryable = _automation_failure_is_retryable(error)
+    failure_class = _automation_failure_class(error, retryable)
+    title = _bounded_error_text(error.title)
+    description = _bounded_error_text(error.description or error.title)
+
+    retry_count = int(enrolment.get("retry_count") or 0)
+    retry_after = None
+    release_status = "held"
+    if retryable:
+        retry_count += 1
+        if retry_count > AUTOMATION_MAX_RETRIES:
+            release_status = "failed"
+        else:
+            release_status = original_status
+            retry_after = (datetime.utcnow() + AUTOMATION_RETRY_BACKOFFS[retry_count - 1]).isoformat() + "Z"
+
+    update = {
+        "last_error": {
+            "title": title,
+            "description": description,
+            "at": failed_at,
+            "retryable": retryable,
+            "failure_class": failure_class,
+            "retry_count": retry_count if retryable else None,
+            "retry_after": retry_after,
+            "status": release_status,
+        },
+        "last_failed_node_id": node.get("id"),
+        "last_failed_node_type": node_type,
+        "last_failed_step_run_id": run_id,
+        "last_failure_retryable": retryable,
+        "last_failure_class": failure_class,
+    }
+    if retryable:
+        update["retry_count"] = retry_count
+        update["retry_after"] = retry_after
+    else:
+        update["retry_count"] = 0
+        update["retry_after"] = None
+    return release_status, update
 
 
 def _running_status(enrolment: JsonObj) -> str:
@@ -1693,6 +1788,7 @@ def _advance_claimed_enrolment(
 ) -> None:
     update = update.copy()
     update.update(_claim_clear_patch())
+    update.update(_retry_clear_patch())
     updated = db.execute(
         """
         update automation_enrolments
@@ -3076,10 +3172,12 @@ def _run_next_automation_enrolment(
     original_status = _running_status(enrolment)
     run_id = shortuuid.uuid()
     run_inserted = False
+    current_node_id = enrolment.get("current_node_id")
+    node: JsonObj = {"id": current_node_id}
+    node_type = "unknown"
 
     try:
         nodes = published.get("nodes") or []
-        current_node_id = enrolment.get("current_node_id")
         node_index = None
         for i, node in enumerate(nodes):
             if node.get("id") == current_node_id:
@@ -3667,32 +3765,46 @@ def _run_next_automation_enrolment(
             }
     except falcon.HTTPError as e:
         fail_now = _utc_now()
-        if run_inserted:
-            _patch_step_run(
-                db,
-                cid,
-                run_id,
-                {
-                    "status": "failed",
-                    "error": e.description or e.title,
-                    "failed_at": fail_now,
-                },
+        wait_not_elapsed = e.title == "Wait has not elapsed"
+        failure_status = original_status
+        failure_update: JsonObj = {}
+        if not wait_not_elapsed:
+            failure_status, failure_update = _automation_failure_update(
+                enrolment,
+                e,
+                original_status,
+                node,
+                node_type,
+                run_id if run_inserted else None,
+                fail_now,
             )
+        if run_inserted:
+            step_failure = {
+                "status": "failed",
+                "error": _bounded_error_text(e.description or e.title),
+                "failed_at": fail_now,
+            }
+            if failure_update:
+                last_error = failure_update.get("last_error") or {}
+                step_failure.update(
+                    {
+                        "retryable": last_error.get("retryable"),
+                        "failure_class": last_error.get("failure_class"),
+                        "retry_count": last_error.get("retry_count"),
+                        "retry_after": last_error.get("retry_after"),
+                        "failure_status": last_error.get("status"),
+                    }
+                )
+            _patch_step_run(db, cid, run_id, step_failure)
         _release_run_claim(
             db,
             cid,
             id,
             enrolment_id,
             claim_token,
-            original_status,
+            failure_status,
             fail_now,
-            {
-                "last_error": {
-                    "title": e.title,
-                    "description": e.description,
-                    "at": fail_now,
-                },
-            },
+            failure_update,
         )
         raise
 
@@ -4591,11 +4703,11 @@ def _eligible_automation_enrolments(
     automation_id: str | None = None,
 ) -> List[JsonObj]:
     now = datetime.utcnow()
-    params: List[object] = [cid, now, limit]
+    params: List[object] = [cid, now, now, limit]
     automation_filter = ""
     if automation_id:
         automation_filter = "and e.automation_id = %s"
-        params = [cid, automation_id, now, limit]
+        params = [cid, automation_id, now, now, limit]
 
     return [
         {
@@ -4620,6 +4732,10 @@ def _eligible_automation_enrolments(
                         e.data->>'status' = 'waiting'
                         and nullif(e.data->>'wake_at', '')::timestamptz <= %s
                     )
+                )
+                and (
+                    nullif(e.data->>'retry_after', '') is null
+                    or nullif(e.data->>'retry_after', '')::timestamptz <= %s
                 )
             order by
                 coalesce(
@@ -4686,6 +4802,10 @@ def _automation_processing_account_ids(
                         and nullif(e.data->>'wake_at', '')::timestamptz <= %s
                     )
                 )
+                and (
+                    nullif(e.data->>'retry_after', '') is null
+                    or nullif(e.data->>'retry_after', '')::timestamptz <= %s
+                )
             group by e.cid
             order by min(
                 coalesce(
@@ -4696,6 +4816,7 @@ def _automation_processing_account_ids(
             limit %s
             """,
             {"admin": False},
+            datetime.utcnow(),
             datetime.utcnow(),
             account_limit,
         )
