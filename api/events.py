@@ -699,6 +699,131 @@ def write_list(
         send_webhooks(db, camp["cid"], webhook_msgs)
 
 
+def write_automation_engagement_event(
+    db: DB,
+    email: str,
+    t: str,
+    campid: str,
+    sinkid: str,
+    settingsid: str,
+    ip: str,
+    ts: datetime | int | None,
+    linkindex: int,
+    linktrack: bool,
+    clientip: str,
+    useragent: str,
+    link_id: str | None = None,
+    link_url: str | None = None,
+    tracking_id: str | None = None,
+) -> bool:
+    if t not in ("open", "click"):
+        return False
+
+    step_run = db.row(
+        """
+        select id, cid, automation_id, enrolment_id, contact_id, node_id, data
+        from automation_step_runs
+        where id = %s and node_type = 'send_email'
+        """,
+        campid,
+    )
+    if step_run is None:
+        return False
+
+    (
+        send_step_run_id,
+        cid,
+        automation_id,
+        enrolment_id,
+        contact_id,
+        send_node_id,
+        step_data,
+    ) = step_run
+
+    if t == "click" and not linktrack:
+        return True
+
+    contact_row = db.row(
+        f"""
+        select contact_id, email
+        from contacts."contacts_{cid}"
+        where lower(email) = lower(%s)
+        """,
+        email,
+    )
+    if contact_row is None:
+        log.info("automation engagement ignored: %s (contact not found)", email)
+        return True
+
+    event_contact_id, contact_email = contact_row
+    if event_contact_id != contact_id:
+        log.info(
+            "automation engagement ignored: step run %s belongs to contact %s, got %s",
+            send_step_run_id,
+            contact_id,
+            event_contact_id,
+        )
+        return True
+
+    automation_email_id = step_data.get("automation_email_id")
+    if not automation_email_id:
+        log.info(
+            "automation engagement ignored: step run %s has no automation email id",
+            send_step_run_id,
+        )
+        return True
+
+    if not ts:
+        event_ts = datetime.utcnow()
+    elif not isinstance(ts, datetime):
+        event_ts = mailtimeepoch + timedelta(hours=ts)
+    else:
+        event_ts = ts
+
+    data: JsonObj = {
+        "provider": sinkid,
+        "settings_id": settingsid,
+        "tracking_id": tracking_id,
+        "ip": clientip or ip,
+        "user_agent": useragent,
+        "created": datetime.utcnow().isoformat() + "Z",
+    }
+    if t == "click":
+        data.update(
+            {
+                "link_id": link_id or "",
+                "link_index": linkindex,
+                "link_url": link_url or "",
+                "updated_ts": 0,
+            }
+        )
+
+    db.execute(
+        """
+        insert into automation_email_events
+            (
+                id, cid, contact_id, contact_email, automation_id, automation_email_id,
+                enrolment_id, send_node_id, send_step_run_id, event_type, ts, data
+            )
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict do nothing
+        """,
+        shortuuid.uuid(),
+        cid,
+        contact_id,
+        contact_email,
+        automation_id,
+        automation_email_id,
+        enrolment_id,
+        send_node_id,
+        send_step_run_id,
+        t,
+        event_ts,
+        data,
+    )
+    return True
+
+
 def write_txnsend(db: DB, campcid: str, msgid: str, t: str, msg: str) -> None:
     last = db.single(
         "select data from txnsends where msgid = %s order by ts desc limit 1", msgid
@@ -842,15 +967,33 @@ class Events(object):
                         try:
                             index = -1
                             track = True
+                            link_url = None
                             if t in ("click", "unsub") and linkid:
                                 if linkid not in links:
                                     links[linkid] = db.row(
-                                        "select index, track from links where id = %s",
+                                        "select url, index, track from links where id = %s",
                                         linkid,
                                     )
                                 linkobj = links[linkid]
                                 if linkobj is not None:
-                                    index, track = linkobj
+                                    link_url, index, track = linkobj
+                            if write_automation_engagement_event(
+                                db,
+                                email,
+                                t,
+                                c,
+                                sendingsink["id"],
+                                s,
+                                ip,
+                                ts,
+                                index,
+                                track,
+                                clientip,
+                                useragent,
+                                link_id=linkid or None,
+                                link_url=link_url,
+                            ):
+                                continue
                             if c.startswith("tx-"):
                                 if txntag is not None:
                                     write_txn(
@@ -1479,6 +1622,9 @@ def process_track_event(
     track: bool,
     clientip: str,
     useragent: str,
+    link_id: str | None = None,
+    link_url: str | None = None,
+    tracking_id: str | None = None,
 ) -> None:
     camp = None
     is_camp = True
@@ -1503,7 +1649,7 @@ def process_track_event(
         if camp is not None and camp.get("archived", False):
             camp = None
 
-    if camp is not None or c.startswith("tx-"):
+    if camp is not None or c.startswith("tx-") or t in ("open", "click"):
         email = unencrypt(u)
         if email is None or "@" not in email:
             log.info("event error: %s (invalid email)", u)
@@ -1522,6 +1668,26 @@ def process_track_event(
             if cid is None:
                 log.info("event error: %s (api account not found)", settingsid)
             else:
+                if write_automation_engagement_event(
+                    db,
+                    email,
+                    t,
+                    c,
+                    sinkid,
+                    settingsid,
+                    ip,
+                    ts,
+                    index,
+                    track,
+                    clientip,
+                    useragent,
+                    link_id=link_id,
+                    link_url=link_url,
+                    tracking_id=tracking_id,
+                ):
+                    return
+                if camp is None and not c.startswith("tx-"):
+                    return
                 if c.startswith("tx-"):
                     if txntag is not None:
                         write_txn(
@@ -1672,6 +1838,9 @@ class Track(object):
                                                     "txnmsgid": txnmsgid,
                                                     "useragent": useragent,
                                                     "clientip": clientip,
+                                                    "link_id": linkid,
+                                                    "link_url": url,
+                                                    "tracking_id": tr,
                                                     "added": datetime.utcnow().isoformat()
                                                     + "Z",
                                                 }
@@ -1712,6 +1881,9 @@ class Track(object):
                     track,
                     clientip,
                     useragent,
+                    link_id=linkid,
+                    link_url=url,
+                    tracking_id=tr,
                 )
 
             if t == "open":
@@ -2150,6 +2322,9 @@ def process_sp_webhook(db: DB, rdb: redis.StrictRedis, jsonobj: JsonObj) -> None
                     evo["track"],
                     evo["clientip"],
                     evo["useragent"],
+                    link_id=evo.get("link_id"),
+                    link_url=evo.get("link_url"),
+                    tracking_id=evo.get("tracking_id"),
                 )
     elif msgtype in ("hard", "complaint"):
         trackrow = db.row("select ip, ts from sptracking where id = %s", trackingid)
@@ -2397,6 +2572,9 @@ def process_mg_webhook(db: DB, rdb: redis.StrictRedis, jsonobj: JsonObj) -> None
                     evo["track"],
                     evo["clientip"],
                     evo["useragent"],
+                    link_id=evo.get("link_id"),
+                    link_url=evo.get("link_url"),
+                    tracking_id=evo.get("tracking_id"),
                 )
     elif msgtype in ("hard", "complaint"):
         trackrow = db.row("select ip, ts from mgtracking where id = %s", trackingid)
