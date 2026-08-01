@@ -8,6 +8,7 @@ class TestAutomationCRUD(test_base.TestBase):
         self.created_automation_ids = []
         self.created_email_ids = []
         self.created_list_ids = []
+        self.created_segment_ids = []
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
@@ -51,6 +52,13 @@ class TestAutomationCRUD(test_base.TestBase):
             self.db.execute(
                 "delete from lists where id = any(%s) and cid in (%s, %s)",
                 self.created_list_ids,
+                cid,
+                "other-account-cid",
+            )
+        if self.created_segment_ids:
+            self.db.execute(
+                "delete from segments where id = any(%s) and cid in (%s, %s)",
+                self.created_segment_ids,
                 cid,
                 "other-account-cid",
             )
@@ -178,6 +186,17 @@ class TestAutomationCRUD(test_base.TestBase):
         lst = self.user_post("/api/lists", json={"name": name})
         self.created_list_ids.append(lst["id"])
         return lst
+
+    def create_segment(self, name="automation_crud_segment"):
+        segment = self.user_post(
+            "/api/segments",
+            json={
+                "name": name,
+                "parts": [],
+            },
+        )
+        self.created_segment_ids.append(segment["id"])
+        return segment
 
     def go_to_workflow(self, go_to=None):
         if go_to is None:
@@ -725,6 +744,115 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.assertEqual(result.status_code, 400)
         self.assertIn("List entry trigger must reference a contact list from this account", result.text)
+
+    def test_segment_entered_entry_with_segment_publishes(self):
+        automation = self.create_tracked_automation("Segment Entered Entry Publish")
+        segment = self.create_segment("automation_crud_entered_entry")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "segment_entered",
+            "segment_id": segment["id"],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {
+                "type": "segment_entered",
+                "segment_id": segment["id"],
+            },
+        )
+
+    def test_segment_left_entry_with_segment_publishes(self):
+        automation = self.create_tracked_automation("Segment Left Entry Publish")
+        segment = self.create_segment("automation_crud_left_segment_entry")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "segment_left",
+            "segment_id": segment["id"],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {
+                "type": "segment_left",
+                "segment_id": segment["id"],
+            },
+        )
+
+    def test_segment_entry_missing_segment_id_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Segment Entry Missing Segment")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "segment_entered",
+            "segment_id": "",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Entered segment entry trigger requires a segment", result.text)
+
+    def test_segment_entry_unknown_segment_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Segment Entry Unknown Segment")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "segment_left",
+            "segment_id": "missing-segment-id",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Segment entry trigger must reference a segment from this account", result.text)
+
+    def test_segment_entry_unowned_segment_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Segment Entry Unowned Segment")
+        segment = self.create_segment("automation_crud_unowned_segment_entry")
+        self.db.execute(
+            "update segments set cid = %s where id = %s",
+            "other-account-cid",
+            segment["id"],
+        )
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "segment_entered",
+            "segment_id": segment["id"],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Segment entry trigger must reference a segment from this account", result.text)
 
     def test_publish_validation_failure_does_not_modify_existing_published_data(self):
         created = self.user_post("/api/automations", json={"name": "Publish Failure"})

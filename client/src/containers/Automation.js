@@ -32,6 +32,8 @@ function normalizeAutomation(automation) {
     automation.entry.tag = automation.entry.tag || '';
   } else if (_.contains(['list_joined', 'list_left'], automation.entry.type)) {
     automation.entry.list_id = automation.entry.list_id || '';
+  } else if (_.contains(['segment_entered', 'segment_left'], automation.entry.type)) {
+    automation.entry.segment_id = automation.entry.segment_id || '';
   } else {
     automation.entry = {type: 'manual'};
   }
@@ -52,6 +54,12 @@ function entryPayload(entry) {
     return {
       type: entry.type,
       list_id: entry.list_id || '',
+    };
+  }
+  if (entry && _.contains(['segment_entered', 'segment_left'], entry.type)) {
+    return {
+      type: entry.type,
+      segment_id: entry.segment_id || '',
     };
   }
   return {
@@ -329,6 +337,7 @@ class Automation extends Component {
   entryTypeChange = event => {
     const type = getvalue(event);
     const lists = this.props.lists || [];
+    const segments = this.props.segments || [];
     this.props.update({
       entry: {$set: _.contains(['tag_added', 'tag_removed'], type) ? {
         type: type,
@@ -336,6 +345,9 @@ class Automation extends Component {
       } : _.contains(['list_joined', 'list_left'], type) ? {
         type: type,
         list_id: (this.props.data.entry && this.props.data.entry.list_id) || (lists.length ? lists[0].id : ''),
+      } : _.contains(['segment_entered', 'segment_left'], type) ? {
+        type: type,
+        segment_id: (this.props.data.entry && this.props.data.entry.segment_id) || (segments.length ? segments[0].id : ''),
       } : {
         type: 'manual',
       }},
@@ -354,6 +366,14 @@ class Automation extends Component {
     this.props.update({
       entry: {
         list_id: {$set: getvalue(event)},
+      },
+    });
+  }
+
+  entrySegmentChange = event => {
+    this.props.update({
+      entry: {
+        segment_id: {$set: getvalue(event)},
       },
     });
   }
@@ -393,6 +413,13 @@ class Automation extends Component {
     const entryTags = _.contains(['tag_added', 'tag_removed'], entry.type) && entry.tag ? [entry.tag] : [];
 
     return _.map(_.uniq(tags.concat(draftTags).concat(entryTags)), tag => ({id: tag, text: tag}));
+  }
+
+  segmentOptions() {
+    return _.map(this.props.segments || [], segment => ({
+      id: segment.id,
+      name: segment.name || segment.id,
+    }));
   }
 
   nodeTargetOptions(node) {
@@ -1361,6 +1388,8 @@ class Automation extends Component {
                   {id: 'tag_removed', name: 'Tag removed'},
                   {id: 'list_joined', name: 'Joined list'},
                   {id: 'list_left', name: 'Left list'},
+                  {id: 'segment_entered', name: 'Entered segment'},
+                  {id: 'segment_left', name: 'Left segment'},
                 ]}
               />
               {
@@ -1404,6 +1433,22 @@ class Automation extends Component {
                     :
                       <p className="help-block">Create a contact list before selecting this trigger.</p>
                     )
+                  :
+                    data.entry && _.contains(['segment_entered', 'segment_left'], data.entry.type) ?
+                      (this.segmentOptions().length ?
+                        <div style={{maxWidth: '360px'}} className="space-bottom">
+                          <SelectLabel
+                            id="segment_id"
+                            label="Trigger segment"
+                            obj={data.entry}
+                            onChange={this.entrySegmentChange}
+                            options={this.segmentOptions()}
+                            emptyVal="Select segment"
+                          />
+                        </div>
+                      :
+                        <p className="help-block">Create a segment before selecting this trigger.</p>
+                      )
                   :
                     <p>Contacts can be added manually from this automation or from a contact/list action.</p>
               }
@@ -1540,6 +1585,7 @@ export default withLoadSave({
     tags: async () => (await axios.get('/api/recenttags')).data,
     emails: async ({id}) => (await axios.get('/api/automations/' + id + '/emails')).data,
     lists: async () => _.sortBy((await axios.get('/api/lists')).data, l => (l.name || '').toLowerCase()),
+    segments: async () => _.sortBy((await axios.get('/api/segments')).data, s => (s.name || '').toLowerCase()),
     enrolments: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments')).data,
     historyData: async ({id}) => (await axios.get('/api/automations/' + id + '/history')).data,
   },

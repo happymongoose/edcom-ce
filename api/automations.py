@@ -328,6 +328,21 @@ ENTRY_SCHEMA = {
             },
             "additionalProperties": False,
         },
+        {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["segment_entered", "segment_left"],
+                },
+                "segment_id": {
+                    "type": "string",
+                    "maxLength": 64,
+                },
+            },
+            "additionalProperties": False,
+        },
     ],
 }
 
@@ -646,6 +661,15 @@ def _published_entry(entry: JsonObj) -> JsonObj:
         return {
             "type": entry_type,
             "list_id": list_id,
+        }
+    if entry_type in ("segment_entered", "segment_left"):
+        segment_id = (entry.get("segment_id") or "").strip()
+        if not segment_id:
+            trigger_label = "Entered segment" if entry_type == "segment_entered" else "Left segment"
+            _validation_error("%s entry trigger requires a segment." % trigger_label)
+        return {
+            "type": entry_type,
+            "segment_id": segment_id,
         }
     _validation_error("Automation entry trigger type is not supported.")
 
@@ -970,6 +994,9 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
     if entry.get("type") in ("list_joined", "list_left"):
         if db.lists.get(entry.get("list_id")) is None:
             _validation_error("List entry trigger must reference a contact list from this account.")
+    if entry.get("type") in ("segment_entered", "segment_left"):
+        if db.segments.get(entry.get("segment_id")) is None:
+            _validation_error("Segment entry trigger must reference a segment from this account.")
 
     reentry = automation.get("reentry", "once")
     _validate_doc(reentry, REENTRY_SCHEMA)
