@@ -94,6 +94,7 @@ import FunnelMessageStats from "./containers/FunnelMessageStats";
 import Automations from "./containers/Automations";
 import Automation from "./containers/Automation";
 import AutomationEmail from "./containers/AutomationEmail";
+import AutomationTriggerEvents from "./containers/AutomationTriggerEvents";
 import DebugEmailLogs from "./containers/DebugEmailLogs";
 import Transactional from "./containers/Transactional";
 import TransactionalTag from "./containers/TransactionalTag";
@@ -215,6 +216,7 @@ export default ({ childProps }) => {
     <AppliedRoute path="/automations" exact component={Automations} props={childProps} />
     <AppliedRoute path="/automations/:automation_id/emails/:email_id" exact component={AutomationEmail} props={childProps} />
     <AppliedRoute path="/automations/:id" exact component={Automation} props={childProps} />
+    <AppliedRoute path="/automation-trigger-events" exact component={AutomationTriggerEvents} props={childProps} />
     <AppliedRoute path="/debug-email-logs" exact component={DebugEmailLogs} props={childProps} />
     <AppliedRoute path="/transactional" exact component={Transactional} props={childProps} />
     <AppliedRoute path="/transactional/tag" exact component={TransactionalTag} props={childProps} />

@@ -1374,6 +1374,8 @@ AUTOMATION_TRIGGER_DEFAULT_LIMIT = 25
 AUTOMATION_TRIGGER_MAX_LIMIT = 100
 AUTOMATION_TRIGGER_DETAIL_LIMIT = 100
 AUTOMATION_TRIGGER_COOLDOWN_MINUTES = 15
+AUTOMATION_TRIGGER_EVENT_LIST_DEFAULT_LIMIT = 50
+AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
 
 
 def _claim_clear_patch() -> JsonObj:
@@ -3459,6 +3461,24 @@ def _automation_trigger_limit(value: object) -> int:
     return min(limit, AUTOMATION_TRIGGER_MAX_LIMIT)
 
 
+def _automation_trigger_event_list_limit(value: object) -> int:
+    if value is None:
+        return AUTOMATION_TRIGGER_EVENT_LIST_DEFAULT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation trigger event limit",
+            description="limit must be a positive integer.",
+        )
+    if limit < 1:
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation trigger event limit",
+            description="limit must be at least 1.",
+        )
+    return min(limit, AUTOMATION_TRIGGER_MAX_LIMIT)
+
+
 def _automation_trigger_max_depth() -> int:
     try:
         return max(1, int(os.environ.get("automation_trigger_max_depth") or 3))
@@ -3503,6 +3523,97 @@ def _trigger_event_obj(row) -> JsonObj | None:
     ret["event_type"] = event_type
     ret["ts"] = ts.isoformat() if hasattr(ts, "isoformat") else ts
     return ret
+
+
+def _bounded_trigger_result_items(items: object) -> List[JsonObj]:
+    if not isinstance(items, list):
+        return []
+
+    allowed = {
+        "event_id",
+        "status",
+        "reason",
+        "description",
+        "automation_id",
+        "automation_name",
+        "contact_id",
+        "contact_email",
+        "event_type",
+        "tag",
+        "enrolment_id",
+        "existing_enrolment_id",
+    }
+    ret = []
+    for item in items[:AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        ret.append({key: item.get(key) for key in allowed if key in item})
+    return ret
+
+
+def _automation_trigger_event_source_names(
+    db: DB,
+    cid: str,
+    rows: List[object],
+) -> Dict[str, str]:
+    source_ids = []
+    for row in rows:
+        data = row[6] or {}
+        if not isinstance(data, dict):
+            continue
+        source = data.get("source") or {}
+        if not isinstance(source, dict):
+            continue
+        automation_id = source.get("automation_id")
+        if source.get("type") == "automation" and automation_id:
+            source_ids.append(automation_id)
+
+    if not source_ids:
+        return {}
+
+    return {
+        automation_id: name
+        for automation_id, name in db.execute(
+            """
+            select id, data->>'name'
+            from automations
+            where cid = %s and id = any(%s)
+            """,
+            cid,
+            list(set(source_ids)),
+        )
+    }
+
+
+def _project_automation_trigger_event(row, source_names: Dict[str, str]) -> JsonObj:
+    event = _trigger_event_obj(row)
+    data = row[6] or {}
+    if event is None:
+        return {}
+    if not isinstance(data, dict):
+        data = {}
+
+    source = data.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
+    source_automation_id = source.get("automation_id") if source.get("type") == "automation" else None
+
+    return {
+        "id": event["id"],
+        "timestamp": event["ts"],
+        "event_type": event["event_type"],
+        "contact_email": event["contact_email"],
+        "tag": data.get("tag"),
+        "status": data.get("status"),
+        "source_type": source.get("type"),
+        "source_automation_id": source_automation_id,
+        "source_automation_name": source_names.get(source_automation_id) if source_automation_id else None,
+        "correlation_id": data.get("correlation_id"),
+        "depth": data.get("depth"),
+        "processed_at": data.get("processed_at"),
+        "results": _bounded_trigger_result_items(data.get("results")),
+        "errors": _bounded_trigger_result_items(data.get("error") or data.get("errors")),
+    }
 
 
 def _automation_trigger_source(source: JsonObj | None) -> JsonObj:
@@ -4271,6 +4382,33 @@ class AutomationEnrolmentProcessor(object):
 
 
 class AutomationTriggerEvents(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit = _automation_trigger_event_list_limit(req.get_param("limit"))
+
+        rows = db.execute(
+            """
+            select id, cid, contact_id, contact_email, event_type, ts, data
+            from automation_trigger_events
+            where cid = %s
+            order by ts desc, id desc
+            limit %s
+            """,
+            cid,
+            limit,
+        ).fetchall()
+        source_names = _automation_trigger_event_source_names(db, cid, rows)
+
+        req.context["result"] = {
+            "events": [
+                _project_automation_trigger_event(row, source_names)
+                for row in rows
+            ]
+        }
 
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)

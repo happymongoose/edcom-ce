@@ -255,6 +255,12 @@ class TestAutomationTriggers(test_base.TestBase):
     def process_events(self, limit=25):
         return self.user_post("/api/automation-trigger-events/process", json={"limit": limit})
 
+    def list_events(self, limit=None):
+        path = "/api/automation-trigger-events"
+        if limit is not None:
+            path += "?limit=%s" % limit
+        return self.user_get(path)
+
     def run_next(self, automation_id, enrolment_id):
         return self.simulate_post(
             "/api/automations/%s/enrolments/%s/run-next" % (automation_id, enrolment_id),
@@ -322,6 +328,152 @@ class TestAutomationTriggers(test_base.TestBase):
             self.user_cookie["cid"],
             event_id,
         )
+
+    def test_trigger_event_list_is_current_account_scoped(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        visible = self.create_event(email, "%s_list_scope_visible" % self.test_id)
+        hidden = self.create_event(email, "%s_list_scope_hidden" % self.test_id)
+        other_cid = "%s_list_other_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        self.db.execute(
+            "update automation_trigger_events set cid = %s where cid = %s and id = %s",
+            other_cid,
+            self.user_cookie["cid"],
+            hidden["id"],
+        )
+
+        events = self.list_events()["events"]
+        event_ids = [event["id"] for event in events]
+
+        self.assertIn(visible["id"], event_ids)
+        self.assertNotIn(hidden["id"], event_ids)
+
+    def test_trigger_event_list_is_newest_first(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        older = self.create_event(email, "%s_list_older" % self.test_id)
+        newer = self.create_event(email, "%s_list_newer" % self.test_id)
+        self.db.execute(
+            "update automation_trigger_events set ts = %s where cid = %s and id = %s",
+            datetime(2026, 1, 1, 12, 0, 0),
+            self.user_cookie["cid"],
+            older["id"],
+        )
+        self.db.execute(
+            "update automation_trigger_events set ts = %s where cid = %s and id = %s",
+            datetime(2026, 1, 1, 13, 0, 0),
+            self.user_cookie["cid"],
+            newer["id"],
+        )
+
+        events = self.list_events(limit=2)["events"]
+
+        self.assertEqual(events[0]["id"], newer["id"])
+        self.assertEqual(events[1]["id"], older["id"])
+
+    def test_trigger_event_list_default_and_max_limit(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        for index in range(105):
+            self.create_event(email, "%s_list_limit_%03d" % (self.test_id, index))
+
+        default_events = self.list_events()["events"]
+        max_events = self.list_events(limit=999)["events"]
+
+        self.assertEqual(len(default_events), 50)
+        self.assertEqual(len(max_events), 100)
+
+    def test_trigger_event_list_includes_suppressed_reason_and_source_automation_name(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_list_suppressed" % self.test_id
+        automation = self.create_automation(tag)
+        event = self.create_event(
+            email,
+            tag,
+            source={
+                "type": "automation",
+                "automation_id": automation["id"],
+            },
+        )
+
+        result = self.process_events()
+        listed = [item for item in self.list_events()["events"] if item["id"] == event["id"]][0]
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(listed["source_type"], "automation")
+        self.assertEqual(listed["source_automation_id"], automation["id"])
+        self.assertEqual(listed["source_automation_name"], automation["name"])
+        self.assertEqual(listed["results"][0]["status"], "suppressed")
+        self.assertEqual(listed["results"][0]["reason"], "same_automation_source")
+
+    def test_trigger_event_list_source_automation_name_is_account_scoped(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        event = self.create_event(email, "%s_list_source_scope" % self.test_id)
+        other_cid = "%s_list_source_other_cid" % self.test_id
+        other_automation_id = "%s_list_source_other_automation" % self.test_id
+        self.created_other_cids.append(other_cid)
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            other_automation_id,
+            other_cid,
+            {"name": "%s source other" % self.test_id},
+        )
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || jsonb_build_object(
+                'source',
+                jsonb_build_object('type', 'automation', 'automation_id', %s)
+            )
+            where cid = %s and id = %s
+            """,
+            other_automation_id,
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        listed = [item for item in self.list_events()["events"] if item["id"] == event["id"]][0]
+
+        self.assertEqual(listed["source_automation_id"], other_automation_id)
+        self.assertIsNone(listed["source_automation_name"])
+
+    def test_trigger_event_list_does_not_return_raw_oversized_metadata(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        event = self.create_event(email, "%s_list_raw" % self.test_id)
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {
+                "large_metadata": "x" * 5000,
+                "source": {
+                    "type": "manual",
+                    "metadata": "x" * 5000,
+                },
+                "results": [
+                    {
+                        "status": "suppressed",
+                        "reason": "test",
+                        "metadata": "x" * 5000,
+                    }
+                ],
+            },
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        listed = [item for item in self.list_events()["events"] if item["id"] == event["id"]][0]
+
+        self.assertNotIn("large_metadata", listed)
+        self.assertNotIn("source", listed)
+        self.assertNotIn("metadata", listed["results"][0])
 
     def test_manual_event_insertion_disabled_by_default(self):
         email, _ = self.create_contact()
