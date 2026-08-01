@@ -476,7 +476,7 @@ class Automation extends Component {
     const node = {
       id: shortid.generate(),
       type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
+      label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
     };
 
     if (type === 'add_tag' || type === 'remove_tag') {
@@ -484,6 +484,12 @@ class Automation extends Component {
     }
     if (type === 'if_has_tag') {
       node.draft_tag = '';
+      node.yes_node_id = '';
+      node.no_node_id = '';
+    }
+    if (type === 'if_opened_email' || type === 'if_clicked_email') {
+      const emails = this.props.emails || [];
+      node.automation_email_id = emails.length ? emails[0].id : '';
       node.yes_node_id = '';
       node.no_node_id = '';
     }
@@ -881,6 +887,45 @@ class Automation extends Component {
       );
     }
 
+    if (node.type === 'if_opened_email' || node.type === 'if_clicked_email') {
+      const options = this.automationEmailOptions();
+      if (!options.length) {
+        return (
+          <div style={{minWidth: '260px'}}>
+            <p className="help-block">Create an automation email before configuring this condition.</p>
+          </div>
+        );
+      }
+      return (
+        <div style={{minWidth: '320px'}}>
+          <SelectLabel
+            id="automation_email_id"
+            label="Automation email"
+            obj={node}
+            onChange={this.nodeTargetChange.bind(this, index)}
+            options={options}
+            emptyVal="Select email"
+          />
+          <SelectLabel
+            id="yes_node_id"
+            label="Yes target"
+            obj={node}
+            onChange={this.nodeTargetChange.bind(this, index)}
+            options={this.nodeTargetOptions(node)}
+            emptyVal="Select target"
+          />
+          <SelectLabel
+            id="no_node_id"
+            label="No target"
+            obj={node}
+            onChange={this.nodeTargetChange.bind(this, index)}
+            options={this.nodeTargetOptions(node)}
+            emptyVal="Select target"
+          />
+        </div>
+      );
+    }
+
     if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
       const options = this.listOptions();
       if (!options.length) {
@@ -925,6 +970,12 @@ class Automation extends Component {
     }
     if (type === 'if_has_tag') {
       return 'If has tag';
+    }
+    if (type === 'if_opened_email') {
+      return 'If opened email';
+    }
+    if (type === 'if_clicked_email') {
+      return 'If clicked email';
     }
     if (type === 'go_to') {
       return 'Go to';
@@ -1488,6 +1539,18 @@ class Automation extends Component {
                   </MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</MenuItem>
+                  <MenuItem
+                    onClick={this.addNode.bind(this, 'if_opened_email')}
+                    disabled={!((this.props.emails || []).length)}
+                  >
+                    If Opened Email Node
+                  </MenuItem>
+                  <MenuItem
+                    onClick={this.addNode.bind(this, 'if_clicked_email')}
+                    disabled={!((this.props.emails || []).length)}
+                  >
+                    If Clicked Email Node
+                  </MenuItem>
                   <MenuItem onClick={this.addNode.bind(this, 'go_to')}>Go To Node</MenuItem>
                   <MenuItem
                     onClick={this.addNode.bind(this, 'send_email')}

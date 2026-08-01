@@ -282,6 +282,34 @@ class TestAutomationCRUD(test_base.TestBase):
             ]
         )
 
+    def email_engagement_condition_workflow(self, email_id=None, node_type="if_opened_email", condition=None):
+        if condition is None:
+            condition = {
+                "id": "node_email_condition_1",
+                "type": node_type,
+                "label": "If opened email" if node_type == "if_opened_email" else "If clicked email",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            }
+            if email_id is not None:
+                condition["automation_email_id"] = email_id
+        return self.workflow_with_nodes(
+            [
+                condition,
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add engaged branch",
+                    "draft_tag": "engaged-branch",
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ]
+        )
+
     def assert_existing_publish_fails(self, automation_id, message):
         result = self.simulate_post(
             "/api/automations/%s/publish" % automation_id,
@@ -1394,6 +1422,190 @@ class TestAutomationCRUD(test_base.TestBase):
         )
 
         self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
+
+    def test_valid_if_opened_email_node_publishes(self):
+        automation = self.create_tracked_automation("Valid If Opened Email")
+        email = self.create_automation_email(automation["id"])
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow(email["id"], "if_opened_email"),
+        )
+        published = self.user_publish(automation["id"])
+
+        condition = published["published"]["nodes"][0]
+        self.assertEqual(condition["type"], "if_opened_email")
+        self.assertEqual(condition["automation_email_id"], email["id"])
+        self.assertEqual(condition["yes_node_id"], "node_add_tag_1")
+        self.assertEqual(condition["no_node_id"], "node_exit_1")
+
+    def test_valid_if_clicked_email_node_publishes(self):
+        automation = self.create_tracked_automation("Valid If Clicked Email")
+        email = self.create_automation_email(automation["id"])
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow(email["id"], "if_clicked_email"),
+        )
+        published = self.user_publish(automation["id"])
+
+        condition = published["published"]["nodes"][0]
+        self.assertEqual(condition["type"], "if_clicked_email")
+        self.assertEqual(condition["automation_email_id"], email["id"])
+        self.assertEqual(condition["yes_node_id"], "node_add_tag_1")
+        self.assertEqual(condition["no_node_id"], "node_exit_1")
+
+    def test_email_engagement_condition_missing_email_fails_validation(self):
+        automation = self.create_tracked_automation("Missing Email Engagement Email")
+
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow(node_type="if_opened_email"),
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("automation_email_id", result.text)
+
+    def test_email_engagement_condition_unknown_or_deleted_email_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Unknown Email Engagement Email")
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow("missing-email-id", "if_opened_email"),
+        )
+
+        self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
+
+    def test_email_engagement_condition_email_from_another_automation_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Email Engagement Owner")
+        other = self.create_tracked_automation("Email Engagement Other Automation")
+        other_email = self.create_automation_email(other["id"])
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow(other_email["id"], "if_clicked_email"),
+        )
+
+        self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
+
+    def test_email_engagement_condition_email_from_another_account_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Email Engagement Other Account")
+        email = self.create_automation_email(automation["id"])
+        self.db.execute(
+            "update automation_emails set cid = %s where id = %s",
+            "other-account-cid",
+            email["id"],
+        )
+
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow(email["id"], "if_opened_email"),
+        )
+
+        self.assert_existing_publish_fails(automation["id"], "must reference an email from this automation")
+
+    def assert_email_engagement_condition_publish_fails(self, condition, message):
+        automation = self.create_tracked_automation("Invalid Email Engagement Condition")
+        email = self.create_automation_email(automation["id"])
+        condition = dict(condition)
+        condition.setdefault("automation_email_id", email["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.email_engagement_condition_workflow(condition=condition),
+        )
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(message, result.text)
+
+    def test_email_engagement_condition_missing_yes_or_no_target_fails_publish_validation(self):
+        missing_yes = {
+            "id": "node_email_condition_1",
+            "type": "if_opened_email",
+            "label": "If opened email",
+            "yes_node_id": "",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_email_engagement_condition_publish_fails(missing_yes, "yes target")
+
+        missing_no = {
+            "id": "node_email_condition_1",
+            "type": "if_clicked_email",
+            "label": "If clicked email",
+            "yes_node_id": "node_add_tag_1",
+            "no_node_id": "",
+        }
+        self.assert_email_engagement_condition_publish_fails(missing_no, "no target")
+
+    def test_email_engagement_condition_target_id_not_found_fails_publish_validation(self):
+        condition = {
+            "id": "node_email_condition_1",
+            "type": "if_opened_email",
+            "label": "If opened email",
+            "yes_node_id": "missing_node",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_email_engagement_condition_publish_fails(condition, "yes target")
+
+    def test_email_engagement_condition_self_target_fails_publish_validation(self):
+        condition = {
+            "id": "node_email_condition_1",
+            "type": "if_clicked_email",
+            "label": "If clicked email",
+            "yes_node_id": "node_email_condition_1",
+            "no_node_id": "node_exit_1",
+        }
+        self.assert_email_engagement_condition_publish_fails(condition, "cannot target themselves")
+
+    def test_email_engagement_condition_branch_cycle_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Email Engagement Cycle")
+        email = self.create_automation_email(automation["id"])
+        workflow = self.workflow_with_nodes([
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add before condition",
+                "draft_tag": "before-condition",
+            },
+            {
+                "id": "node_email_condition_1",
+                "type": "if_opened_email",
+                "label": "If opened email",
+                "automation_email_id": email["id"],
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ])
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Workflow contains a cycle", result.text)
+        self.assertIn("Step 1 Add before condition", result.text)
+        self.assertIn("Step 2 If opened email", result.text)
 
     def test_condition_branch_target_can_point_to_go_to_node(self):
         created = self.user_post("/api/automations", json={"name": "Condition Go To Target"})

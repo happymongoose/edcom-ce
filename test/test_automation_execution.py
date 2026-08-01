@@ -311,6 +311,50 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         ).json
 
+    def create_email_engagement_condition_automation(self, node_type="if_opened_email"):
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_email_condition_%s" % suffix},
+        )
+        email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Engagement condition email",
+                "subject": "Engagement condition subject",
+                "rawText": "<p>Hello</p>",
+            },
+        )
+        nodes = [
+            {
+                "id": "node_email_condition_1",
+                "type": node_type,
+                "label": "If opened email" if node_type == "if_opened_email" else "If clicked email",
+                "automation_email_id": email["id"],
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add engaged branch tag",
+                "draft_tag": "engaged-branch",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        return self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
     def create_go_to_automation(self):
         suffix = self.unique()
         automation = self.user_post(
@@ -1812,6 +1856,30 @@ class TestAutomationExecution(test_base.TestBase):
         result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
         self.assertIn("if_has_tag yes target was not found", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_opened_email_run_next_returns_unsupported_clearly(self):
+        email, _ = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_opened_email")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unsupported automation node", result.text)
+        self.assertIn("if_opened_email", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_run_next_returns_unsupported_clearly(self):
+        email, _ = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unsupported automation node", result.text)
+        self.assertIn("if_clicked_email", result.text)
 
         self.cleanup(automation["id"])
 

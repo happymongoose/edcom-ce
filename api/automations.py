@@ -258,6 +258,38 @@ SEND_EMAIL_NODE_SCHEMA = {
 }
 
 
+EMAIL_ENGAGEMENT_CONDITION_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "automation_email_id", "yes_node_id", "no_node_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["if_opened_email", "if_clicked_email"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "automation_email_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+        },
+        "yes_node_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+        "no_node_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 EXIT_NODE_SCHEMA = {
     "type": "object",
     "required": ["id", "type", "label"],
@@ -363,6 +395,7 @@ DRAFT_SCHEMA = {
                     IF_HAS_TAG_NODE_SCHEMA,
                     GO_TO_NODE_SCHEMA,
                     SEND_EMAIL_NODE_SCHEMA,
+                    EMAIL_ENGAGEMENT_CONDITION_NODE_SCHEMA,
                     EXIT_NODE_SCHEMA,
                 ],
             },
@@ -738,7 +771,7 @@ def _workflow_edges(nodes: list[JsonObj]) -> dict[str, list[str]]:
             edges[node_id] = []
         elif node_type == "go_to":
             edges[node_id] = [node.get("target_node_id")]
-        elif node_type == "if_has_tag":
+        elif node_type in ("if_has_tag", "if_opened_email", "if_clicked_email"):
             edges[node_id] = [node.get("yes_node_id"), node.get("no_node_id")]
         elif index + 1 < len(nodes):
             edges[node_id] = [nodes[index + 1].get("id")]
@@ -1042,6 +1075,31 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
                 _validation_error("If has tag no target must exist in the draft workflow.")
             if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
                 _validation_error("If has tag nodes cannot target themselves.")
+        if node.get("type") in ("if_opened_email", "if_clicked_email"):
+            node_label = "If opened email" if node.get("type") == "if_opened_email" else "If clicked email"
+            automation_email_id = node.get("automation_email_id")
+            if not automation_email_id:
+                _validation_error("%s nodes must select an automation email." % node_label)
+            if not _automation_email_exists(
+                db,
+                automation.get("cid"),
+                automation.get("id"),
+                automation_email_id,
+            ):
+                _validation_error(
+                    "%s node at step %s must reference an email from this automation."
+                    % (node_label, index + 1)
+                )
+            if not node.get("yes_node_id"):
+                _validation_error("%s nodes must have a yes target." % node_label)
+            if not node.get("no_node_id"):
+                _validation_error("%s nodes must have a no target." % node_label)
+            if node.get("yes_node_id") not in node_ids:
+                _validation_error("%s yes target must exist in the draft workflow." % node_label)
+            if node.get("no_node_id") not in node_ids:
+                _validation_error("%s no target must exist in the draft workflow." % node_label)
+            if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
+                _validation_error("%s nodes cannot target themselves." % node_label)
         if node.get("type") == "go_to":
             target_node_id = node.get("target_node_id")
             if not target_node_id:
