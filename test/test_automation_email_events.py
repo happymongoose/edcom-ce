@@ -19,6 +19,7 @@ class TestAutomationEmailEvents(test_base.TestBase):
         self.created_list_ids = []
         self.created_mailgun_ids = []
         self.created_tracking_ids = []
+        self.created_sink_ids = []
         self.created_link_ids = []
         self.created_automation_ids = []
         self.created_campaign_ids = []
@@ -63,6 +64,8 @@ class TestAutomationEmailEvents(test_base.TestBase):
                 "delete from mailgun where id = any(%s)",
                 self.created_mailgun_ids,
             )
+        if self.created_sink_ids:
+            self.db.execute("delete from sinks where id = any(%s)", self.created_sink_ids)
         if self.created_emails:
             contact_ids = [
                 row[0]
@@ -146,6 +149,21 @@ class TestAutomationEmailEvents(test_base.TestBase):
         self.created_mailgun_ids.append(mailgun_id)
         self.created_tracking_ids.append(tracking_id)
         return tracking_id
+
+    def create_sink(self):
+        sink_id = shortuuid.uuid()
+        access_key = "access-%s" % shortuuid.uuid()
+        self.db.execute(
+            "insert into sinks (id, cid, data) values (%s, %s, %s)",
+            sink_id,
+            self.user_cookie["cid"],
+            {
+                "name": "Automation event sink %s" % self.test_id,
+                "accesskey": access_key,
+            },
+        )
+        self.created_sink_ids.append(sink_id)
+        return sink_id, access_key
 
     def create_automation_send_step_run(self, contact_id, contact_email):
         automation_id = "automation-%s" % shortuuid.uuid()
@@ -322,6 +340,47 @@ class TestAutomationEmailEvents(test_base.TestBase):
         self.assertEqual(self.track("click", send["step_run_id"], email, tracking_id, link_id).status_code, 301)
 
         self.assertEqual(len(self.event_rows(send["step_run_id"])), 1)
+
+    def test_provider_event_endpoint_captures_automation_open(self):
+        email, contact_id = self.create_contact()
+        send = self.create_automation_send_step_run(contact_id, email)
+        sink_id, access_key = self.create_sink()
+
+        result = self.simulate_post(
+            "/api/events/%s" % sink_id,
+            json={
+                "accesskey": access_key,
+                "events": [
+                    {
+                        "t": "open",
+                        "c": send["step_run_id"],
+                        "e": email,
+                        "s": "provider-settings-id",
+                        "i": "127.0.0.1",
+                        "d": "example.com",
+                        "k": sink_id,
+                        "ts": 0,
+                        "p": "203.0.113.10",
+                        "a": "ProviderEventTest/1.0",
+                    }
+                ],
+                "statevents": [],
+            },
+        )
+
+        self.assertEqual(result.status_code, 200)
+        rows = self.event_rows(send["step_run_id"])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row[0], "open")
+        self.assertEqual(row[2], contact_id)
+        self.assertEqual(row[4], send["automation_id"])
+        self.assertEqual(row[5], send["automation_email_id"])
+        self.assertEqual(row[6], send["enrolment_id"])
+        self.assertEqual(row[9]["provider"], sink_id)
+        self.assertEqual(row[9]["settings_id"], "provider-settings-id")
+        self.assertEqual(row[9]["ip"], "203.0.113.10")
+        self.assertEqual(row[9]["user_agent"], "ProviderEventTest/1.0")
 
     def test_non_automation_tracking_still_uses_existing_contact_logs(self):
         email, contact_id = self.create_contact()

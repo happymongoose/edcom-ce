@@ -1,17 +1,81 @@
+import shortuuid
+
 import test_base
 from api.shared.contacts import update, add_send
 from api.shared.utils import get_os, get_browser, get_device
 
 class TestListUpdate(test_base.TestBase):
 
+    def setUp(self):
+        super(TestListUpdate, self).setUp()
+        self.test_id = "test_update_%s" % shortuuid.uuid().lower()
+        self.created_emails = []
+        self.created_list_ids = []
+        self.created_campaign_ids = []
+
+    def tearDown(self):
+        cid = self.user_cookie["cid"]
+        if self.created_campaign_ids:
+            self.db.execute(
+                "delete from campaigns where id = any(%s) and cid = %s",
+                self.created_campaign_ids,
+                cid,
+            )
+        if self.created_emails:
+            contact_ids = [
+                row[0]
+                for row in self.db.execute(
+                    f"""select contact_id from contacts."contacts_{cid}" where email = any(%s)""",
+                    self.created_emails,
+                )
+            ]
+            if contact_ids:
+                self.db.execute(
+                    f"""delete from contacts."contact_open_logs_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_click_logs_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_send_logs_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_values_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_lists_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+            self.db.execute(
+                f"""delete from contacts."contacts_{cid}" where email = any(%s)""",
+                self.created_emails,
+            )
+        if self.created_list_ids:
+            self.db.execute(
+                f"""delete from contacts."contact_lists_{cid}" where list_id = any(%s)""",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from lists where id = any(%s) and cid = %s",
+                self.created_list_ids,
+                cid,
+            )
+        super(TestListUpdate, self).tearDown()
+
     def test_update(self):
         result = self.user_post('/api/lists', json={
-            "name": "test_update"
+            "name": self.test_id
         })
 
         lid = result['id']
+        self.created_list_ids.append(lid)
 
-        email = 'ace@petpsychic.com'
+        email = '%s@example.com' % self.test_id
+        self.created_emails.append(email)
 
         self.user_post(f'/api/lists/{lid}/feed', json={
             'email': email,
@@ -22,9 +86,10 @@ class TestListUpdate(test_base.TestBase):
             }
         })
 
-        camp = self.create_broadcast(lid, 'test_update 1')
-        camp2 = self.create_broadcast(lid, 'test_update 2')
-        camp3 = self.create_broadcast(lid, 'test_update 3')
+        camp = self.create_broadcast(lid, '%s 1' % self.test_id)
+        camp2 = self.create_broadcast(lid, '%s 2' % self.test_id)
+        camp3 = self.create_broadcast(lid, '%s 3' % self.test_id)
+        self.created_campaign_ids.extend([camp['id'], camp2['id'], camp3['id']])
 
         add_send(self.db, camp['id'], [email])
         self.update(email, 'open', camp['id'], 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:101.0) Gecko/20100101 Firefox/101.0')

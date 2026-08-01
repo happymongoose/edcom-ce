@@ -948,8 +948,12 @@ class Events(object):
                     if not eventsinkid:
                         eventsinkid = sendingsink["id"]
 
-                    if t in ("click", "open", "unsub", "complaint", "hard") and (
-                        c.startswith("tx-") or camp is not None
+                    if (
+                        t in ("click", "open")
+                        or (
+                            t in ("unsub", "complaint", "hard")
+                            and (c.startswith("tx-") or camp is not None)
+                        )
                     ):
                         if not u and not email:
                             log.info("event error: %s (no uid/email)", ev)
@@ -993,6 +997,8 @@ class Events(object):
                                 link_id=linkid or None,
                                 link_url=link_url,
                             ):
+                                continue
+                            if camp is None and not c.startswith("tx-"):
                                 continue
                             if c.startswith("tx-"):
                                 if txntag is not None:
