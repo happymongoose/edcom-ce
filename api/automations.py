@@ -799,6 +799,9 @@ def _add_contact_to_list(
     contact_id: int,
     contact_email: str,
     list_id: str,
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
 ) -> JsonObj:
     lst = db.lists.get(list_id)
     if lst is None:
@@ -846,6 +849,19 @@ def _add_contact_to_list(
             complained,
             soft_bounced,
         )
+        try:
+            contacts.maybe_insert_list_joined_trigger_event(
+                db,
+                cid,
+                contact_email,
+                contact_id,
+                list_id,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
+        except Exception:
+            log.exception("Error creating automation list_joined trigger event")
 
     return {
         "list_id": list_id,
@@ -860,6 +876,9 @@ def _remove_contact_from_list(
     contact_id: int,
     contact_email: str,
     list_id: str,
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
 ) -> JsonObj:
     lst = db.lists.get(list_id)
     if lst is None:
@@ -918,6 +937,19 @@ def _remove_contact_from_list(
                 -complained,
                 -soft_bounced,
             )
+            try:
+                contacts.maybe_insert_list_left_trigger_event(
+                    db,
+                    cid,
+                    contact_email,
+                    contact_id,
+                    list_id,
+                    automation_trigger_source,
+                    automation_trigger_correlation_id,
+                    automation_trigger_depth,
+                )
+            except Exception:
+                log.exception("Error creating automation list_left trigger event")
 
     return {
         "list_id": list_id,
@@ -3132,12 +3164,27 @@ def _run_next_automation_enrolment(
                     description="The published add_to_list node does not include a contact list.",
                 )
 
+            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            try:
+                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
+            except (TypeError, ValueError):
+                trigger_depth = 1
             list_result = _add_contact_to_list(
                 db,
                 cid,
                 enrolment["contact_id"],
                 enrolment["contact_email"],
                 list_id,
+                {
+                    "type": "automation",
+                    "automation_id": id,
+                    "enrolment_id": enrolment_id,
+                    "node_id": node.get("id"),
+                    "step_run_id": run_id,
+                    "published_revision": automation.get("published_revision"),
+                },
+                trigger_correlation_id,
+                trigger_depth,
             )
             success_data.update(
                 {
@@ -3167,12 +3214,27 @@ def _run_next_automation_enrolment(
                     description="The published remove_from_list node does not include a contact list.",
                 )
 
+            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            try:
+                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
+            except (TypeError, ValueError):
+                trigger_depth = 1
             list_result = _remove_contact_from_list(
                 db,
                 cid,
                 enrolment["contact_id"],
                 enrolment["contact_email"],
                 list_id,
+                {
+                    "type": "automation",
+                    "automation_id": id,
+                    "enrolment_id": enrolment_id,
+                    "node_id": node.get("id"),
+                    "step_run_id": run_id,
+                    "published_revision": automation.get("published_revision"),
+                },
+                trigger_correlation_id,
+                trigger_depth,
             )
             success_data.update(
                 {

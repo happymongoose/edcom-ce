@@ -254,6 +254,60 @@ class TestAutomationTriggers(test_base.TestBase):
             },
         }
 
+    def add_to_list_workflow(self, list_id, entry_type="manual", entry_list_id=None, reentry="once"):
+        entry = {"type": "manual"}
+        if entry_type in ("list_joined", "list_left"):
+            entry = {
+                "type": entry_type,
+                "list_id": entry_list_id or list_id,
+            }
+        return {
+            "entry": entry,
+            "reentry": reentry,
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_add_to_list_1",
+                        "type": "add_to_list",
+                        "label": "Add to list",
+                        "list_id": list_id,
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
+    def remove_from_list_workflow(self, list_id, entry_type="manual", entry_list_id=None, reentry="once"):
+        entry = {"type": "manual"}
+        if entry_type in ("list_joined", "list_left"):
+            entry = {
+                "type": entry_type,
+                "list_id": entry_list_id or list_id,
+            }
+        return {
+            "entry": entry,
+            "reentry": reentry,
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_remove_from_list_1",
+                        "type": "remove_from_list",
+                        "label": "Remove from list",
+                        "list_id": list_id,
+                    },
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
     def create_automation(self, tag, reentry="once", paused=False, entry_type="tag_added"):
         automation = self.user_post(
             "/api/automations",
@@ -336,6 +390,40 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(published.status_code, 200)
         return published.json
 
+    def create_add_to_list_automation(self, list_id, entry_type="manual", entry_list_id=None):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_add_to_list_automation_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.add_to_list_workflow(list_id, entry_type, entry_list_id),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(published.status_code, 200)
+        return published.json
+
+    def create_remove_from_list_automation(self, list_id, entry_type="manual", entry_list_id=None):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_remove_from_list_automation_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.remove_from_list_workflow(list_id, entry_type, entry_list_id),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(published.status_code, 200)
+        return published.json
+
     def create_event(self, email, tag, **overrides):
         doc = {
             "event_type": "tag_added",
@@ -395,6 +483,30 @@ class TestAutomationTriggers(test_base.TestBase):
             event_type,
             tag,
         ).fetchall()
+
+    def emitted_list_events(self, list_id, event_type="list_joined"):
+        return self.db.execute(
+            """
+            select id, data
+            from automation_trigger_events
+            where cid = %s and event_type = %s and data->>'list_id' = %s
+            order by ts, id
+            """,
+            self.user_cookie["cid"],
+            event_type,
+            list_id,
+        ).fetchall()
+
+    def add_contact_to_list_row(self, contact_id, list_id):
+        self.db.execute(
+            f"""
+            insert into contacts."contact_lists_{self.user_cookie['cid']}" (contact_id, list_id)
+            values (%s, %s)
+            on conflict (contact_id, list_id) do nothing
+            """,
+            contact_id,
+            list_id,
+        )
 
     def enrolment_rows(self, automation_id):
         return self.db.execute(
@@ -1179,6 +1291,231 @@ class TestAutomationTriggers(test_base.TestBase):
         events = self.emitted_events(tag, "tag_removed")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][1]["correlation_id"], "%s_existing_remove_correlation" % self.test_id)
+        self.assertEqual(events[0][1]["depth"], 3)
+
+    def test_list_joined_emission_flag_off_does_not_create_event_even_with_match(self):
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        self.create_list_trigger_automation(lst["id"])
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertTrue(run.json["step_run"]["added"])
+        self.assertEqual(len(self.emitted_list_events(lst["id"])), 0)
+
+    def test_noop_list_add_does_not_create_event(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        lst = self.create_contact_list()
+        self.add_contact_to_list_row(contact_id, lst["id"])
+        self.create_list_trigger_automation(lst["id"])
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertFalse(run.json["step_run"]["added"])
+        self.assertEqual(len(self.emitted_list_events(lst["id"])), 0)
+
+    def test_noop_list_remove_does_not_create_event(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        self.create_list_trigger_automation(lst["id"], entry_type="list_left")
+        source_automation = self.create_remove_from_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertFalse(run.json["step_run"]["removed"])
+        self.assertEqual(len(self.emitted_list_events(lst["id"], "list_left")), 0)
+
+    def test_list_joined_emission_without_matching_automation_does_not_create_event(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertTrue(run.json["step_run"]["added"])
+        self.assertEqual(len(self.emitted_list_events(lst["id"])), 0)
+
+    def test_matching_published_list_joined_automation_creates_pending_event(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        self.create_list_trigger_automation(lst["id"])
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
+        self.assertEqual(events[0][1]["source"]["type"], "automation")
+
+    def test_matching_paused_list_joined_automation_creates_pending_event(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        self.create_list_trigger_automation(lst["id"], paused=True)
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
+
+    def test_processing_emitted_list_event_creates_enrolment(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        target_automation = self.create_list_trigger_automation(lst["id"], reentry="multiple")
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"])
+        result = self.process_events()
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(target_automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % events[0][0])
+
+    def test_automation_add_to_list_emits_source_metadata_when_another_automation_matches(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        self.create_list_trigger_automation(lst["id"], reentry="multiple")
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        source = events[0][1]["source"]
+        self.assertEqual(source["type"], "automation")
+        self.assertEqual(source["automation_id"], source_automation["id"])
+        self.assertEqual(source["enrolment_id"], enrolment["id"])
+        self.assertEqual(source["node_id"], "node_add_to_list_1")
+        self.assertEqual(source["step_run_id"], run.json["step_run"]["id"])
+        self.assertEqual(source["published_revision"], str(source_automation["published_revision"]))
+
+    def test_automation_remove_from_list_emits_source_metadata_when_another_automation_matches(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        lst = self.create_contact_list()
+        self.add_contact_to_list_row(contact_id, lst["id"])
+        source_automation = self.create_remove_from_list_automation(lst["id"])
+        self.create_list_trigger_automation(lst["id"], reentry="multiple", entry_type="list_left")
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"], "list_left")
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        source = events[0][1]["source"]
+        self.assertEqual(source["type"], "automation")
+        self.assertEqual(source["automation_id"], source_automation["id"])
+        self.assertEqual(source["enrolment_id"], enrolment["id"])
+        self.assertEqual(source["node_id"], "node_remove_from_list_1")
+        self.assertEqual(source["step_run_id"], run.json["step_run"]["id"])
+        self.assertEqual(source["published_revision"], str(source_automation["published_revision"]))
+
+    def test_same_automation_source_list_event_is_suppressed(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_add_to_list_automation(lst["id"], "list_joined", lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(automation["id"], enrolment["id"])
+        result = self.process_events()
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "same_automation_source")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
+    def test_depth_increments_for_automation_caused_list_event(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        self.create_list_trigger_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+        self.patch_enrolment_status(enrolment["id"], "ready")
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || jsonb_build_object('trigger_correlation_id', %s, 'trigger_depth', 2)
+            where cid = %s and id = %s
+            """,
+            "%s_existing_list_correlation" % self.test_id,
+            self.user_cookie["cid"],
+            enrolment["id"],
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["correlation_id"], "%s_existing_list_correlation" % self.test_id)
         self.assertEqual(events[0][1]["depth"], 3)
 
     def test_source_payload_is_bounded_and_sanitized(self):

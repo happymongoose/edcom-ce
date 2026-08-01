@@ -102,6 +102,26 @@ def matching_tag_trigger_automation_exists(db: DB, cid: str, event_type: str, ta
     )
 
 
+def matching_list_trigger_automation_exists(db: DB, cid: str, event_type: str, list_id: str) -> bool:
+    return bool(
+        db.single(
+            """
+            select id
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+                and data->'published'->'entry'->>'type' = %s
+                and data->'published'->'entry'->>'list_id' = %s
+            limit 1
+            """,
+            cid,
+            event_type,
+            list_id,
+        )
+    )
+
+
 def maybe_insert_tag_trigger_event(
     db: DB,
     cid: str,
@@ -155,6 +175,59 @@ def maybe_insert_tag_trigger_event(
     return event_id
 
 
+def maybe_insert_list_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    event_type: str,
+    list_id: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    if not automation_trigger_emission_enabled():
+        return None
+    if event_type not in ("list_joined", "list_left"):
+        return None
+    if not matching_list_trigger_automation_exists(db, cid, event_type, list_id):
+        return None
+
+    now = datetime.utcnow()
+    event_id = shortuuid.uuid()
+    try:
+        depth = max(0, min(int(depth or 0), 100))
+    except (TypeError, ValueError):
+        depth = 0
+    data = {
+        "status": "pending",
+        "list_id": list_id,
+        "source": sanitize_automation_trigger_source(source),
+        "correlation_id": (correlation_id or shortuuid.uuid())[:128],
+        "depth": depth,
+        "manual_debug": False,
+        "created_by": None,
+        "created": now.isoformat() + "Z",
+        "processed_at": None,
+        "results": [],
+    }
+    db.execute(
+        """
+        insert into automation_trigger_events
+            (id, cid, contact_id, contact_email, event_type, ts, data)
+        values (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        event_id,
+        cid,
+        contact_id,
+        email,
+        event_type,
+        now,
+        data,
+    )
+    return event_id
+
+
 def maybe_insert_tag_added_trigger_event(
     db: DB,
     cid: str,
@@ -172,6 +245,52 @@ def maybe_insert_tag_added_trigger_event(
         contact_id,
         "tag_added",
         tag,
+        source,
+        correlation_id,
+        depth,
+    )
+
+
+def maybe_insert_list_joined_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    list_id: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_list_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "list_joined",
+        list_id,
+        source,
+        correlation_id,
+        depth,
+    )
+
+
+def maybe_insert_list_left_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    list_id: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_list_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "list_left",
+        list_id,
         source,
         correlation_id,
         depth,
