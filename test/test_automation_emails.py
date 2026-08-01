@@ -491,3 +491,73 @@ class TestAutomationEmails(test_base.TestBase):
 
         self.assertEqual(result.status_code, 400)
         self.assertIn("referenced by published step 1", result.text)
+
+    def test_delete_rejects_draft_email_engagement_condition_reference(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+        self.db.automations.patch(
+            automation["id"],
+            {
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_if_opened_email_1",
+                            "type": "if_opened_email",
+                            "label": "If opened email",
+                            "automation_email_id": email["id"],
+                            "yes_node_id": "node_exit_1",
+                            "no_node_id": "node_exit_1",
+                        },
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ]
+                }
+            },
+        )
+
+        result = self.simulate_delete(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("referenced by draft step 1", result.text)
+        self.assertIn("If opened email", result.text)
+
+    def test_delete_rejects_published_email_engagement_condition_reference(self):
+        automation = self.create_automation()
+        email = self.create_email(automation["id"])
+        self.db.automations.patch(
+            automation["id"],
+            {
+                "published": {
+                    "nodes": [
+                        {
+                            "id": "node_if_clicked_email_1",
+                            "type": "if_clicked_email",
+                            "label": "If clicked email",
+                            "automation_email_id": email["id"],
+                            "yes_node_id": "node_exit_1",
+                            "no_node_id": "node_exit_1",
+                        },
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ]
+                }
+            },
+        )
+
+        result = self.simulate_delete(
+            "/api/automations/%s/emails/%s" % (automation["id"], email["id"]),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("referenced by published step 1", result.text)
+        self.assertIn("If clicked email", result.text)
