@@ -487,7 +487,7 @@ class TestAutomationExecution(test_base.TestBase):
             automations.run_task = original_run_task
         return result, dispatched
 
-    def create_scheduler_candidate_account(self, status="ready", automation_status="published", wake_at=None, modified_at=None):
+    def create_scheduler_candidate_account(self, status="ready", automation_status="published", wake_at=None, modified_at=None, retry_after=None):
         cid = "automation-scheduler-%s" % self.unique()
         automation_id = "automation-scheduler-automation-%s" % self.unique()
         enrolment_id = "automation-scheduler-enrolment-%s" % self.unique()
@@ -530,6 +530,8 @@ class TestAutomationExecution(test_base.TestBase):
         }
         if wake_at is not None:
             enrolment_data["wake_at"] = wake_at
+        if retry_after is not None:
+            enrolment_data["retry_after"] = retry_after
         self.db.execute(
             """
             insert into automation_enrolments
@@ -1597,6 +1599,8 @@ class TestAutomationExecution(test_base.TestBase):
                 "claimed_at": stale,
                 "claimed_node_id": "node_add_tag_1",
                 "claimed_published_revision": automation["published_revision"],
+                "retry_count": "bad-count",
+                "retry_after": (datetime.utcnow() + timedelta(hours=1)).isoformat() + "Z",
             },
             self.user_cookie["cid"],
             automation["id"],
@@ -1610,6 +1614,8 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["enrolment"]["status"], "ready")
         self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
         self.assert_claim_cleared(result.json["enrolment"])
+        self.assertIsNone(result.json["enrolment"].get("retry_after"))
+        self.assertIsNone(result.json["enrolment"].get("retry_count"))
 
         self.cleanup(automation["id"])
 
@@ -2822,13 +2828,44 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_processor_treats_invalid_retry_after_as_elapsed(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="processor-invalid-retry-after")
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            enrolment["id"],
+            {
+                "retry_count": "not-a-number",
+                "retry_after": "not-a-date",
+            },
+        )
+
+        result = self.process_enrolments(automation_id=automation["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+        self.assertEqual(result.json["succeeded"], 1)
+        self.assertTrue(self.has_tag(contact_id, "processor-invalid-retry-after"))
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "ready")
+        self.assertIsNone(data.get("retry_after"))
+        self.assertIsNone(data.get("retry_count"))
+
+        self.cleanup(automation["id"])
+
     def test_processor_excludes_ineligible_statuses_and_paused_automations(self):
         statuses = ["held", "paused_ready", "paused_waiting", "completed", "exited", "cancelled", "failed"]
         automation = self.create_automation(tag="processor-ineligible")
         for status in statuses:
             email, _ = self.create_contact()
             enrolment = self.enrol(automation["id"], email)
-            self.patch_enrolment_data(enrolment["id"], {"status": status})
+            self.patch_enrolment_data(
+                enrolment["id"],
+                {
+                    "status": status,
+                    "retry_after": "not-a-date",
+                },
+            )
 
         result = self.process_enrolments(automation_id=automation["id"])
 
@@ -3406,6 +3443,26 @@ class TestAutomationExecution(test_base.TestBase):
 
     def test_scheduler_account_selection_includes_ready_enrolment(self):
         cid = self.create_scheduler_candidate_account(status="ready")
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertIn(cid, cids)
+
+    def test_scheduler_account_selection_ignores_future_retry_after(self):
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            retry_after=(datetime.utcnow() + timedelta(hours=1)).isoformat() + "Z",
+        )
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertNotIn(cid, cids)
+
+    def test_scheduler_account_selection_treats_invalid_retry_after_as_elapsed(self):
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            retry_after="not-a-date",
+        )
 
         cids = automations._automation_processing_account_ids(self.db, 50)
 

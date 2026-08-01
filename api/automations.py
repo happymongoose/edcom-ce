@@ -1578,6 +1578,24 @@ def _bounded_error_text(value: object) -> str:
     return text
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _retry_after_blocks_processing(value: object, now: datetime) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        retry_after = _parse_datetime(text)
+    except Exception:
+        return False
+    return retry_after > now
+
+
 def _automation_failure_is_retryable(error: falcon.HTTPError) -> bool:
     return error.title == "Error sending automation email"
 
@@ -1613,7 +1631,7 @@ def _automation_failure_update(
     title = _bounded_error_text(error.title)
     description = _bounded_error_text(error.description or error.title)
 
-    retry_count = int(enrolment.get("retry_count") or 0)
+    retry_count = _safe_int(enrolment.get("retry_count"), 0)
     retry_after = None
     release_status = "held"
     if retryable:
@@ -4703,22 +4721,16 @@ def _eligible_automation_enrolments(
     automation_id: str | None = None,
 ) -> List[JsonObj]:
     now = datetime.utcnow()
-    params: List[object] = [cid, now, now, limit]
+    params: List[object] = [cid, now, limit * 5]
     automation_filter = ""
     if automation_id:
         automation_filter = "and e.automation_id = %s"
-        params = [cid, automation_id, now, now, limit]
+        params = [cid, automation_id, now, limit * 5]
 
-    return [
-        {
-            "automation_id": automation_id,
-            "enrolment_id": enrolment_id,
-            "contact_email": contact_email,
-            "status": status,
-        }
-        for automation_id, enrolment_id, contact_email, status in db.execute(
-            f"""
-            select e.automation_id, e.id, e.contact_email, e.data->>'status'
+    candidates: List[JsonObj] = []
+    for automation_id, enrolment_id, contact_email, status, retry_after in db.execute(
+        f"""
+        select e.automation_id, e.id, e.contact_email, e.data->>'status', e.data->>'retry_after'
             from automation_enrolments e
             join automations a on a.cid = e.cid and a.id = e.automation_id
             join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
@@ -4733,10 +4745,6 @@ def _eligible_automation_enrolments(
                         and nullif(e.data->>'wake_at', '')::timestamptz <= %s
                     )
                 )
-                and (
-                    nullif(e.data->>'retry_after', '') is null
-                    or nullif(e.data->>'retry_after', '')::timestamptz <= %s
-                )
             order by
                 coalesce(
                     nullif(e.data->>'modified', '')::timestamptz,
@@ -4745,9 +4753,21 @@ def _eligible_automation_enrolments(
                 e.id
             limit %s
             """,
-            *params,
+        *params,
+    ):
+        if _retry_after_blocks_processing(retry_after, now):
+            continue
+        candidates.append(
+            {
+                "automation_id": automation_id,
+                "enrolment_id": enrolment_id,
+                "contact_email": contact_email,
+                "status": status,
+            }
         )
-    ]
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def _running_automation_enrolment_count(
@@ -4784,11 +4804,11 @@ def _automation_processing_account_ids(
     db: DB,
     account_limit: int,
 ) -> List[str]:
-    return [
-        cid
-        for cid, in db.execute(
-            """
-            select e.cid
+    now = datetime.utcnow()
+    cids: List[str] = []
+    for cid, retry_after in db.execute(
+        """
+            select e.cid, e.data->>'retry_after'
             from automation_enrolments e
             join automations a on a.cid = e.cid and a.id = e.automation_id
             join companies c on c.id = e.cid
@@ -4802,25 +4822,24 @@ def _automation_processing_account_ids(
                         and nullif(e.data->>'wake_at', '')::timestamptz <= %s
                     )
                 )
-                and (
-                    nullif(e.data->>'retry_after', '') is null
-                    or nullif(e.data->>'retry_after', '')::timestamptz <= %s
-                )
-            group by e.cid
-            order by min(
+            order by
                 coalesce(
                     nullif(e.data->>'modified', '')::timestamptz,
                     nullif(e.data->>'created', '')::timestamptz
-                )
-            ), e.cid
+                ),
+                e.cid
             limit %s
             """,
-            {"admin": False},
-            datetime.utcnow(),
-            datetime.utcnow(),
-            account_limit,
-        )
-    ]
+        {"admin": False},
+        now,
+        account_limit * 5,
+    ):
+        if cid in cids or _retry_after_blocks_processing(retry_after, now):
+            continue
+        cids.append(cid)
+        if len(cids) >= account_limit:
+            break
+    return cids
 
 
 def _process_eligible_automation_enrolments(
