@@ -30,6 +30,8 @@ function normalizeAutomation(automation) {
   automation.entry = automation.entry || {type: 'manual'};
   if (_.contains(['tag_added', 'tag_removed'], automation.entry.type)) {
     automation.entry.tag = automation.entry.tag || '';
+  } else if (_.contains(['list_joined', 'list_left'], automation.entry.type)) {
+    automation.entry.list_id = automation.entry.list_id || '';
   } else {
     automation.entry = {type: 'manual'};
   }
@@ -44,6 +46,12 @@ function entryPayload(entry) {
     return {
       type: entry.type,
       tag: entry.tag || '',
+    };
+  }
+  if (entry && _.contains(['list_joined', 'list_left'], entry.type)) {
+    return {
+      type: entry.type,
+      list_id: entry.list_id || '',
     };
   }
   return {
@@ -320,10 +328,14 @@ class Automation extends Component {
 
   entryTypeChange = event => {
     const type = getvalue(event);
+    const lists = this.props.lists || [];
     this.props.update({
       entry: {$set: _.contains(['tag_added', 'tag_removed'], type) ? {
         type: type,
         tag: (this.props.data.entry && this.props.data.entry.tag) || '',
+      } : _.contains(['list_joined', 'list_left'], type) ? {
+        type: type,
+        list_id: (this.props.data.entry && this.props.data.entry.list_id) || (lists.length ? lists[0].id : ''),
       } : {
         type: 'manual',
       }},
@@ -334,6 +346,14 @@ class Automation extends Component {
     this.props.update({
       entry: {
         tag: {$set: event.params.data.id},
+      },
+    });
+  }
+
+  entryListChange = event => {
+    this.props.update({
+      entry: {
+        list_id: {$set: getvalue(event)},
       },
     });
   }
@@ -1339,6 +1359,8 @@ class Automation extends Component {
                   {id: 'manual', name: 'Manual'},
                   {id: 'tag_added', name: 'Tag added'},
                   {id: 'tag_removed', name: 'Tag removed'},
+                  {id: 'list_joined', name: 'Joined list'},
+                  {id: 'list_left', name: 'Left list'},
                 ]}
               />
               {
@@ -1367,7 +1389,23 @@ class Automation extends Component {
                     />
                   </div>
                 :
-                  <p>Contacts can be added manually from this automation or from a contact/list action.</p>
+                  data.entry && _.contains(['list_joined', 'list_left'], data.entry.type) ?
+                    (this.listOptions().length ?
+                      <div style={{maxWidth: '360px'}} className="space-bottom">
+                        <SelectLabel
+                          id="list_id"
+                          label="Trigger list"
+                          obj={data.entry}
+                          onChange={this.entryListChange}
+                          options={this.listOptions()}
+                          emptyVal="Select list"
+                        />
+                      </div>
+                    :
+                      <p className="help-block">Create a contact list before selecting this trigger.</p>
+                    )
+                  :
+                    <p>Contacts can be added manually from this automation or from a contact/list action.</p>
               }
               <SelectLabel
                 id="reentry"

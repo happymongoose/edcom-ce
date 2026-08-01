@@ -617,6 +617,115 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Tag removed entry trigger requires a tag", result.text)
 
+    def test_list_joined_entry_with_list_publishes(self):
+        automation = self.create_tracked_automation("List Joined Entry Publish")
+        lst = self.create_contact_list("automation_crud_joined_entry")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "list_joined",
+            "list_id": lst["id"],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {
+                "type": "list_joined",
+                "list_id": lst["id"],
+            },
+        )
+
+    def test_list_left_entry_with_list_publishes(self):
+        automation = self.create_tracked_automation("List Left Entry Publish")
+        lst = self.create_contact_list("automation_crud_left_entry")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "list_left",
+            "list_id": lst["id"],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {
+                "type": "list_left",
+                "list_id": lst["id"],
+            },
+        )
+
+    def test_list_entry_missing_list_id_fails_publish_validation(self):
+        automation = self.create_tracked_automation("List Entry Missing List")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "list_joined",
+            "list_id": "",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Joined list entry trigger requires a contact list", result.text)
+
+    def test_list_entry_unknown_list_fails_publish_validation(self):
+        automation = self.create_tracked_automation("List Entry Unknown List")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "list_left",
+            "list_id": "missing-list-id",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("List entry trigger must reference a contact list from this account", result.text)
+
+    def test_list_entry_unowned_list_fails_publish_validation(self):
+        automation = self.create_tracked_automation("List Entry Unowned List")
+        lst = self.create_contact_list("automation_crud_unowned_entry")
+        self.db.execute(
+            "update lists set cid = %s where id = %s",
+            "other-account-cid",
+            lst["id"],
+        )
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "list_joined",
+            "list_id": lst["id"],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("List entry trigger must reference a contact list from this account", result.text)
+
     def test_publish_validation_failure_does_not_modify_existing_published_data(self):
         created = self.user_post("/api/automations", json={"name": "Publish Failure"})
         automation_id = created["id"]

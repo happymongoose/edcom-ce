@@ -313,6 +313,21 @@ ENTRY_SCHEMA = {
             },
             "additionalProperties": False,
         },
+        {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["list_joined", "list_left"],
+                },
+                "list_id": {
+                    "type": "string",
+                    "maxLength": 64,
+                },
+            },
+            "additionalProperties": False,
+        },
     ],
 }
 
@@ -618,6 +633,15 @@ def _published_entry(entry: JsonObj) -> JsonObj:
             "type": entry_type,
             "tag": tag,
         }
+    if entry_type in ("list_joined", "list_left"):
+        list_id = (entry.get("list_id") or "").strip()
+        if not list_id:
+            trigger_label = "Joined list" if entry_type == "list_joined" else "Left list"
+            _validation_error("%s entry trigger requires a contact list." % trigger_label)
+        return {
+            "type": entry_type,
+            "list_id": list_id,
+        }
     _validation_error("Automation entry trigger type is not supported.")
 
 
@@ -906,6 +930,9 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
         _validation_error("Automation entry is required.")
     _validate_doc(entry, ENTRY_SCHEMA)
     entry = _published_entry(entry)
+    if entry.get("type") in ("list_joined", "list_left"):
+        if db.lists.get(entry.get("list_id")) is None:
+            _validation_error("List entry trigger must reference a contact list from this account.")
 
     reentry = automation.get("reentry", "once")
     _validate_doc(reentry, REENTRY_SCHEMA)
