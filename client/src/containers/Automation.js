@@ -139,6 +139,32 @@ export function automationHistoryLog(history, options) {
       if (event.remaining_seconds !== undefined && event.remaining_seconds !== null) {
         parts.push('remaining_seconds=' + event.remaining_seconds);
       }
+    } else if (event.type === 'engagement') {
+      parts.push('engagement ' + (event.event_type || ''));
+      if (event.automation_email_id) {
+        parts.push('automation_email=' + event.automation_email_id);
+      }
+      if (event.automation_email_name) {
+        parts.push('email_name="' + event.automation_email_name + '"');
+      }
+      if (event.subject) {
+        parts.push('subject="' + event.subject + '"');
+      }
+      if (event.send_step_run_id) {
+        parts.push('send_step=' + event.send_step_run_id);
+      }
+      if (event.link_url) {
+        parts.push('link=' + event.link_url);
+      }
+      if (event.link_index !== undefined && event.link_index !== null) {
+        parts.push('link_index=' + event.link_index);
+      }
+      if (event.inferred) {
+        parts.push('inferred=true');
+      }
+      if (event.inferred_from_event_type) {
+        parts.push('inferred_from=' + event.inferred_from_event_type);
+      }
     } else {
       parts.push('step ' + (event.node_type || '') + ' ' + (event.node_id || ''));
       if (event.action) {

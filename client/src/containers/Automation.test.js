@@ -306,6 +306,48 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('sent=true');
   });
 
+  it('includes engagement events in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'engagement',
+          event_type: 'open',
+          created: '2026-07-24T21:12:00Z',
+          contact_email: 'sarah@example.com',
+          enrolment_id: 'enrolment-1',
+          automation_email_id: 'email-1',
+          automation_email_name: 'Welcome email',
+          subject: 'Welcome',
+          send_step_run_id: 'step-run-1',
+          inferred: true,
+          inferred_from_event_type: 'click',
+        },
+        {
+          type: 'engagement',
+          event_type: 'click',
+          created: '2026-07-24T21:13:00Z',
+          contact_email: 'sarah@example.com',
+          enrolment_id: 'enrolment-1',
+          automation_email_id: 'email-1',
+          automation_email_name: 'Welcome email',
+          subject: 'Welcome',
+          send_step_run_id: 'step-run-1',
+          link_url: 'https://example.com/offer',
+          link_index: 2,
+        },
+      ],
+    });
+
+    expect(log).toContain('sarah@example.com | enrolment enrolment-1 | engagement open');
+    expect(log).toContain('email_name="Welcome email"');
+    expect(log).toContain('send_step=step-run-1');
+    expect(log).toContain('inferred=true');
+    expect(log).toContain('inferred_from=click');
+    expect(log).toContain('engagement click');
+    expect(log).toContain('link=https://example.com/offer');
+    expect(log).toContain('link_index=2');
+  });
+
   it('groups debug history by contact email and sorts passes newest first', () => {
     const contacts = automationHistoryContacts({
       enrolments: [

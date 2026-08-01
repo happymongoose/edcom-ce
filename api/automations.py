@@ -2851,6 +2851,7 @@ class AutomationHistory(object):
 
     ENROLMENT_LIMIT = 100
     STEP_RUN_LIMIT = 500
+    ENGAGEMENT_EVENT_LIMIT = 500
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
@@ -2907,10 +2908,61 @@ class AutomationHistory(object):
         enrolments_by_id = {enrolment["id"]: enrolment for enrolment in enrolments}
         for enrolment in enrolments:
             enrolment["step_runs"] = []
+            enrolment["engagement_events"] = []
         for step_run in step_runs:
             enrolment = enrolments_by_id.get(step_run["enrolment_id"])
             if enrolment is not None:
                 enrolment["step_runs"].append(step_run)
+
+        engagement_events = [
+            {
+                "id": row[0],
+                "type": "engagement",
+                "event_type": row[8],
+                "created": row[9].isoformat() if row[9] else None,
+                "contact_id": row[2],
+                "contact_email": row[3],
+                "enrolment_id": row[6],
+                "automation_email_id": row[5],
+                "automation_email_name": (row[11] or {}).get("name"),
+                "subject": (row[11] or {}).get("subject"),
+                "send_step_run_id": row[7],
+                "link_url": (row[10] or {}).get("link_url"),
+                "link_index": (row[10] or {}).get("link_index"),
+                "inferred": (row[10] or {}).get("inferred"),
+                "inferred_from_event_type": (row[10] or {}).get("inferred_from_event_type"),
+                "inferred_from_link_id": (row[10] or {}).get("inferred_from_link_id"),
+                "inferred_from_link_index": (row[10] or {}).get("inferred_from_link_index"),
+            }
+            for row in db.execute(
+                """
+                select e.id, e.cid, e.contact_id, e.contact_email, e.automation_id,
+                    e.automation_email_id, e.enrolment_id, e.send_step_run_id,
+                    e.event_type, e.ts, e.data, ae.data
+                from (
+                    select id, cid, contact_id, contact_email, automation_id,
+                        automation_email_id, enrolment_id, send_step_run_id,
+                        event_type, ts, data
+                    from automation_email_events
+                    where cid = %s and automation_id = %s
+                    order by ts desc, id desc
+                    limit %s
+                ) e
+                left join automation_emails ae
+                    on ae.cid = e.cid
+                    and ae.automation_id = e.automation_id
+                    and ae.id = e.automation_email_id
+                order by e.ts, e.id
+                """,
+                cid,
+                id,
+                self.ENGAGEMENT_EVENT_LIMIT,
+            )
+        ]
+        for engagement_event in engagement_events:
+            enrolment = enrolments_by_id.get(engagement_event["enrolment_id"])
+            if enrolment is not None:
+                enrolment["engagement_events"].append(engagement_event)
 
         events = []
         for enrolment in enrolments:
@@ -2969,6 +3021,8 @@ class AutomationHistory(object):
                 }
             )
 
+        events.extend(engagement_events)
+
         events.sort(key=lambda event: (event.get("created") or "", event["type"]))
 
         req.context["result"] = {
@@ -2977,6 +3031,7 @@ class AutomationHistory(object):
             "limits": {
                 "enrolments": self.ENROLMENT_LIMIT,
                 "step_runs": self.STEP_RUN_LIMIT,
+                "engagement_events": self.ENGAGEMENT_EVENT_LIMIT,
             },
             "enrolments": enrolments,
             "events": events,

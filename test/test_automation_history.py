@@ -2,9 +2,15 @@ import shortuuid
 from datetime import datetime, timedelta
 
 import test_base
+from api.migrations import add_automation_email_events_table, add_automation_emails_table
 
 
 class TestAutomationHistory(test_base.TestBase):
+
+    def setUp(self):
+        super(TestAutomationHistory, self).setUp()
+        add_automation_emails_table.run(self.db)
+        add_automation_email_events_table.run(self.db)
 
     def unique(self):
         return shortuuid.uuid().lower()
@@ -102,6 +108,14 @@ class TestAutomationHistory(test_base.TestBase):
 
     def cleanup(self, *automation_ids):
         self.db.execute(
+            "delete from automation_email_events where automation_id = any(%s)",
+            list(automation_ids),
+        )
+        self.db.execute(
+            "delete from automation_emails where automation_id = any(%s)",
+            list(automation_ids),
+        )
+        self.db.execute(
             "delete from automation_step_runs where automation_id = any(%s)",
             list(automation_ids),
         )
@@ -112,6 +126,67 @@ class TestAutomationHistory(test_base.TestBase):
         self.db.set_cid(self.user_cookie["cid"])
         for automation_id in automation_ids:
             self.db.automations.remove(automation_id)
+
+    def create_automation_email(self, automation_id):
+        email_id = "automation-history-email-%s" % self.unique()
+        self.db.execute(
+            """
+            insert into automation_emails (id, cid, automation_id, data)
+            values (%s, %s, %s, %s)
+            """,
+            email_id,
+            self.user_cookie["cid"],
+            automation_id,
+            {
+                "name": "History welcome email",
+                "subject": "History welcome subject",
+            },
+        )
+        return email_id
+
+    def insert_engagement_event(
+        self,
+        automation_id,
+        enrolment,
+        automation_email_id,
+        event_type,
+        ts,
+        data=None,
+        cid=None,
+    ):
+        event_id = "automation-history-event-%s" % self.unique()
+        self.db.execute(
+            """
+            insert into automation_email_events (
+                id,
+                cid,
+                contact_id,
+                contact_email,
+                automation_id,
+                automation_email_id,
+                enrolment_id,
+                send_node_id,
+                send_step_run_id,
+                event_type,
+                ts,
+                data
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            event_id,
+            cid or self.user_cookie["cid"],
+            enrolment["contact_id"],
+            enrolment["contact_email"],
+            automation_id,
+            automation_email_id,
+            enrolment["id"],
+            "node_send_email_1",
+            "send-step-history-1",
+            event_type,
+            ts,
+            data or {},
+        )
+        return event_id
 
     def test_history_includes_enrolments_and_step_runs(self):
         email, contact_id = self.create_contact()
@@ -139,6 +214,88 @@ class TestAutomationHistory(test_base.TestBase):
         self.assertEqual(history["enrolments"][0]["step_runs"][0]["status"], "succeeded")
         self.assertEqual(history["enrolments"][0]["step_runs"][1]["node_id"], "node_exit_1")
 
+        self.cleanup(automation["id"])
+
+    def test_history_includes_engagement_events(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        automation_email_id = self.create_automation_email(automation["id"])
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_engagement_event(
+            automation["id"],
+            enrolment,
+            automation_email_id,
+            "open",
+            datetime(2026, 7, 24, 21, 12, 0),
+            {
+                "inferred": True,
+                "inferred_from_event_type": "click",
+                "inferred_from_link_id": "link-1",
+                "inferred_from_link_index": 2,
+                "oversized_unprojected": "x" * 1000,
+            },
+        )
+        self.insert_engagement_event(
+            automation["id"],
+            enrolment,
+            automation_email_id,
+            "click",
+            datetime(2026, 7, 24, 21, 13, 0),
+            {
+                "link_url": "https://example.com/history",
+                "link_index": 2,
+                "oversized_unprojected": "x" * 1000,
+            },
+        )
+
+        history = self.history(automation["id"])
+        engagement_events = [event for event in history["events"] if event["type"] == "engagement"]
+
+        self.assertEqual(history["limits"]["engagement_events"], 500)
+        self.assertEqual(len(engagement_events), 2)
+        self.assertEqual(len(history["enrolments"][0]["engagement_events"]), 2)
+        self.assertEqual(engagement_events[0]["event_type"], "open")
+        self.assertEqual(engagement_events[0]["contact_email"], email)
+        self.assertEqual(engagement_events[0]["enrolment_id"], enrolment["id"])
+        self.assertEqual(engagement_events[0]["automation_email_id"], automation_email_id)
+        self.assertEqual(engagement_events[0]["automation_email_name"], "History welcome email")
+        self.assertEqual(engagement_events[0]["subject"], "History welcome subject")
+        self.assertEqual(engagement_events[0]["send_step_run_id"], "send-step-history-1")
+        self.assertEqual(engagement_events[0]["inferred"], True)
+        self.assertEqual(engagement_events[0]["inferred_from_event_type"], "click")
+        self.assertEqual(engagement_events[0]["inferred_from_link_id"], "link-1")
+        self.assertEqual(engagement_events[0]["inferred_from_link_index"], 2)
+        self.assertNotIn("oversized_unprojected", engagement_events[0])
+        self.assertEqual(engagement_events[1]["event_type"], "click")
+        self.assertEqual(engagement_events[1]["link_url"], "https://example.com/history")
+        self.assertEqual(engagement_events[1]["link_index"], 2)
+
+        self.cleanup(automation["id"])
+
+    def test_history_engagement_events_are_account_scoped(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        automation_email_id = self.create_automation_email(automation["id"])
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_engagement_event(
+            automation["id"],
+            enrolment,
+            automation_email_id,
+            "open",
+            datetime(2026, 7, 24, 21, 12, 0),
+            cid="other-account-cid",
+        )
+
+        history = self.history(automation["id"])
+
+        self.assertEqual([event for event in history["events"] if event["type"] == "engagement"], [])
+        self.assertEqual(history["enrolments"][0]["engagement_events"], [])
+
+        self.db.execute(
+            "delete from automation_email_events where automation_id = %s and cid = %s",
+            automation["id"],
+            "other-account-cid",
+        )
         self.cleanup(automation["id"])
 
     def test_history_events_are_chronological(self):
