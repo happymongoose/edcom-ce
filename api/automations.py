@@ -3039,12 +3039,12 @@ def _run_next_automation_enrolment(
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_opened_email", "go_to", "send_email", "exit"):
+        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_opened_email, go_to, send_email and exit nodes can be executed manually."
+                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -3410,7 +3410,7 @@ def _run_next_automation_enrolment(
                 "current_node_id": target_node_id,
                 "modified": now,
             }
-        elif node_type == "if_opened_email":
+        elif node_type in ("if_opened_email", "if_clicked_email"):
             automation_email_id = node.get("automation_email_id")
             automation_email = _automation_email_obj(
                 db.row(
@@ -3427,9 +3427,10 @@ def _run_next_automation_enrolment(
             if automation_email is None:
                 raise falcon.HTTPBadRequest(
                     title="Automation email is missing",
-                    description="The published if_opened_email node references an automation email that was not found.",
+                    description="The published %s node references an automation email that was not found." % node_type,
                 )
 
+            event_type = "open" if node_type == "if_opened_email" else "click"
             result = bool(
                 db.single(
                     """
@@ -3440,7 +3441,7 @@ def _run_next_automation_enrolment(
                         and enrolment_id = %s
                         and contact_id = %s
                         and automation_email_id = %s
-                        and event_type = 'open'
+                        and event_type = %s
                     limit 1
                     """,
                     cid,
@@ -3448,6 +3449,7 @@ def _run_next_automation_enrolment(
                     enrolment_id,
                     enrolment["contact_id"],
                     automation_email_id,
+                    event_type,
                 )
             )
             branch = "yes" if result else "no"
@@ -3455,12 +3457,12 @@ def _run_next_automation_enrolment(
             if _node_by_id(nodes, target_node_id) is None:
                 raise falcon.HTTPBadRequest(
                     title="Automation branch target is missing",
-                    description="The published if_opened_email %s target was not found in the published workflow." % branch,
+                    description="The published %s %s target was not found in the published workflow." % (node_type, branch),
                 )
 
             success_data.update(
                 {
-                    "action": "if_opened_email",
+                    "action": node_type,
                     "automation_email_id": automation_email_id,
                     "automation_email_name": automation_email.get("name"),
                     "subject": automation_email.get("subject"),

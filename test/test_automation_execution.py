@@ -787,6 +787,7 @@ class TestAutomationExecution(test_base.TestBase):
         event_enrolment_id=None,
         event_contact_id=None,
         event_automation_email_id=None,
+        event_type="open",
     ):
         event_id = shortuuid.uuid()
         self.db.execute(
@@ -805,7 +806,7 @@ class TestAutomationExecution(test_base.TestBase):
                 ts,
                 data
             )
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', now(), %s)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
             """,
             event_id,
             event_cid or self.user_cookie["cid"],
@@ -816,6 +817,7 @@ class TestAutomationExecution(test_base.TestBase):
             event_enrolment_id or enrolment_id,
             "node_send_email_1",
             "send-step-%s" % event_id,
+            event_type,
             {"test_id": self.test_id},
         )
         return event_id
@@ -2066,15 +2068,184 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_if_clicked_email_run_next_returns_unsupported_clearly(self):
+    def test_if_clicked_email_true_branch_when_matching_click_exists(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertFalse(self.has_tag(contact_id, "engaged-branch"))
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["node_id"], "node_email_condition_1")
+        self.assertEqual(step_run["node_type"], "if_clicked_email")
+        self.assertEqual(step_run["action"], "if_clicked_email")
+        self.assertEqual(step_run["automation_email_id"], automation["engagement_email_id"])
+        self.assertEqual(step_run["automation_email_name"], "Engagement condition email")
+        self.assertEqual(step_run["subject"], "Engagement condition subject")
+        self.assertEqual(step_run["result"], True)
+        self.assertEqual(step_run["branch"], "yes")
+        self.assertEqual(step_run["target_node_id"], "node_add_tag_1")
+        self.assertEqual(step_run["published_revision"], automation["published_revision"])
+        self.assertEqual(step_run["status"], "succeeded")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_false_branch_when_no_click_exists(self):
         email, _ = self.create_contact()
         automation = self.create_email_engagement_condition_automation("if_clicked_email")
         enrolment = self.enrol(automation["id"], email)
 
         result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+        self.assertEqual(result.json["step_run"]["branch"], "no")
+        self.assertEqual(result.json["step_run"]["target_node_id"], "node_exit_1")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_ignores_click_from_another_enrolment(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_enrolment_id="other-enrolment-%s" % self.unique(),
+            event_type="click",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_ignores_click_from_another_automation_email(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_automation_email_id="other-email-%s" % self.unique(),
+            event_type="click",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_ignores_click_from_another_contact_or_account(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_contact_id=contact_id + 100000,
+            event_type="click",
+        )
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_cid="other-account-%s" % self.unique(),
+            event_type="click",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_open_event_does_not_count_as_click(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_target_missing_is_rejected_clearly(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        published = automation["published"].copy()
+        published["nodes"] = [
+            node for node in published["nodes"] if node["id"] != "node_add_tag_1"
+        ]
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation["id"], {"published": published})
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
         self.assertEqual(result.status_code, 400)
-        self.assertIn("Unsupported automation node", result.text)
-        self.assertIn("if_clicked_email", result.text)
+        self.assertIn("if_clicked_email yes target was not found", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_missing_email_is_rejected_clearly(self):
+        email, _ = self.create_contact()
+        automation = self.create_email_engagement_condition_automation("if_clicked_email")
+        self.db.execute(
+            "delete from automation_emails where id = %s and cid = %s",
+            automation["engagement_email_id"],
+            self.user_cookie["cid"],
+        )
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("if_clicked_email node references an automation email that was not found", result.text)
 
         self.cleanup(automation["id"])
 
