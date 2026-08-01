@@ -577,6 +577,46 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Tag added entry trigger requires a tag", result.text)
 
+    def test_tag_removed_entry_with_tag_publishes(self):
+        automation = self.create_tracked_automation("Tag Removed Entry Publish")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "tag_removed",
+            "tag": "automation-entry-lapsed",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {
+                "type": "tag_removed",
+                "tag": "automation-entry-lapsed",
+            },
+        )
+
+    def test_tag_removed_entry_missing_tag_fails_publish_validation(self):
+        automation = self.create_tracked_automation("Tag Removed Entry Missing Tag")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "tag_removed",
+            "tag": "",
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Tag removed entry trigger requires a tag", result.text)
+
     def test_publish_validation_failure_does_not_modify_existing_published_data(self):
         created = self.user_post("/api/automations", json={"name": "Publish Failure"})
         automation_id = created["id"]

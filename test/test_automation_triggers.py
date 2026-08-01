@@ -156,10 +156,10 @@ class TestAutomationTriggers(test_base.TestBase):
         )
         return email, contact_id
 
-    def workflow(self, tag, reentry="once"):
+    def workflow(self, tag, reentry="once", entry_type="tag_added"):
         return {
             "entry": {
-                "type": "tag_added",
+                "type": entry_type,
                 "tag": tag,
             },
             "reentry": reentry,
@@ -201,7 +201,7 @@ class TestAutomationTriggers(test_base.TestBase):
             },
         }
 
-    def create_automation(self, tag, reentry="once", paused=False):
+    def create_automation(self, tag, reentry="once", paused=False, entry_type="tag_added"):
         automation = self.user_post(
             "/api/automations",
             json={"name": "%s_automation_%s" % (self.test_id, self.unique())},
@@ -209,7 +209,7 @@ class TestAutomationTriggers(test_base.TestBase):
         self.created_automation_ids.append(automation["id"])
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(tag, reentry),
+            json=self.workflow(tag, reentry, entry_type),
         )
         published = self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
@@ -279,15 +279,16 @@ class TestAutomationTriggers(test_base.TestBase):
             **kwargs
         )
 
-    def emitted_events(self, tag):
+    def emitted_events(self, tag, event_type="tag_added"):
         return self.db.execute(
             """
             select id, data
             from automation_trigger_events
-            where cid = %s and event_type = 'tag_added' and data->>'tag' = %s
+            where cid = %s and event_type = %s and data->>'tag' = %s
             order by ts, id
             """,
             self.user_cookie["cid"],
+            event_type,
             tag,
         ).fetchall()
 
@@ -501,6 +502,17 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(event["status"], "pending")
         self.assertEqual(event["source"]["type"], "manual")
 
+    def test_manual_tag_removed_event_insertion_works_when_enabled(self):
+        self.enable_manual_events()
+        email, contact_id = self.create_contact()
+
+        event = self.create_event(email, "%s_removed_manual" % self.test_id, event_type="tag_removed")
+
+        self.assertEqual(event["event_type"], "tag_removed")
+        self.assertEqual(event["contact_id"], contact_id)
+        self.assertEqual(event["tag"], "%s_removed_manual" % self.test_id)
+        self.assertEqual(event["status"], "pending")
+
     def test_processor_disabled_by_default(self):
         self.enable_manual_events()
         email, _ = self.create_contact()
@@ -529,6 +541,50 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(rows[0][1]["status"], "ready")
         self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
         self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_enabled_processor_enrols_matching_tag_removed_automation(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_removed_match" % self.test_id
+        automation = self.create_automation(tag, entry_type="tag_removed")
+        event = self.create_event(email, tag, event_type="tag_removed")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["status"], "ready")
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_contact_remove_tag_does_not_emit_tag_removed_event_yet(self):
+        self.enable_emission()
+        self.enable_processing()
+        email, contact_id = self.create_contact()
+        tag = "%s_removed_no_emit" % self.test_id
+        automation = self.create_automation(tag, entry_type="tag_removed")
+        self.add_contact_tag(email, contact_id, tag)
+        self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 0)
+
+        tagcounts = {}
+        contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            tagcounts,
+            [],
+        )
+        result = self.process_events()
+
+        self.assertEqual(tagcounts[tag], -1)
+        self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 0)
+        self.assertEqual(result["processed"], 0)
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 0)
 
     def test_emission_flag_off_does_not_create_event_even_with_match(self):
         email, contact_id = self.create_contact()

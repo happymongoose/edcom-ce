@@ -304,7 +304,7 @@ ENTRY_SCHEMA = {
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["tag_added"],
+                    "enum": ["tag_added", "tag_removed"],
                 },
                 "tag": {
                     "type": "string",
@@ -399,7 +399,7 @@ AUTOMATION_TRIGGER_EVENT_SCHEMA = {
     "properties": {
         "event_type": {
             "type": "string",
-            "enum": ["tag_added"],
+            "enum": ["tag_added", "tag_removed"],
         },
         "contact_email": {
             "type": "string",
@@ -609,12 +609,13 @@ def _published_entry(entry: JsonObj) -> JsonObj:
     entry_type = entry.get("type")
     if entry_type == "manual":
         return {"type": "manual"}
-    if entry_type == "tag_added":
+    if entry_type in ("tag_added", "tag_removed"):
         tag = (entry.get("tag") or "").strip()
         if not tag:
-            _validation_error("Tag added entry trigger requires a tag.")
+            trigger_label = "Tag added" if entry_type == "tag_added" else "Tag removed"
+            _validation_error("%s entry trigger requires a tag." % trigger_label)
         return {
-            "type": "tag_added",
+            "type": entry_type,
             "tag": tag,
         }
     _validation_error("Automation entry trigger type is not supported.")
@@ -3640,17 +3641,17 @@ def _create_automation_trigger_event(
     created_by: str | None = None,
     manual_debug: bool = False,
 ) -> JsonObj:
-    if event_type != "tag_added":
+    if event_type not in ("tag_added", "tag_removed"):
         raise falcon.HTTPBadRequest(
             title="Unsupported trigger event",
-            description="Only tag_added trigger events are supported.",
+            description="Only tag_added and tag_removed trigger events are supported.",
         )
 
     tag = fix_tag(tag)
     if not tag:
         raise falcon.HTTPBadRequest(
             title="Trigger tag is required",
-            description="Tag added trigger events require a tag.",
+            description="Tag trigger events require a tag.",
         )
 
     if not contact_email or len(contact_email) > 320:
@@ -3778,7 +3779,7 @@ def _claim_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> Li
 
 
 def _matching_trigger_automations(db: DB, cid: str, event: JsonObj) -> List[JsonObj]:
-    if event.get("event_type") != "tag_added":
+    if event.get("event_type") not in ("tag_added", "tag_removed"):
         return []
     rows = db.execute(
         """
@@ -3787,11 +3788,12 @@ def _matching_trigger_automations(db: DB, cid: str, event: JsonObj) -> List[Json
         where cid = %s
             and data->>'status' in ('published', 'paused')
             and data->'published' is not null
-            and data->'published'->'entry'->>'type' = 'tag_added'
+            and data->'published'->'entry'->>'type' = %s
             and data->'published'->'entry'->>'tag' = %s
         order by data->>'name', id
         """,
         cid,
+        event.get("event_type"),
         event.get("tag"),
     ).fetchall()
     return [automation for automation in (json_obj(row) for row in rows) if automation is not None]
@@ -3857,7 +3859,7 @@ def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonO
         if len(result["event_results"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
             result["event_results"].append(item)
 
-    if event.get("event_type") != "tag_added" or not tag:
+    if event.get("event_type") not in ("tag_added", "tag_removed") or not tag:
         result["failed"] += 1
         error = {
             "event_id": event.get("id"),

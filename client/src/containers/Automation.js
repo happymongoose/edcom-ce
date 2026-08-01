@@ -28,7 +28,7 @@ function errorMessage(error, fallback) {
 
 function normalizeAutomation(automation) {
   automation.entry = automation.entry || {type: 'manual'};
-  if (automation.entry.type === 'tag_added') {
+  if (_.contains(['tag_added', 'tag_removed'], automation.entry.type)) {
     automation.entry.tag = automation.entry.tag || '';
   } else {
     automation.entry = {type: 'manual'};
@@ -40,9 +40,9 @@ function normalizeAutomation(automation) {
 }
 
 function entryPayload(entry) {
-  if (entry && entry.type === 'tag_added') {
+  if (entry && _.contains(['tag_added', 'tag_removed'], entry.type)) {
     return {
-      type: 'tag_added',
+      type: entry.type,
       tag: entry.tag || '',
     };
   }
@@ -321,8 +321,8 @@ class Automation extends Component {
   entryTypeChange = event => {
     const type = getvalue(event);
     this.props.update({
-      entry: {$set: type === 'tag_added' ? {
-        type: 'tag_added',
+      entry: {$set: _.contains(['tag_added', 'tag_removed'], type) ? {
+        type: type,
         tag: (this.props.data.entry && this.props.data.entry.tag) || '',
       } : {
         type: 'manual',
@@ -370,7 +370,7 @@ class Automation extends Component {
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
     const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
     const entry = this.props.data.entry || {};
-    const entryTags = entry.type === 'tag_added' && entry.tag ? [entry.tag] : [];
+    const entryTags = _.contains(['tag_added', 'tag_removed'], entry.type) && entry.tag ? [entry.tag] : [];
 
     return _.map(_.uniq(tags.concat(draftTags).concat(entryTags)), tag => ({id: tag, text: tag}));
   }
@@ -1338,10 +1338,11 @@ class Automation extends Component {
                 options={[
                   {id: 'manual', name: 'Manual'},
                   {id: 'tag_added', name: 'Tag added'},
+                  {id: 'tag_removed', name: 'Tag removed'},
                 ]}
               />
               {
-                data.entry && data.entry.type === 'tag_added' ?
+                data.entry && _.contains(['tag_added', 'tag_removed'], data.entry.type) ?
                   <div style={{maxWidth: '360px'}} className="space-bottom">
                     <label>Trigger tag</label>
                     <Select2
