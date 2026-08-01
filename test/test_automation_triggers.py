@@ -156,11 +156,37 @@ class TestAutomationTriggers(test_base.TestBase):
         )
         return email, contact_id
 
+    def create_contact_list(self, name=None):
+        lst = self.user_post(
+            "/api/lists",
+            json={"name": name or "automation_trigger_list_%s" % self.unique()},
+        )
+        self.created_list_ids.append(lst["id"])
+        return lst
+
     def workflow(self, tag, reentry="once", entry_type="tag_added"):
         return {
             "entry": {
                 "type": entry_type,
                 "tag": tag,
+            },
+            "reentry": reentry,
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
+    def list_workflow(self, list_id, reentry="once", entry_type="list_joined"):
+        return {
+            "entry": {
+                "type": entry_type,
+                "list_id": list_id,
             },
             "reentry": reentry,
             "draft": {
@@ -252,6 +278,30 @@ class TestAutomationTriggers(test_base.TestBase):
             return paused_result.json
         return published.json
 
+    def create_list_trigger_automation(self, list_id, reentry="once", paused=False, entry_type="list_joined"):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_list_automation_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.list_workflow(list_id, reentry, entry_type),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(published.status_code, 200)
+        if paused:
+            paused_result = self.simulate_post(
+                "/api/automations/%s/pause" % automation["id"],
+                headers=self.headers(),
+            )
+            self.assertEqual(paused_result.status_code, 200)
+            return paused_result.json
+        return published.json
+
     def create_add_tag_automation(self, add_tag, entry_type="manual", entry_tag=None):
         automation = self.user_post(
             "/api/automations",
@@ -291,6 +341,16 @@ class TestAutomationTriggers(test_base.TestBase):
             "event_type": "tag_added",
             "contact_email": email,
             "tag": tag,
+            "correlation_id": "%s_%s" % (self.test_id, self.unique()),
+        }
+        doc.update(overrides)
+        return self.user_post("/api/automation-trigger-events", json=doc)
+
+    def create_list_event(self, email, list_id, event_type="list_joined", **overrides):
+        doc = {
+            "event_type": event_type,
+            "contact_email": email,
+            "list_id": list_id,
             "correlation_id": "%s_%s" % (self.test_id, self.unique()),
         }
         doc.update(overrides)
@@ -401,13 +461,13 @@ class TestAutomationTriggers(test_base.TestBase):
         newer = self.create_event(email, "%s_list_newer" % self.test_id)
         self.db.execute(
             "update automation_trigger_events set ts = %s where cid = %s and id = %s",
-            datetime(2026, 1, 1, 12, 0, 0),
+            datetime(2099, 1, 1, 12, 0, 0),
             self.user_cookie["cid"],
             older["id"],
         )
         self.db.execute(
             "update automation_trigger_events set ts = %s where cid = %s and id = %s",
-            datetime(2026, 1, 1, 13, 0, 0),
+            datetime(2099, 1, 1, 13, 0, 0),
             self.user_cookie["cid"],
             newer["id"],
         )
@@ -520,6 +580,39 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertNotIn("source", listed)
         self.assertNotIn("metadata", listed["results"][0])
 
+    def test_trigger_event_list_projects_list_id_without_raw_metadata(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        event = self.create_list_event(email, lst["id"], "list_joined")
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {
+                "large_metadata": "x" * 5000,
+                "results": [
+                    {
+                        "status": "no_match",
+                        "reason": "test",
+                        "list_id": lst["id"],
+                        "metadata": "x" * 5000,
+                    }
+                ],
+            },
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        listed = [item for item in self.list_events()["events"] if item["id"] == event["id"]][0]
+
+        self.assertEqual(listed["list_id"], lst["id"])
+        self.assertNotIn("large_metadata", listed)
+        self.assertNotIn("metadata", listed["results"][0])
+        self.assertEqual(listed["results"][0]["list_id"], lst["id"])
+
     def test_manual_event_insertion_disabled_by_default(self):
         email, _ = self.create_contact()
         result = self.simulate_post(
@@ -556,6 +649,82 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(event["contact_id"], contact_id)
         self.assertEqual(event["tag"], "%s_removed_manual" % self.test_id)
         self.assertEqual(event["status"], "pending")
+
+    def test_manual_list_joined_event_insertion_works_when_enabled(self):
+        self.enable_manual_events()
+        email, contact_id = self.create_contact()
+        lst = self.create_contact_list()
+
+        event = self.create_list_event(email, lst["id"], "list_joined")
+
+        self.assertEqual(event["event_type"], "list_joined")
+        self.assertEqual(event["contact_id"], contact_id)
+        self.assertEqual(event["list_id"], lst["id"])
+        self.assertEqual(event["status"], "pending")
+
+    def test_manual_list_left_event_insertion_works_when_enabled(self):
+        self.enable_manual_events()
+        email, contact_id = self.create_contact()
+        lst = self.create_contact_list()
+
+        event = self.create_list_event(email, lst["id"], "list_left")
+
+        self.assertEqual(event["event_type"], "list_left")
+        self.assertEqual(event["contact_id"], contact_id)
+        self.assertEqual(event["list_id"], lst["id"])
+        self.assertEqual(event["status"], "pending")
+
+    def test_manual_list_event_missing_list_id_fails(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        result = self.simulate_post(
+            "/api/automation-trigger-events",
+            json={
+                "event_type": "list_joined",
+                "contact_email": email,
+            },
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+
+    def test_manual_list_event_unknown_or_unowned_list_fails(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        unknown = self.simulate_post(
+            "/api/automation-trigger-events",
+            json={
+                "event_type": "list_left",
+                "contact_email": email,
+                "list_id": "missing-list-id",
+            },
+            headers=self.headers(),
+        )
+        self.assertEqual(unknown.status_code, 400)
+
+        lst = self.create_contact_list()
+        self.db.execute(
+            "update lists set cid = %s where id = %s",
+            "other-account-cid",
+            lst["id"],
+        )
+        try:
+            unowned = self.simulate_post(
+                "/api/automation-trigger-events",
+                json={
+                    "event_type": "list_joined",
+                    "contact_email": email,
+                    "list_id": lst["id"],
+                },
+                headers=self.headers(),
+            )
+            self.assertEqual(unowned.status_code, 400)
+        finally:
+            self.db.execute(
+                "update lists set cid = %s where id = %s",
+                self.user_cookie["cid"],
+                lst["id"],
+            )
 
     def test_processor_disabled_by_default(self):
         self.enable_manual_events()
@@ -602,6 +771,56 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1]["status"], "ready")
         self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_enabled_processor_enrols_matching_list_joined_automation(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"])
+        event = self.create_list_event(email, lst["id"], "list_joined")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["status"], "ready")
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_enabled_processor_enrols_matching_list_left_automation(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"], entry_type="list_left")
+        event = self.create_list_event(email, lst["id"], "list_left")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["status"], "ready")
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_no_match_list_event_is_processed_without_enrolment(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        event = self.create_list_event(email, lst["id"], "list_joined")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 0)
+        self.assertEqual(result["no_match"], 1)
         self.assertEqual(self.event_status(event["id"]), "processed")
 
     def test_tag_removed_emission_flag_off_does_not_create_event_even_with_match(self):
@@ -1051,6 +1270,28 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(result["no_match"], 1)
         self.assertEqual(self.event_status(event["id"]), "processed")
 
+    def test_same_automation_source_suppresses_list_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"])
+        self.create_list_event(
+            email,
+            lst["id"],
+            "list_joined",
+            source={
+                "type": "automation",
+                "automation_id": automation["id"],
+            },
+        )
+
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "same_automation_source")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 0)
+
     def test_same_automation_source_suppresses(self):
         self.enable_manual_events()
         self.enable_processing()
@@ -1087,6 +1328,21 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(result["details"][0]["reason"], "active_pass")
         self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
 
+    def test_active_pass_suppresses_list_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"], reentry="multiple")
+        self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        self.create_list_event(email, lst["id"], "list_joined")
+
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "active_pass")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
     def test_once_suppresses_prior_enrolment(self):
         self.enable_manual_events()
         self.enable_processing()
@@ -1096,6 +1352,22 @@ class TestAutomationTriggers(test_base.TestBase):
         enrolment = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
         self.patch_enrolment_status(enrolment["id"], "completed")
         self.create_event(email, tag)
+
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "once")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
+    def test_once_suppresses_prior_enrolment_for_list_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"])
+        enrolment = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        self.patch_enrolment_status(enrolment["id"], "completed")
+        self.create_list_event(email, lst["id"], "list_joined")
 
         result = self.process_events()
 
@@ -1118,6 +1390,21 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(result["enrolled"], 1)
         self.assertEqual(len(self.enrolment_rows(automation["id"])), 2)
 
+    def test_multiple_allows_terminal_previous_pass_for_list_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"], reentry="multiple")
+        enrolment = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        self.patch_enrolment_status(enrolment["id"], "completed")
+        self.create_list_event(email, lst["id"], "list_joined")
+
+        result = self.process_events()
+
+        self.assertEqual(result["enrolled"], 1)
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 2)
+
     def test_depth_guard_suppresses(self):
         self.enable_manual_events()
         self.enable_processing()
@@ -1125,6 +1412,20 @@ class TestAutomationTriggers(test_base.TestBase):
         tag = "%s_depth" % self.test_id
         automation = self.create_automation(tag)
         self.create_event(email, tag, depth=3)
+
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "max_depth")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 0)
+
+    def test_depth_guard_suppresses_list_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"])
+        self.create_list_event(email, lst["id"], "list_joined", depth=3)
 
         result = self.process_events()
 
@@ -1145,6 +1446,25 @@ class TestAutomationTriggers(test_base.TestBase):
         self.patch_enrolment_status(enrolment_id, "completed")
 
         self.create_event(email, tag)
+        second = self.process_events()
+
+        self.assertEqual(second["suppressed"], 1)
+        self.assertEqual(second["details"][0]["reason"], "cooldown")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
+    def test_cooldown_suppresses_repeat_list_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        automation = self.create_list_trigger_automation(lst["id"], reentry="multiple")
+        self.create_list_event(email, lst["id"], "list_joined")
+        first = self.process_events()
+        self.assertEqual(first["enrolled"], 1)
+        enrolment_id = self.enrolment_rows(automation["id"])[0][0]
+        self.patch_enrolment_status(enrolment_id, "completed")
+
+        self.create_list_event(email, lst["id"], "list_joined")
         second = self.process_events()
 
         self.assertEqual(second["suppressed"], 1)
@@ -1176,6 +1496,45 @@ class TestAutomationTriggers(test_base.TestBase):
             },
         )
         self.create_event(email, tag)
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 0)
+        self.assertEqual(result["no_match"], 1)
+
+    def test_current_account_scoping_for_list_matching(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        other_cid = "%s_list_other_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            "%s_list_other_automation" % self.test_id,
+            other_cid,
+            {
+                "name": "%s list other automation" % self.test_id,
+                "status": "published",
+                "published": {
+                    "entry": {
+                        "type": "list_joined",
+                        "list_id": lst["id"],
+                    },
+                    "reentry": "once",
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ],
+                },
+                "published_revision": 1,
+            },
+        )
+        self.create_list_event(email, lst["id"], "list_joined")
 
         result = self.process_events()
 

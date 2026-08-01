@@ -37,6 +37,7 @@ function eventJson(event) {
         automation_id: event.source_automation_id || "",
         automation_name: event.source_automation_name || "",
       },
+      list_id: event.list_id || "",
       correlation_id: event.correlation_id || "",
       depth: event.depth,
       processed_at: event.processed_at || "",
@@ -92,7 +93,7 @@ export default class AutomationTriggerEvents extends Component {
             <td>{moment(event.timestamp).format("l LTS")}</td>
             <td>{event.event_type || ""}</td>
             <td>{event.contact_email || ""}</td>
-            <td>{event.tag || ""}</td>
+            <td>{event.tag || event.list_id || ""}</td>
             <td>{event.status || ""}</td>
             <td>{sourceSummary(event)}</td>
             <td>{event.correlation_id || ""}</td>
@@ -132,7 +133,7 @@ export default class AutomationTriggerEvents extends Component {
                       <th>Timestamp</th>
                       <th>Event Type</th>
                       <th>Contact</th>
-                      <th>Tag</th>
+                      <th>Tag/List</th>
                       <th>Status</th>
                       <th>Source</th>
                       <th>Correlation ID</th>

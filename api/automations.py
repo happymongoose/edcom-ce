@@ -410,11 +410,11 @@ AUTOMATION_ENROLMENT_SCHEMA = {
 
 AUTOMATION_TRIGGER_EVENT_SCHEMA = {
     "type": "object",
-    "required": ["event_type", "contact_email", "tag"],
+    "required": ["event_type", "contact_email"],
     "properties": {
         "event_type": {
             "type": "string",
-            "enum": ["tag_added", "tag_removed"],
+            "enum": ["tag_added", "tag_removed", "list_joined", "list_left"],
         },
         "contact_email": {
             "type": "string",
@@ -425,6 +425,11 @@ AUTOMATION_TRIGGER_EVENT_SCHEMA = {
             "type": "string",
             "minLength": 1,
             "maxLength": 1024,
+        },
+        "list_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
         },
         "source": {
             "type": "object",
@@ -1404,6 +1409,9 @@ AUTOMATION_TRIGGER_DETAIL_LIMIT = 100
 AUTOMATION_TRIGGER_COOLDOWN_MINUTES = 15
 AUTOMATION_TRIGGER_EVENT_LIST_DEFAULT_LIMIT = 50
 AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
+TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
+LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
+SUPPORTED_TRIGGER_EVENT_TYPES = TAG_TRIGGER_EVENT_TYPES + LIST_TRIGGER_EVENT_TYPES
 
 
 def _claim_clear_patch() -> JsonObj:
@@ -3583,6 +3591,7 @@ def _bounded_trigger_result_items(items: object) -> List[JsonObj]:
         "contact_email",
         "event_type",
         "tag",
+        "list_id",
         "enrolment_id",
         "existing_enrolment_id",
     }
@@ -3647,6 +3656,7 @@ def _project_automation_trigger_event(row, source_names: Dict[str, str]) -> Json
         "event_type": event["event_type"],
         "contact_email": event["contact_email"],
         "tag": data.get("tag"),
+        "list_id": data.get("list_id"),
         "status": data.get("status"),
         "source_type": source.get("type"),
         "source_automation_id": source_automation_id,
@@ -3671,30 +3681,53 @@ def _automation_trigger_source(source: JsonObj | None) -> JsonObj:
     return ret
 
 
+def _trigger_event_selector(event: JsonObj) -> tuple[str | None, str | None]:
+    event_type = event.get("event_type")
+    if event_type in TAG_TRIGGER_EVENT_TYPES:
+        return "tag", event.get("tag")
+    if event_type in LIST_TRIGGER_EVENT_TYPES:
+        return "list_id", event.get("list_id")
+    return None, None
+
+
 def _create_automation_trigger_event(
     db: DB,
     cid: str,
     event_type: str,
     contact_email: str,
-    tag: str,
+    tag: str | None = None,
+    list_id: str | None = None,
     source: JsonObj | None = None,
     correlation_id: str | None = None,
     depth: int = 0,
     created_by: str | None = None,
     manual_debug: bool = False,
 ) -> JsonObj:
-    if event_type not in ("tag_added", "tag_removed"):
+    if event_type not in SUPPORTED_TRIGGER_EVENT_TYPES:
         raise falcon.HTTPBadRequest(
             title="Unsupported trigger event",
-            description="Only tag_added and tag_removed trigger events are supported.",
+            description="Only tag_added, tag_removed, list_joined and list_left trigger events are supported.",
         )
 
-    tag = fix_tag(tag)
-    if not tag:
-        raise falcon.HTTPBadRequest(
-            title="Trigger tag is required",
-            description="Tag trigger events require a tag.",
-        )
+    if event_type in TAG_TRIGGER_EVENT_TYPES:
+        tag = fix_tag(tag or "")
+        if not tag:
+            raise falcon.HTTPBadRequest(
+                title="Trigger tag is required",
+                description="Tag trigger events require a tag.",
+            )
+    else:
+        list_id = (list_id or "").strip()
+        if not list_id:
+            raise falcon.HTTPBadRequest(
+                title="Trigger list is required",
+                description="List trigger events require a contact list.",
+            )
+        if db.lists.get(list_id) is None:
+            raise falcon.HTTPBadRequest(
+                title="Trigger list not found",
+                description="List trigger events require a contact list from this account.",
+            )
 
     if not contact_email or len(contact_email) > 320:
         raise falcon.HTTPBadRequest(
@@ -3733,7 +3766,6 @@ def _create_automation_trigger_event(
     event_id = shortuuid.uuid()
     data = {
         "status": "pending",
-        "tag": tag,
         "source": source_data,
         "correlation_id": correlation_id or shortuuid.uuid(),
         "depth": depth,
@@ -3743,6 +3775,10 @@ def _create_automation_trigger_event(
         "processed_at": None,
         "results": [],
     }
+    if event_type in TAG_TRIGGER_EVENT_TYPES:
+        data["tag"] = tag
+    else:
+        data["list_id"] = list_id
     db.execute(
         """
         insert into automation_trigger_events
@@ -3821,7 +3857,8 @@ def _claim_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> Li
 
 
 def _matching_trigger_automations(db: DB, cid: str, event: JsonObj) -> List[JsonObj]:
-    if event.get("event_type") not in ("tag_added", "tag_removed"):
+    selector_field, selector_value = _trigger_event_selector(event)
+    if event.get("event_type") not in SUPPORTED_TRIGGER_EVENT_TYPES or not selector_field or not selector_value:
         return []
     rows = db.execute(
         """
@@ -3831,12 +3868,13 @@ def _matching_trigger_automations(db: DB, cid: str, event: JsonObj) -> List[Json
             and data->>'status' in ('published', 'paused')
             and data->'published' is not null
             and data->'published'->'entry'->>'type' = %s
-            and data->'published'->'entry'->>'tag' = %s
+            and data->'published'->'entry'->>%s = %s
         order by data->>'name', id
         """,
         cid,
         event.get("event_type"),
-        event.get("tag"),
+        selector_field,
+        selector_value,
     ).fetchall()
     return [automation for automation in (json_obj(row) for row in rows) if automation is not None]
 
@@ -3850,6 +3888,9 @@ def _trigger_cooldown_active(
     cooldown_minutes = _automation_trigger_cooldown_minutes()
     if cooldown_minutes <= 0:
         return False
+    selector_field, selector_value = _trigger_event_selector(event)
+    if not selector_field or not selector_value:
+        return False
     return bool(
         db.single(
             """
@@ -3860,7 +3901,7 @@ def _trigger_cooldown_active(
                 and e.id <> %s
                 and e.contact_id = %s
                 and e.event_type = %s
-                and e.data->>'tag' = %s
+                and e.data->>%s = %s
                 and e.ts >= (now() at time zone 'utc') - (%s::text || ' minutes')::interval
                 and r->>'automation_id' = %s
                 and r->>'status' = 'enrolled'
@@ -3870,7 +3911,8 @@ def _trigger_cooldown_active(
             event.get("id"),
             event.get("contact_id"),
             event.get("event_type"),
-            event.get("tag"),
+            selector_field,
+            selector_value,
             cooldown_minutes,
             automation_id,
         )
@@ -3893,7 +3935,7 @@ def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonO
         "errors": [],
         "event_results": [],
     }
-    tag = event.get("tag")
+    selector_field, selector_value = _trigger_event_selector(event)
     depth = int(event.get("depth") or 0)
     source = event.get("source") or {}
 
@@ -3901,12 +3943,12 @@ def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonO
         if len(result["event_results"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
             result["event_results"].append(item)
 
-    if event.get("event_type") not in ("tag_added", "tag_removed") or not tag:
+    if event.get("event_type") not in SUPPORTED_TRIGGER_EVENT_TYPES or not selector_field or not selector_value:
         result["failed"] += 1
         error = {
             "event_id": event.get("id"),
             "reason": "invalid_event",
-            "description": "Trigger event is missing a supported type or tag.",
+            "description": "Trigger event is missing a supported type or selector.",
         }
         result["errors"].append(error)
         record_event_result({"status": "failed", **error})
@@ -3946,8 +3988,9 @@ def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonO
             "contact_id": event.get("contact_id"),
             "contact_email": event.get("contact_email"),
             "event_type": event.get("event_type"),
-            "tag": tag,
         }
+        if selector_field:
+            base_detail[selector_field] = selector_value
         try:
             if source.get("type") == "automation" and source.get("automation_id") == automation_id:
                 result["suppressed"] += 1
@@ -4478,7 +4521,8 @@ class AutomationTriggerEvents(object):
             cid,
             doc["event_type"],
             doc["contact_email"],
-            doc["tag"],
+            doc.get("tag"),
+            doc.get("list_id"),
             doc.get("source"),
             doc.get("correlation_id"),
             int(doc.get("depth") or 0),
