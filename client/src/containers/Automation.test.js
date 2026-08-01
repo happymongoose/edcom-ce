@@ -7,6 +7,7 @@ import {
   automationHistoryLogForEnrolment,
   automationHistoryLog,
   paginateAutomationHistoryContacts,
+  sortAutomationHistoryContacts,
   canReEnrolAutomation,
   displayAutomationEnrolments,
 } from './Automation';
@@ -350,31 +351,31 @@ describe('automation enrolment display helpers', () => {
     expect(log).toContain('link_index=2');
   });
 
-  it('groups debug history by contact email and sorts passes newest first', () => {
+  it('groups debug history by contact email and sorts contacts by latest pass first', () => {
     const contacts = automationHistoryContacts({
       enrolments: [
         {
           id: 'older-pass',
-          contact_email: 'contact@example.com',
+          contact_email: 'z-contact@example.com',
           created: '2026-07-20T10:00:00Z',
         },
         {
           id: 'newer-pass',
-          contact_email: 'contact@example.com',
+          contact_email: 'z-contact@example.com',
           created: '2026-07-20T11:00:00Z',
         },
         {
           id: 'other-pass',
-          contact_email: 'other@example.com',
-          created: '2026-07-20T09:00:00Z',
+          contact_email: 'a-other@example.com',
+          created: '2026-07-20T12:00:00Z',
         },
       ],
     });
 
     expect(contacts).toHaveLength(2);
-    expect(contacts[0].email).toBe('contact@example.com');
-    expect(_.pluck(contacts[0].enrolments, 'id')).toEqual(['newer-pass', 'older-pass']);
-    expect(contacts[1].email).toBe('other@example.com');
+    expect(contacts[0].email).toBe('a-other@example.com');
+    expect(contacts[1].email).toBe('z-contact@example.com');
+    expect(_.pluck(contacts[1].enrolments, 'id')).toEqual(['newer-pass', 'older-pass']);
   });
 
   it('filters debug history contacts by email address', () => {
@@ -406,6 +407,35 @@ describe('automation enrolment display helpers', () => {
 
     const clamped = paginateAutomationHistoryContacts(contacts, 99, 50);
     expect(clamped.page).toBe(3);
+  });
+
+  it('sorts debug history contacts by recent pass and email in both directions', () => {
+    const contacts = [
+      {email: 'sarah@example.com', latest_created: '2026-07-20T10:00:00Z'},
+      {email: 'admin@example.com', latest_created: '2026-07-20T12:00:00Z'},
+      {email: 'zoe@example.com', latest_created: '2026-07-20T11:00:00Z'},
+    ];
+
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'recent_desc'), 'email')).toEqual([
+      'admin@example.com',
+      'zoe@example.com',
+      'sarah@example.com',
+    ]);
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'recent_asc'), 'email')).toEqual([
+      'sarah@example.com',
+      'zoe@example.com',
+      'admin@example.com',
+    ]);
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'email_asc'), 'email')).toEqual([
+      'admin@example.com',
+      'sarah@example.com',
+      'zoe@example.com',
+    ]);
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'email_desc'), 'email')).toEqual([
+      'zoe@example.com',
+      'sarah@example.com',
+      'admin@example.com',
+    ]);
   });
 
   it('formats copy-friendly history text for one pass only', () => {

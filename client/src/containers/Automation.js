@@ -244,18 +244,21 @@ export function automationHistoryLogForEnrolment(history, enrolmentId) {
 }
 
 export function automationHistoryContacts(history) {
-  return _.chain((history && history.enrolments) || [])
+  return sortAutomationHistoryContacts(_.chain((history && history.enrolments) || [])
     .groupBy(enrolment => enrolment.contact_email || 'unknown contact')
-    .map((enrolments, email) => ({
-      id: email,
-      email: email,
-      enrolments: _.chain(enrolments)
+    .map((enrolments, email) => {
+      const sortedEnrolments = _.chain(enrolments)
         .sortBy(enrolment => moment(enrolment.created || 0).valueOf())
         .reverse()
-        .value(),
-    }))
-    .sortBy(contact => contact.email.toLowerCase())
-    .value();
+        .value();
+      return {
+        id: email,
+        email: email,
+        latest_created: sortedEnrolments.length ? sortedEnrolments[0].created : null,
+        enrolments: sortedEnrolments,
+      };
+    })
+    .value(), 'recent_desc');
 }
 
 export function filterAutomationHistoryContacts(contacts, search) {
@@ -264,6 +267,24 @@ export function filterAutomationHistoryContacts(contacts, search) {
     return contacts || [];
   }
   return _.filter(contacts || [], contact => (contact.email || '').toLowerCase().indexOf(term) !== -1);
+}
+
+export function sortAutomationHistoryContacts(contacts, sort) {
+  const mode = sort || 'recent_desc';
+  const normalizedContacts = contacts || [];
+  const byEmail = contact => (contact.email || '').toLowerCase();
+  const latest = contact => moment(contact.latest_created || ((contact.enrolments || [])[0] || {}).created || 0).valueOf();
+
+  if (mode === 'email_asc') {
+    return _.sortBy(normalizedContacts, byEmail);
+  }
+  if (mode === 'email_desc') {
+    return _.sortBy(normalizedContacts, byEmail).reverse();
+  }
+  if (mode === 'recent_asc') {
+    return _.sortBy(normalizedContacts, latest);
+  }
+  return _.sortBy(normalizedContacts, latest).reverse();
 }
 
 export function paginateAutomationHistoryContacts(contacts, page, pageSize) {
@@ -346,6 +367,7 @@ class Automation extends Component {
       duplicatingEmailId: null,
       historyContactSearch: '',
       historyContactPage: 1,
+      historyContactSort: 'recent_desc',
     };
   }
 
@@ -370,6 +392,13 @@ class Automation extends Component {
 
   historyContactPageChange = page => {
     this.setState({historyContactPage: page});
+  }
+
+  historyContactSortChange = event => {
+    this.setState({
+      historyContactSort: event.target.value,
+      historyContactPage: 1,
+    });
   }
 
   nodeChange = (index, event) => {
@@ -1367,7 +1396,8 @@ class Automation extends Component {
     const history = this.props.historyData || {};
     const contacts = automationHistoryContacts(history);
     const filteredContacts = filterAutomationHistoryContacts(contacts, this.state.historyContactSearch);
-    const contactPage = paginateAutomationHistoryContacts(filteredContacts, this.state.historyContactPage, 50);
+    const sortedContacts = sortAutomationHistoryContacts(filteredContacts, this.state.historyContactSort);
+    const contactPage = paginateAutomationHistoryContacts(sortedContacts, this.state.historyContactPage, 50);
     const log = automationHistoryLog(history, {newestFirst: true});
 
     return (
@@ -1380,7 +1410,7 @@ class Automation extends Component {
           </Panel.Heading>
           <Panel.Collapse>
             <Panel.Body>
-              <div className="flex-items space-between" style={{marginBottom: '12px'}}>
+              <div className="flex-items space-between" style={{marginBottom: '12px', gap: '12px'}}>
                 <div style={{width: '360px', maxWidth: '100%'}}>
                   <FormControl
                     type="text"
@@ -1388,6 +1418,18 @@ class Automation extends Component {
                     value={this.state.historyContactSearch}
                     onChange={this.historyContactSearchChange}
                   />
+                </div>
+                <div style={{width: '220px', maxWidth: '100%'}}>
+                  <FormControl
+                    componentClass="select"
+                    value={this.state.historyContactSort}
+                    onChange={this.historyContactSortChange}
+                  >
+                    <option value="recent_desc">Most recent first</option>
+                    <option value="recent_asc">Oldest first</option>
+                    <option value="email_asc">Email A-Z</option>
+                    <option value="email_desc">Email Z-A</option>
+                  </FormControl>
                 </div>
                 <div className="text-right" style={{paddingTop: '8px'}}>
                   <span>
