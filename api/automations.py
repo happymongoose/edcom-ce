@@ -1444,6 +1444,20 @@ AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
 TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
 LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
 SUPPORTED_TRIGGER_EVENT_TYPES = TAG_TRIGGER_EVENT_TYPES + LIST_TRIGGER_EVENT_TYPES
+AUTOMATION_PROCESSING_STATUSES = (
+    "ready",
+    "waiting",
+    "held",
+    "paused_ready",
+    "paused_waiting",
+    "running",
+    "stale_running",
+    "failed",
+    "completed",
+    "exited",
+    "cancelled",
+    "total",
+)
 
 
 def _claim_clear_patch() -> JsonObj:
@@ -3624,6 +3638,140 @@ def _automation_scheduler_process_limit() -> int:
         return AUTOMATION_PROCESS_DEFAULT_LIMIT
 
 
+def _empty_processing_counts() -> JsonObj:
+    return {status: 0 for status in AUTOMATION_PROCESSING_STATUSES}
+
+
+def _automation_processing_feature_flags() -> JsonObj:
+    return {
+        "automation_processing_enabled": _automation_processing_enabled(),
+        "automation_triggers_enabled": _automation_triggers_enabled(),
+        "automation_trigger_emission_enabled": contacts.automation_trigger_emission_enabled(),
+        "automation_trigger_manual_events_enabled_debug": _automation_trigger_manual_events_enabled(),
+    }
+
+
+def _automation_processing_status(db: DB, cid: str) -> JsonObj:
+    stale_before = datetime.utcnow() - CLAIM_STALE_AFTER
+    summary = _empty_processing_counts()
+    by_automation: Dict[str, JsonObj] = {}
+
+    rows = db.execute(
+        """
+        select
+            a.id,
+            a.data->>'name',
+            a.data->>'status',
+            a.data->>'published_revision',
+            e.data->>'status',
+            count(*)::int,
+            count(*) filter (
+                where e.data->>'status' = 'running'
+                    and nullif(e.data->>'claimed_at', '')::timestamptz < %s
+            )::int
+        from automation_enrolments e
+        join automations a on a.cid = e.cid and a.id = e.automation_id
+        where e.cid = %s
+        group by
+            a.id,
+            a.data->>'name',
+            a.data->>'status',
+            a.data->>'published_revision',
+            e.data->>'status'
+        order by a.data->>'name', a.id
+        """,
+        stale_before,
+        cid,
+    ).fetchall()
+
+    for automation_id, name, automation_status, published_revision, status, count, stale_count in rows:
+        status = status or "unknown"
+        if automation_id not in by_automation:
+            by_automation[automation_id] = {
+                "automation_id": automation_id,
+                "automation_name": name or "",
+                "automation_status": automation_status or "",
+                "published_revision": int(published_revision) if str(published_revision or "").isdigit() else published_revision,
+                "counts": _empty_processing_counts(),
+            }
+
+        if status in summary:
+            summary[status] += int(count or 0)
+            by_automation[automation_id]["counts"][status] += int(count or 0)
+        summary["total"] += int(count or 0)
+        by_automation[automation_id]["counts"]["total"] += int(count or 0)
+        if stale_count:
+            summary["stale_running"] += int(stale_count or 0)
+            by_automation[automation_id]["counts"]["stale_running"] += int(stale_count or 0)
+
+    failures = [
+        {
+            "enrolment_id": enrolment_id,
+            "automation_id": automation_id,
+            "automation_name": automation_name or "",
+            "contact_email": contact_email,
+            "current_node_id": data.get("current_node_id"),
+            "failed_at": (data.get("last_error") or {}).get("at") or data.get("modified") or data.get("created"),
+            "error": (data.get("last_error") or {}).get("description") or (data.get("last_error") or {}).get("title") or "",
+        }
+        for enrolment_id, automation_id, automation_name, contact_email, data in db.execute(
+            """
+            select e.id, e.automation_id, a.data->>'name', e.contact_email, e.data
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            where e.cid = %s and e.data->>'status' = 'failed'
+            order by
+                coalesce(
+                    nullif(e.data->'last_error'->>'at', '')::timestamptz,
+                    nullif(e.data->>'modified', '')::timestamptz,
+                    nullif(e.data->>'created', '')::timestamptz
+                ) desc nulls last,
+                e.id desc
+            limit 25
+            """,
+            cid,
+        ).fetchall()
+    ]
+
+    stale_running = [
+        {
+            "enrolment_id": enrolment_id,
+            "automation_id": automation_id,
+            "automation_name": automation_name or "",
+            "contact_email": contact_email,
+            "claimed_at": data.get("claimed_at"),
+            "claimed_node_id": data.get("claimed_node_id"),
+            "claimed_published_revision": data.get("claimed_published_revision"),
+            "running_status": data.get("running_status"),
+        }
+        for enrolment_id, automation_id, automation_name, contact_email, data in db.execute(
+            """
+            select e.id, e.automation_id, a.data->>'name', e.contact_email, e.data
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            where e.cid = %s
+                and e.data->>'status' = 'running'
+                and nullif(e.data->>'claimed_at', '')::timestamptz < %s
+            order by nullif(e.data->>'claimed_at', '')::timestamptz, e.id
+            limit 25
+            """,
+            cid,
+            stale_before,
+        ).fetchall()
+    ]
+
+    return {
+        "summary": summary,
+        "automations": sorted(
+            by_automation.values(),
+            key=lambda item: ((item.get("automation_name") or "").lower(), item.get("automation_id") or ""),
+        ),
+        "recent_failures": failures,
+        "stale_running": stale_running,
+        "flags": _automation_processing_feature_flags(),
+    }
+
+
 def _trigger_event_obj(row) -> JsonObj | None:
     if row is None:
         return None
@@ -4528,6 +4676,16 @@ class AutomationEnrolmentProcessor(object):
             limit,
             automation_id,
         )
+
+
+class AutomationProcessingStatus(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        req.context["result"] = _automation_processing_status(db, cid)
 
 
 class AutomationTriggerEvents(object):

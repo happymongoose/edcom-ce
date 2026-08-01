@@ -399,6 +399,12 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         )
 
+    def processing_status(self):
+        return self.simulate_get(
+            "/api/automation-processing-status",
+            headers=self.headers(),
+        )
+
     def process_enrolments_task(self, automation_id=None, limit=25):
         return automations.process_automation_enrolments_task(
             self.user_cookie["cid"],
@@ -2333,6 +2339,212 @@ class TestAutomationExecution(test_base.TestBase):
             "other-account-cid",
         )
         self.cleanup(automation["id"])
+
+    def test_processing_status_is_current_account_scoped(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(tag="status-scope")
+        self.enrol(automation["id"], email)
+        other_cid = "automation-status-other-%s" % self.unique()
+        other_automation_id = "automation-status-other-automation-%s" % self.unique()
+        other_enrolment_id = "automation-status-other-enrolment-%s" % self.unique()
+        self.created_scheduler_cids.append(other_cid)
+        self.db.execute(
+            "insert into companies (id, cid, data) values (%s, %s, %s)",
+            other_cid,
+            self.backend_cid(),
+            {"name": "Status other account", "admin": False},
+        )
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            other_automation_id,
+            other_cid,
+            {
+                "name": "Status other automation",
+                "status": "published",
+                "published_revision": 1,
+                "published": {"nodes": []},
+            },
+        )
+        self.db.execute(
+            """
+            insert into automation_enrolments
+                (id, cid, automation_id, contact_id, contact_email, data)
+            values (%s, %s, %s, %s, %s, %s)
+            """,
+            other_enrolment_id,
+            other_cid,
+            other_automation_id,
+            1,
+            "other-status@example.com",
+            {"status": "ready", "created": datetime.utcnow().isoformat() + "Z"},
+        )
+
+        result = self.processing_status()
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertGreaterEqual(result.json["summary"]["ready"], 1)
+        automation_ids = [item["automation_id"] for item in result.json["automations"]]
+        self.assertIn(automation["id"], automation_ids)
+        self.assertNotIn(other_automation_id, automation_ids)
+        breakdown = [
+            item for item in result.json["automations"]
+            if item["automation_id"] == automation["id"]
+        ][0]
+        self.assertEqual(breakdown["counts"]["ready"], 1)
+
+        self.cleanup(automation["id"])
+
+    def test_processing_status_returns_summary_and_per_automation_counts(self):
+        automation = self.create_automation(tag="status-counts")
+        statuses = [
+            "ready",
+            "waiting",
+            "held",
+            "paused_ready",
+            "paused_waiting",
+            "running",
+            "failed",
+            "completed",
+            "exited",
+            "cancelled",
+        ]
+        for status in statuses:
+            email, _ = self.create_contact()
+            enrolment = self.enrol(automation["id"], email)
+            self.patch_enrolment_data(enrolment["id"], {"status": status})
+
+        result = self.processing_status()
+
+        self.assertEqual(result.status_code, 200, result.text)
+        for status in statuses:
+            self.assertGreaterEqual(result.json["summary"][status], 1)
+        self.assertGreaterEqual(result.json["summary"]["total"], len(statuses))
+        breakdown = [
+            item for item in result.json["automations"]
+            if item["automation_id"] == automation["id"]
+        ][0]
+        for status in statuses:
+            self.assertEqual(breakdown["counts"][status], 1)
+        self.assertEqual(breakdown["counts"]["total"], len(statuses))
+        self.assertEqual(breakdown["counts"]["stale_running"], 0)
+
+        self.cleanup(automation["id"])
+
+    def test_processing_status_detects_stale_running_claims(self):
+        email, _ = self.create_contact()
+        fresh_email, _ = self.create_contact()
+        automation = self.create_automation(tag="status-stale")
+        stale_enrolment = self.enrol(automation["id"], email)
+        fresh_enrolment = self.enrol(automation["id"], fresh_email)
+        stale = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        fresh = datetime.utcnow().isoformat() + "Z"
+        self.patch_enrolment_data(
+            stale_enrolment["id"],
+            {
+                "status": "running",
+                "running_status": "ready",
+                "claim_token": "stale-status-claim",
+                "claimed_at": stale,
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+        )
+        self.patch_enrolment_data(
+            fresh_enrolment["id"],
+            {
+                "status": "running",
+                "running_status": "ready",
+                "claim_token": "fresh-status-claim",
+                "claimed_at": fresh,
+                "claimed_node_id": "node_add_tag_1",
+                "claimed_published_revision": automation["published_revision"],
+            },
+        )
+
+        result = self.processing_status()
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["summary"]["running"], 2)
+        self.assertEqual(result.json["summary"]["stale_running"], 1)
+        self.assertEqual(len(result.json["stale_running"]), 1)
+        self.assertEqual(result.json["stale_running"][0]["enrolment_id"], stale_enrolment["id"])
+        self.assertEqual(result.json["stale_running"][0]["claimed_node_id"], "node_add_tag_1")
+
+        self.cleanup(automation["id"])
+
+    def test_processing_status_recent_failures_are_capped_and_scoped(self):
+        automation = self.create_automation(tag="status-failed")
+        for i in range(26):
+            email, _ = self.create_contact()
+            enrolment = self.enrol(automation["id"], email)
+            self.patch_enrolment_data(
+                enrolment["id"],
+                {
+                    "status": "failed",
+                    "last_error": {
+                        "title": "Failure %s" % i,
+                        "description": "Status failure %s" % i,
+                        "at": (datetime.utcnow() + timedelta(seconds=i)).isoformat() + "Z",
+                    },
+                },
+            )
+        other_cid = "automation-status-failure-other-%s" % self.unique()
+        other_automation_id = "automation-status-failure-other-automation-%s" % self.unique()
+        self.created_scheduler_cids.append(other_cid)
+        self.db.execute(
+            "insert into companies (id, cid, data) values (%s, %s, %s)",
+            other_cid,
+            self.backend_cid(),
+            {"name": "Status failure other account", "admin": False},
+        )
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            other_automation_id,
+            other_cid,
+            {"name": "Status failure other automation", "status": "published"},
+        )
+        self.db.execute(
+            """
+            insert into automation_enrolments
+                (id, cid, automation_id, contact_id, contact_email, data)
+            values (%s, %s, %s, %s, %s, %s)
+            """,
+            "automation-status-failure-other-enrolment-%s" % self.unique(),
+            other_cid,
+            other_automation_id,
+            1,
+            "other-failure@example.com",
+            {"status": "failed", "last_error": {"description": "hidden"}},
+        )
+
+        result = self.processing_status()
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(len(result.json["recent_failures"]), 25)
+        self.assertTrue(all(item["automation_id"] == automation["id"] for item in result.json["recent_failures"]))
+        self.assertEqual(result.json["recent_failures"][0]["error"], "Status failure 25")
+
+        self.cleanup(automation["id"])
+
+    def test_processing_status_flags_are_booleans_only(self):
+        os.environ["automation_processing_enabled"] = "true"
+        os.environ["automation_triggers_enabled"] = "yes"
+        os.environ["automation_trigger_emission_enabled"] = "on"
+        os.environ["automation_trigger_manual_events_enabled"] = "1"
+
+        result = self.processing_status()
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(
+            result.json["flags"],
+            {
+                "automation_processing_enabled": True,
+                "automation_triggers_enabled": True,
+                "automation_trigger_emission_enabled": True,
+                "automation_trigger_manual_events_enabled_debug": True,
+            },
+        )
+        self.assertTrue(all(isinstance(value, bool) for value in result.json["flags"].values()))
 
     def test_processor_send_email_uses_debug_path_and_does_not_auto_loop(self):
         route_id = self.assign_single_debug_route()

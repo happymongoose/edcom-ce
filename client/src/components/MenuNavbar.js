@@ -379,6 +379,10 @@ export default class MenuNavbar extends Component {
                           <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
                           Automation Trigger Events
                         </RouteNavItem>
+                        <RouteNavItem href="/automation-processing-status">
+                          <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                          Automation Processing Status
+                        </RouteNavItem>
                         <RouteNavItem href="/transactional">
                           <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
                           Transactional
