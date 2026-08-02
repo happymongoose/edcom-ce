@@ -1532,12 +1532,18 @@ AUTOMATION_PROCESS_MAX_LIMIT = 100
 AUTOMATION_PROCESS_ERROR_LIMIT = 100
 AUTOMATION_PROCESS_ACCOUNT_LIMIT = 50
 CHECK_AUTOMATION_ENROLMENTS_LOCK = 58413921
+AUTOMATION_RETENTION_CLEANUP_LOCK = 98337413
+AUTOMATION_RETENTION_DEBUG_LOG_DAYS = 14
+AUTOMATION_RETENTION_TRIGGER_EVENT_DAYS = 30
+AUTOMATION_RETENTION_ACCOUNT_LIMIT = 25
+AUTOMATION_RETENTION_DELETE_LIMIT = 1000
 AUTOMATION_TRIGGER_DEFAULT_LIMIT = 25
 AUTOMATION_TRIGGER_MAX_LIMIT = 100
 AUTOMATION_TRIGGER_DETAIL_LIMIT = 100
 AUTOMATION_TRIGGER_COOLDOWN_MINUTES = 15
 AUTOMATION_TRIGGER_EVENT_LIST_DEFAULT_LIMIT = 50
 AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
+AUTOMATION_TRIGGER_FINISHED_STATUSES = ("processed", "suppressed", "failed", "enrolled")
 TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
 LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
 SUPPORTED_TRIGGER_EVENT_TYPES = TAG_TRIGGER_EVENT_TYPES + LIST_TRIGGER_EVENT_TYPES
@@ -4090,6 +4096,26 @@ def _automation_processing_enabled() -> bool:
     )
 
 
+def _env_enabled(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_positive_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        log.warning("Ignoring invalid %s=%r; using default %s.", name, value, default)
+        return default
+    if parsed < minimum:
+        return minimum
+    if maximum is not None:
+        return min(parsed, maximum)
+    return parsed
+
+
 def _customer_automation_processing_enabled(db: DB, cid: str) -> bool:
     oldcid = db.get_cid()
     db.set_cid(None)
@@ -5051,6 +5077,221 @@ def _automation_processing_account_ids(
         if len(cids) >= account_limit:
             break
     return cids
+
+
+def _automation_retention_cleanup_enabled() -> bool:
+    return _env_enabled("automation_retention_cleanup_enabled")
+
+
+def _automation_retention_debug_cutoff() -> datetime:
+    days = _env_positive_int(
+        "automation_retention_debug_email_log_days",
+        AUTOMATION_RETENTION_DEBUG_LOG_DAYS,
+    )
+    return datetime.utcnow() - timedelta(days=days)
+
+
+def _automation_retention_trigger_cutoff() -> datetime:
+    days = _env_positive_int(
+        "automation_retention_trigger_event_days",
+        AUTOMATION_RETENTION_TRIGGER_EVENT_DAYS,
+    )
+    return datetime.utcnow() - timedelta(days=days)
+
+
+def _automation_retention_delete_limit() -> int:
+    return _env_positive_int(
+        "automation_retention_delete_limit",
+        AUTOMATION_RETENTION_DELETE_LIMIT,
+    )
+
+
+def _automation_retention_account_limit() -> int:
+    return _env_positive_int(
+        "automation_retention_account_limit",
+        AUTOMATION_RETENTION_ACCOUNT_LIMIT,
+    )
+
+
+def _automation_retention_account_ids(
+    db: DB,
+    debug_cutoff: datetime,
+    trigger_cutoff: datetime,
+    account_limit: int,
+) -> List[str]:
+    return [
+        row[0]
+        for row in db.execute(
+            """
+            select cid
+            from (
+                select cid, min(ts) as oldest_ts
+                from debug_email_logs
+                where ts < %s
+                group by cid
+                union all
+                select cid, min(ts) as oldest_ts
+                from automation_trigger_events
+                where ts < %s
+                    and data->>'status' = any(%s)
+                group by cid
+            ) candidates
+            group by cid
+            order by min(oldest_ts), cid
+            limit %s
+            """,
+            debug_cutoff,
+            trigger_cutoff,
+            list(AUTOMATION_TRIGGER_FINISHED_STATUSES),
+            account_limit,
+        )
+    ]
+
+
+def _cleanup_debug_email_logs_for_account(
+    db: DB,
+    cid: str,
+    cutoff: datetime,
+    limit: int,
+) -> int:
+    return int(
+        db.single(
+            """
+            with doomed as (
+                select id
+                from debug_email_logs
+                where cid = %s and ts < %s
+                order by ts, id
+                limit %s
+            ),
+            deleted as (
+                delete from debug_email_logs l
+                using doomed
+                where l.id = doomed.id and l.cid = %s
+                returning l.id
+            )
+            select count(*) from deleted
+            """,
+            cid,
+            cutoff,
+            limit,
+            cid,
+        )
+        or 0
+    )
+
+
+def _cleanup_automation_trigger_events_for_account(
+    db: DB,
+    cid: str,
+    cutoff: datetime,
+    limit: int,
+) -> int:
+    return int(
+        db.single(
+            """
+            with doomed as (
+                select id
+                from automation_trigger_events
+                where cid = %s
+                    and ts < %s
+                    and data->>'status' = any(%s)
+                order by ts, id
+                limit %s
+            ),
+            deleted as (
+                delete from automation_trigger_events e
+                using doomed
+                where e.id = doomed.id and e.cid = %s
+                returning e.id
+            )
+            select count(*) from deleted
+            """,
+            cid,
+            cutoff,
+            list(AUTOMATION_TRIGGER_FINISHED_STATUSES),
+            limit,
+            cid,
+        )
+        or 0
+    )
+
+
+def _cleanup_automation_retention_for_account(
+    db: DB,
+    cid: str,
+    debug_cutoff: datetime,
+    trigger_cutoff: datetime,
+    delete_limit: int,
+) -> JsonObj:
+    debug_deleted = _cleanup_debug_email_logs_for_account(db, cid, debug_cutoff, delete_limit)
+    trigger_deleted = _cleanup_automation_trigger_events_for_account(db, cid, trigger_cutoff, delete_limit)
+    return {
+        "cid": cid,
+        "debug_email_logs_deleted": debug_deleted,
+        "automation_trigger_events_deleted": trigger_deleted,
+        "deleted": debug_deleted + trigger_deleted,
+    }
+
+
+def check_automation_retention_cleanup() -> JsonObj:
+    if not _automation_retention_cleanup_enabled():
+        log.info("Automation retention cleanup is disabled; set automation_retention_cleanup_enabled=true to enable it.")
+        return {
+            "enabled": False,
+            "locked": False,
+            "accounts": 0,
+            "debug_email_logs_deleted": 0,
+            "automation_trigger_events_deleted": 0,
+            "deleted": 0,
+            "account_results": [],
+        }
+
+    debug_cutoff = _automation_retention_debug_cutoff()
+    trigger_cutoff = _automation_retention_trigger_cutoff()
+    account_limit = _automation_retention_account_limit()
+    delete_limit = _automation_retention_delete_limit()
+    account_results: List[JsonObj] = []
+
+    with open_db() as db:
+        with db.transaction():
+            if not db.single(f"select pg_try_advisory_xact_lock({AUTOMATION_RETENTION_CLEANUP_LOCK})"):
+                log.info("Automation retention cleanup is already running.")
+                return {
+                    "enabled": True,
+                    "locked": True,
+                    "accounts": 0,
+                    "debug_email_logs_deleted": 0,
+                    "automation_trigger_events_deleted": 0,
+                    "deleted": 0,
+                    "account_results": [],
+                }
+
+            cids = _automation_retention_account_ids(db, debug_cutoff, trigger_cutoff, account_limit)
+            for cid in cids:
+                account_results.append(
+                    _cleanup_automation_retention_for_account(
+                        db,
+                        cid,
+                        debug_cutoff,
+                        trigger_cutoff,
+                        delete_limit,
+                    )
+                )
+
+    debug_deleted = sum(int(row["debug_email_logs_deleted"]) for row in account_results)
+    trigger_deleted = sum(int(row["automation_trigger_events_deleted"]) for row in account_results)
+    result = {
+        "enabled": True,
+        "locked": False,
+        "accounts": len(account_results),
+        "debug_email_logs_deleted": debug_deleted,
+        "automation_trigger_events_deleted": trigger_deleted,
+        "deleted": debug_deleted + trigger_deleted,
+        "account_results": account_results,
+    }
+    log.info("Automation retention cleanup completed: %s", result)
+    return result
 
 
 def _process_eligible_automation_enrolments(
