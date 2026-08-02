@@ -29,6 +29,11 @@ function initialNodeId(props) {
   return params.get("node_id") || "";
 }
 
+function initialNodePosition(props) {
+  const params = new URLSearchParams(props.location.search);
+  return params.get("node_position") || "";
+}
+
 export default class AutomationEnrolments extends Component {
   constructor(props) {
     super(props);
@@ -42,6 +47,7 @@ export default class AutomationEnrolments extends Component {
       totalPages: 1,
       view: initialView(props),
       nodeId: initialNodeId(props),
+      nodePosition: initialNodePosition(props),
       search: "",
       appliedSearch: "",
       isLoading: false,
@@ -71,6 +77,7 @@ export default class AutomationEnrolments extends Component {
             page_size: this.state.pageSize,
             search: this.state.appliedSearch,
             node_id: this.state.nodeId,
+            node_position: this.state.nodePosition,
           },
         }),
       ]);
@@ -202,8 +209,14 @@ export default class AutomationEnrolments extends Component {
   render() {
     const title = this.state.view === "active" ? "Active Automation Contacts" : "Enrolled Automation Contacts";
     const summary = this.state.summary || {};
-    const node = this.state.nodeId && this.state.automation && this.state.automation.published ?
-      _.find((this.state.automation.published.nodes || []), item => item.id === this.state.nodeId)
+    const node = this.state.automation && this.state.automation.published ?
+      this.state.nodeId ?
+        _.find((this.state.automation.published.nodes || []), item => item.id === this.state.nodeId)
+      :
+        this.state.nodePosition ?
+          (this.state.automation.published.nodes || [])[parseInt(this.state.nodePosition, 10) - 1]
+        :
+          null
     :
       null;
 
@@ -217,9 +230,9 @@ export default class AutomationEnrolments extends Component {
                 <h4>{this.state.automation ? this.state.automation.name : ""}</h4>
                 <p>Active {summary.active || 0} / Enrolled {summary.enrolled || 0}</p>
                 {
-                  this.state.nodeId ?
+                  this.state.nodeId || this.state.nodePosition ?
                     <p>
-                      Step filter: {node ? (node.label || node.type || node.id) : this.state.nodeId}
+                      Step filter: {node ? (node.label || node.type || node.id) : (this.state.nodeId || ('Step ' + this.state.nodePosition))}
                     </p>
                   :
                     null

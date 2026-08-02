@@ -122,6 +122,11 @@ export function automationNodeContactIds(node, draftNodes, publishedNodes) {
 
 export function automationNodeContactCount(node, draftNodes, publishedNodes, summary) {
   const counts = (summary && summary.nodes) || {};
+  const positionCounts = (summary && summary.node_positions) || {};
+  const index = _.findIndex(draftNodes || [], item => item.id === node.id);
+  if (index >= 0 && positionCounts[String(index + 1)] !== undefined) {
+    return positionCounts[String(index + 1)] || 0;
+  }
   return _.reduce(
     automationNodeContactIds(node, draftNodes, publishedNodes),
     (total, nodeId) => total + (counts[nodeId] || 0),
@@ -132,6 +137,21 @@ export function automationNodeContactCount(node, draftNodes, publishedNodes, sum
 export function automationNodeContactFilterId(node, draftNodes, publishedNodes) {
   const ids = automationNodeContactIds(node, draftNodes, publishedNodes);
   return ids.length > 1 ? ids[1] : ids[0];
+}
+
+export function automationNodeContactFilterParam(node, draftNodes, publishedNodes, summary) {
+  const index = _.findIndex(draftNodes || [], item => item.id === node.id);
+  const positionCounts = (summary && summary.node_positions) || {};
+  if (index >= 0 && positionCounts[String(index + 1)] !== undefined) {
+    return {
+      key: 'node_position',
+      value: String(index + 1),
+    };
+  }
+  return {
+    key: 'node_id',
+    value: automationNodeContactFilterId(node, draftNodes, publishedNodes),
+  };
 }
 
 export function displayAutomationEnrolments(enrolments) {
@@ -1001,9 +1021,9 @@ class Automation extends Component {
     const nodes = (data.draft && data.draft.nodes) || [];
     const publishedNodes = (data.published && data.published.nodes) || [];
     const count = automationNodeContactCount(node, nodes, publishedNodes, summary);
-    const filterNodeId = automationNodeContactFilterId(node, nodes, publishedNodes);
+    const filter = automationNodeContactFilterParam(node, nodes, publishedNodes, summary);
     const href = this.impersonatedHref(
-      '/automations/' + this.props.id + '/enrolments?view=active&node_id=' + encodeURIComponent(filterNodeId)
+      '/automations/' + this.props.id + '/enrolments?view=active&' + filter.key + '=' + encodeURIComponent(filter.value)
     );
 
     return (

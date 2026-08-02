@@ -10,6 +10,7 @@ import {
   automationImpersonatedHref,
   automationNodeContactCount,
   automationNodeContactFilterId,
+  automationNodeContactFilterParam,
   paginateAutomationHistoryContacts,
   sortAutomationHistoryContacts,
   canReEnrolAutomation,
@@ -77,6 +78,31 @@ describe('automation enrolment display helpers', () => {
     expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(1);
     expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(5);
     expect(automationNodeContactFilterId(draftNodes[0], draftNodes, publishedNodes)).toBe('published-send');
+    expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id',
+      value: 'published-send',
+    });
+  });
+
+  it('prefers step-position counts for older active revisions', () => {
+    const draftNodes = [
+      {id: 'draft-send', label: 'Send email'},
+      {id: 'draft-tag', label: 'Add tag'},
+    ];
+    const summary = {
+      nodes: {
+        'old-wait-node': 1,
+      },
+      node_positions: {
+        '2': 1,
+      },
+    };
+
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, [], summary)).toBe(1);
+    expect(automationNodeContactFilterParam(draftNodes[1], draftNodes, [], summary)).toEqual({
+      key: 'node_position',
+      value: '2',
+    });
   });
 
   it('collapses sessions by contact and prefers the latest ready session', () => {

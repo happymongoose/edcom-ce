@@ -2489,25 +2489,71 @@ class AutomationResume(object):
 
 class AutomationEnrolments(object):
 
-    def _summary(self, db: DB, cid: str, automation_id: str) -> JsonObj:
-        node_counts = {
-            row[0]: row[1]
-            for row in db.execute(
-                f"""
-                select e.data->>'current_node_id', count(distinct coalesce(e.contact_id::text, e.contact_email))
-                from automation_enrolments e
-                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
-                where e.cid = %s
-                  and e.automation_id = %s
-                  and e.data->>'status' = any(%s)
-                  and coalesce(e.data->>'current_node_id', '') <> ''
-                group by e.data->>'current_node_id'
-                """,
-                cid,
-                automation_id,
-                list(ACTIVE_ENROLMENT_STATUSES),
-            )
+    def _node_position_summary(self, db: DB, cid: str, automation_id: str) -> tuple[JsonObj, JsonObj, JsonObj]:
+        automation = db.automations.get(automation_id) or {}
+        published_nodes = (automation.get("published") or {}).get("nodes") or []
+        published_positions = {
+            node.get("id"): index + 1
+            for index, node in enumerate(published_nodes)
+            if node.get("id")
         }
+        active_rows = db.execute(
+            f"""
+            select e.id, e.data->>'current_node_id'
+            from automation_enrolments e
+            join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+            where e.cid = %s
+              and e.automation_id = %s
+              and e.data->>'status' = any(%s)
+              and coalesce(e.data->>'current_node_id', '') <> ''
+            """,
+            cid,
+            automation_id,
+            list(ACTIVE_ENROLMENT_STATUSES),
+        ).fetchall()
+        node_counts: JsonObj = {}
+        position_counts: JsonObj = {}
+        node_ids_by_position: JsonObj = {}
+        if not active_rows:
+            return node_counts, position_counts, node_ids_by_position
+
+        enrolment_ids = [row[0] for row in active_rows]
+        step_rows = db.execute(
+            """
+            select enrolment_id, node_id
+            from automation_step_runs
+            where cid = %s and automation_id = %s and enrolment_id = any(%s)
+            order by data->>'created', id
+            """,
+            cid,
+            automation_id,
+            enrolment_ids,
+        ).fetchall()
+        step_order_by_enrolment: dict[str, list[str]] = {}
+        for enrolment_id, node_id in step_rows:
+            if not node_id:
+                continue
+            order = step_order_by_enrolment.setdefault(enrolment_id, [])
+            if node_id not in order:
+                order.append(node_id)
+
+        for enrolment_id, current_node_id in active_rows:
+            node_counts[current_node_id] = node_counts.get(current_node_id, 0) + 1
+            position = published_positions.get(current_node_id)
+            if position is None:
+                order = step_order_by_enrolment.get(enrolment_id, [])
+                if current_node_id in order:
+                    position = order.index(current_node_id) + 1
+            if position is not None:
+                key = str(position)
+                position_counts[key] = position_counts.get(key, 0) + 1
+                ids = node_ids_by_position.setdefault(key, [])
+                if current_node_id not in ids:
+                    ids.append(current_node_id)
+        return node_counts, position_counts, node_ids_by_position
+
+    def _summary(self, db: DB, cid: str, automation_id: str) -> JsonObj:
+        node_counts, position_counts, node_ids_by_position = self._node_position_summary(db, cid, automation_id)
         active = db.single(
             f"""
             select count(distinct coalesce(e.contact_id::text, e.contact_email))
@@ -2535,6 +2581,8 @@ class AutomationEnrolments(object):
             "active": active or 0,
             "enrolled": enrolled or 0,
             "nodes": node_counts,
+            "node_positions": position_counts,
+            "node_ids_by_position": node_ids_by_position,
         }
 
     def _paged(self, req: falcon.Request, db: DB, cid: str, automation_id: str) -> JsonObj:
@@ -2561,6 +2609,14 @@ class AutomationEnrolments(object):
         if node_id:
             filters.append("e.data->>'current_node_id' = %s")
             params.append(node_id)
+        node_position = req.get_param_as_int("node_position")
+        if node_position is not None:
+            _, _, node_ids_by_position = self._node_position_summary(db, cid, automation_id)
+            node_ids = node_ids_by_position.get(str(node_position), [])
+            if not node_ids:
+                node_ids = ["__no_matching_automation_node__"]
+            filters.append("e.data->>'current_node_id' = any(%s)")
+            params.append(node_ids)
         where = " and ".join(filters)
         count = db.single(
             f"""
@@ -2611,6 +2667,7 @@ class AutomationEnrolments(object):
             "view": view,
             "search": search,
             "node_id": node_id,
+            "node_position": node_position,
         }
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:

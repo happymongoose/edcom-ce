@@ -355,6 +355,58 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(result["summary"]["nodes"]["node_add_tag_1"], 1)
         self.assertEqual(result["summary"]["nodes"]["node_exit_1"], 1)
 
+    def test_enrolment_summary_counts_older_revision_nodes_by_step_position(self):
+        email, contact_id, _ = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email).json
+        old_node_id = "old_wait_node_%s" % self.unique()
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {"current_node_id": old_node_id, "status": "waiting"},
+            self.user_cookie["cid"],
+            enrolment["id"],
+        )
+        self.db.execute(
+            """
+            insert into automation_step_runs
+                (id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            "automation-enrolment-step-%s" % self.unique(),
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            "old_first_node_%s" % self.unique(),
+            "add_tag",
+            {"created": "2026-01-01T00:00:00Z", "status": "succeeded"},
+        )
+        self.db.execute(
+            """
+            insert into automation_step_runs
+                (id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            "automation-enrolment-step-%s" % self.unique(),
+            self.user_cookie["cid"],
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            old_node_id,
+            "wait_duration",
+            {"created": "2026-01-01T00:01:00Z", "status": "waiting"},
+        )
+
+        result = self.paged_enrolments(automation["id"], summary="true")
+
+        self.assertEqual(result["summary"]["nodes"][old_node_id], 1)
+        self.assertEqual(result["summary"]["node_positions"]["2"], 1)
+        self.assertEqual(result["summary"]["node_ids_by_position"]["2"], [old_node_id])
+
     def test_enrolment_paged_view_filters_by_current_node(self):
         first_email, _, _ = self.create_contact()
         second_email, _, _ = self.create_contact()
@@ -377,6 +429,47 @@ class TestAutomationEnrolments(test_base.TestBase):
         emails = [enrolment["contact_email"] for enrolment in result["enrolments"]]
         self.assertEqual(emails, [second_email])
         self.assertEqual(result["node_id"], "node_exit_1")
+        self.assertEqual(result["total"], 1)
+
+    def test_enrolment_paged_view_filters_by_older_revision_step_position(self):
+        email, contact_id, _ = self.create_contact()
+        other_email, _, _ = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email).json
+        self.enrol(automation["id"], other_email)
+        old_node_id = "old_position_node_%s" % self.unique()
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {"current_node_id": old_node_id, "status": "waiting"},
+            self.user_cookie["cid"],
+            enrolment["id"],
+        )
+        for index, node_id in enumerate(["old_first_node_%s" % self.unique(), old_node_id]):
+            self.db.execute(
+                """
+                insert into automation_step_runs
+                    (id, cid, automation_id, enrolment_id, contact_id, node_id, node_type, data)
+                values (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                "automation-enrolment-step-%s" % self.unique(),
+                self.user_cookie["cid"],
+                automation["id"],
+                enrolment["id"],
+                contact_id,
+                node_id,
+                "wait_duration",
+                {"created": "2026-01-01T00:0%s:00Z" % index, "status": "waiting"},
+            )
+
+        result = self.paged_enrolments(automation["id"], view="active", node_position=2)
+
+        emails = [item["contact_email"] for item in result["enrolments"]]
+        self.assertEqual(emails, [email])
+        self.assertEqual(result["node_position"], 2)
         self.assertEqual(result["total"], 1)
 
     def test_enrolment_paged_view_searches_email_and_paginates(self):
