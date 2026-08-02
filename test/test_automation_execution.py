@@ -21,7 +21,16 @@ class TestAutomationExecution(test_base.TestBase):
         self.created_debug_backend_ids = []
         self.created_route_ids = []
         self.created_scheduler_cids = []
+        self.created_admin_user_ids = []
+        self.created_admin_cookie_ids = []
+        if self.admin_cookie is None:
+            self.create_admin_cookie()
         self.original_company_routes = None
+        company = self.db.companies.get(self.user_cookie["cid"])
+        self.original_company_automation_settings = {
+            "automation_processing_enabled": company.get("automation_processing_enabled"),
+            "automation_diagnostics_visible": company.get("automation_diagnostics_visible"),
+        }
         self.original_automation_env = {
             "automation_processing_enabled": os.environ.get("automation_processing_enabled"),
             "automation_processing_limit": os.environ.get("automation_processing_limit"),
@@ -30,7 +39,9 @@ class TestAutomationExecution(test_base.TestBase):
 
     def tearDown(self):
         self.restore_automation_env()
+        self.restore_company_automation_settings()
         self.cleanup_scheduler_accounts()
+        self.cleanup_admin_cookie()
         self.cleanup_debug_routes()
         self.cleanup_contacts_and_lists()
         super(TestAutomationExecution, self).tearDown()
@@ -41,6 +52,75 @@ class TestAutomationExecution(test_base.TestBase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    def restore_company_automation_settings(self):
+        self.db.execute(
+            """
+            update companies
+            set data = data - 'automation_processing_enabled' - 'automation_diagnostics_visible'
+            where id = %s
+            """,
+            self.user_cookie["cid"],
+        )
+        patch = {
+            key: value
+            for key, value in self.original_company_automation_settings.items()
+            if value is not None
+        }
+        if patch:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                patch,
+                self.user_cookie["cid"],
+            )
+
+    def set_customer_automation_processing(self, enabled):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_processing_enabled": enabled},
+            self.user_cookie["cid"],
+        )
+
+    def create_admin_cookie(self):
+        backend_cid = self.backend_cid()
+        oldcid = self.db.get_cid()
+        self.db.set_cid(backend_cid)
+        try:
+            admin_uid = self.db.users.add(
+                {
+                    "username": "automation-admin-%s@example.com" % shortuuid.uuid().lower(),
+                    "fullname": "Automation Admin",
+                    "companyname": "Automation Admin Company",
+                    "admin": True,
+                    "created": datetime.utcnow().isoformat() + "Z",
+                }
+            )
+            cookie_id = self.db.cookies.add(
+                {
+                    "lastused": datetime.utcnow().isoformat() + "Z",
+                    "uid": admin_uid,
+                    "admin": True,
+                }
+            )
+        finally:
+            self.db.set_cid(oldcid)
+        self.created_admin_user_ids.append(admin_uid)
+        self.created_admin_cookie_ids.append(cookie_id)
+        self.admin_cookie = self.db.cookies.get(cookie_id)
+
+    def cleanup_admin_cookie(self):
+        if self.created_admin_cookie_ids:
+            self.db.execute(
+                "delete from cookies where id = any(%s)",
+                self.created_admin_cookie_ids,
+            )
+            self.created_admin_cookie_ids = []
+        if self.created_admin_user_ids:
+            self.db.execute(
+                "delete from users where id = any(%s)",
+                self.created_admin_user_ids,
+            )
+            self.created_admin_user_ids = []
 
     def cleanup_scheduler_accounts(self):
         if not self.created_scheduler_cids:
@@ -147,6 +227,12 @@ class TestAutomationExecution(test_base.TestBase):
         return {
             "X-Auth-UID": self.user_cookie["uid"],
             "X-Auth-Cookie": self.user_cookie["id"],
+        }
+
+    def admin_headers(self):
+        return {
+            "X-Auth-UID": self.admin_cookie["uid"],
+            "X-Auth-Cookie": self.admin_cookie["id"],
         }
 
     def create_contact(self):
@@ -440,6 +526,7 @@ class TestAutomationExecution(test_base.TestBase):
         )
 
     def process_enrolments(self, **doc):
+        self.set_customer_automation_processing(True)
         return self.simulate_post(
             "/api/automation-enrolments/process",
             json=doc,
@@ -453,6 +540,7 @@ class TestAutomationExecution(test_base.TestBase):
         )
 
     def process_enrolments_task(self, automation_id=None, limit=25):
+        self.set_customer_automation_processing(True)
         return automations.process_automation_enrolments_task(
             self.user_cookie["cid"],
             automation_id,
@@ -487,7 +575,37 @@ class TestAutomationExecution(test_base.TestBase):
             automations.run_task = original_run_task
         return result, dispatched
 
-    def create_scheduler_candidate_account(self, status="ready", automation_status="published", wake_at=None, modified_at=None, retry_after=None):
+    def run_scheduler_with_task_patch(self):
+        original_run_task = automations.run_task
+        dispatched = []
+
+        def fake_run_task(task, cid, automation_id, limit):
+            dispatched.append(
+                {
+                    "task": task,
+                    "cid": cid,
+                    "automation_id": automation_id,
+                    "limit": limit,
+                }
+            )
+            return "task-%s" % len(dispatched)
+
+        automations.run_task = fake_run_task
+        try:
+            result = automations.check_automation_enrolments()
+        finally:
+            automations.run_task = original_run_task
+        return result, dispatched
+
+    def create_scheduler_candidate_account(
+        self,
+        status="ready",
+        automation_status="published",
+        wake_at=None,
+        modified_at=None,
+        retry_after=None,
+        automation_processing_enabled=True,
+    ):
         cid = "automation-scheduler-%s" % self.unique()
         automation_id = "automation-scheduler-automation-%s" % self.unique()
         enrolment_id = "automation-scheduler-enrolment-%s" % self.unique()
@@ -496,6 +614,9 @@ class TestAutomationExecution(test_base.TestBase):
             "name": "Scheduler account %s" % cid,
             "admin": False,
         }
+        if automation_processing_enabled is not None:
+            data["automation_processing_enabled"] = automation_processing_enabled
+            data["automation_diagnostics_visible"] = False
         self.db.execute(
             "insert into companies (id, cid, data) values (%s, %s, %s)",
             cid,
@@ -2691,6 +2812,55 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_manual_processor_rejects_when_customer_processing_disabled(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="processor-disabled")
+        self.enrol(automation["id"], email)
+        self.set_customer_automation_processing(False)
+
+        result = self.simulate_post(
+            "/api/automation-enrolments/process",
+            json={"automation_id": automation["id"]},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Automation processing is disabled", result.text)
+        self.assertFalse(self.has_tag(contact_id, "processor-disabled"))
+
+        self.cleanup(automation["id"])
+
+    def test_manual_processor_works_when_customer_processing_enabled(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="processor-enabled")
+        self.enrol(automation["id"], email)
+        self.set_customer_automation_processing(True)
+
+        result = self.simulate_post(
+            "/api/automation-enrolments/process",
+            json={"automation_id": automation["id"]},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["processed"], 1)
+        self.assertTrue(self.has_tag(contact_id, "processor-enabled"))
+
+        self.cleanup(automation["id"])
+
+    def test_run_next_remains_allowed_when_customer_processing_disabled(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_automation(tag="run-next-processing-disabled")
+        enrolment = self.enrol(automation["id"], email)
+        self.set_customer_automation_processing(False)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertTrue(self.has_tag(contact_id, "run-next-processing-disabled"))
+
+        self.cleanup(automation["id"])
+
     def test_processor_processes_ready_enrolment_one_node_only(self):
         email, contact_id = self.create_contact()
         automation = self.create_automation(
@@ -3414,13 +3584,93 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(manual["id"], task["id"])
 
+    def test_admin_can_update_customer_automation_processing_settings(self):
+        cid = self.user_cookie["cid"]
+
+        result = self.simulate_patch(
+            "/api/companies/%s" % cid,
+            json={
+                "automation_processing_enabled": True,
+                "automation_diagnostics_visible": True,
+            },
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        company = self.db.companies.get(cid)
+        self.assertEqual(company.get("automation_processing_enabled"), True)
+        self.assertEqual(company.get("automation_diagnostics_visible"), True)
+
+    def test_customer_cannot_update_automation_processing_settings(self):
+        cid = self.user_cookie["cid"]
+
+        result = self.simulate_patch(
+            "/api/companies/%s" % cid,
+            json={
+                "automation_processing_enabled": True,
+                "automation_diagnostics_visible": True,
+            },
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 401)
+        company = self.db.companies.get(cid)
+        self.assertIsNone(company.get("automation_processing_enabled"))
+        self.assertIsNone(company.get("automation_diagnostics_visible"))
+
+    def test_company_automation_processing_settings_must_be_boolean(self):
+        cid = self.user_cookie["cid"]
+
+        result = self.simulate_patch(
+            "/api/companies/%s" % cid,
+            json={"automation_processing_enabled": "true"},
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("must be a boolean", result.text)
+
+    def test_customer_automation_processing_default_is_false(self):
+        cid = self.user_cookie["cid"]
+        company = self.db.companies.get(cid)
+
+        self.assertIsNone(company.get("automation_processing_enabled"))
+        self.assertIsNone(company.get("automation_diagnostics_visible"))
+        self.assertFalse(automations._customer_automation_processing_enabled(self.db, cid))
+
     def test_scheduler_feature_flag_off_does_not_dispatch(self):
         os.environ.pop("automation_processing_enabled", None)
+        self.set_customer_automation_processing(True)
         result, dispatched = self.run_scheduler_with_dispatch_patch([self.user_cookie["cid"]])
 
         self.assertEqual(result["enabled"], False)
         self.assertEqual(result["dispatched"], 0)
         self.assertEqual(dispatched, [])
+
+    def test_scheduler_account_selection_ignores_customer_setting_false_or_absent(self):
+        disabled = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_processing_enabled=False,
+        )
+        absent = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_processing_enabled=None,
+        )
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertNotIn(disabled, cids)
+        self.assertNotIn(absent, cids)
+
+    def test_scheduler_account_selection_includes_customer_setting_true(self):
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_processing_enabled=True,
+        )
+
+        cids = automations._automation_processing_account_ids(self.db, 50)
+
+        self.assertIn(cid, cids)
 
     def test_scheduler_enabled_dispatches_for_ready_account(self):
         os.environ["automation_processing_enabled"] = "true"
@@ -3467,6 +3717,30 @@ class TestAutomationExecution(test_base.TestBase):
         cids = automations._automation_processing_account_ids(self.db, 50)
 
         self.assertIn(cid, cids)
+
+    def test_scheduler_does_not_dispatch_customer_setting_false(self):
+        os.environ["automation_processing_enabled"] = "true"
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_processing_enabled=False,
+        )
+
+        result, dispatched = self.run_scheduler_with_task_patch()
+
+        self.assertEqual(result["enabled"], True)
+        self.assertNotIn(cid, [item["cid"] for item in dispatched])
+
+    def test_scheduler_dispatches_customer_setting_true_when_eligible(self):
+        os.environ["automation_processing_enabled"] = "true"
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_processing_enabled=True,
+        )
+
+        result, dispatched = self.run_scheduler_with_task_patch()
+
+        self.assertEqual(result["enabled"], True)
+        self.assertIn(cid, [item["cid"] for item in dispatched])
 
     def test_scheduler_account_selection_includes_elapsed_waiting_enrolment(self):
         cid = self.create_scheduler_candidate_account(

@@ -64,6 +64,26 @@ logging.getLogger("nose").setLevel(logging.INFO)
 
 log = get_logger()
 
+
+AUTOMATION_COMPANY_SETTING_FIELDS = (
+    "automation_processing_enabled",
+    "automation_diagnostics_visible",
+)
+
+
+def normalize_automation_company_settings(doc: JsonObj, include_defaults: bool = False) -> None:
+    for field in AUTOMATION_COMPANY_SETTING_FIELDS:
+        if include_defaults and field not in doc:
+            doc[field] = False
+        if field not in doc:
+            continue
+        if not isinstance(doc[field], bool):
+            raise falcon.HTTPBadRequest(
+                title="Invalid automation setting",
+                description="%s must be a boolean." % field,
+            )
+
+
 # nothing returned by the web app should be cached by a proxy
 class NoCache(object):
 
@@ -2110,6 +2130,8 @@ class Companies(CRUDCollection):
                     + timedelta(days=frontend.get("trialdays", TRIAL_DAYS))
                 ).isoformat() + "Z"
 
+        normalize_automation_company_settings(doc, include_defaults=True)
+
         if doc.get("exampletemplate", False):
             db.execute(
                 """update companies set data = data || '{"exampletemplate": false}' where cid = %s""",
@@ -2139,6 +2161,7 @@ class Company(CRUDSingle):
             )
 
         db = req.context["db"]
+        normalize_automation_company_settings(doc)
         if doc.get("exampletemplate", False):
             db.execute(
                 """update companies set data = data || '{"exampletemplate": false}' where cid = %s""",

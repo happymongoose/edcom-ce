@@ -3890,6 +3890,16 @@ def _automation_processing_enabled() -> bool:
     )
 
 
+def _customer_automation_processing_enabled(db: DB, cid: str) -> bool:
+    oldcid = db.get_cid()
+    db.set_cid(None)
+    try:
+        company = db.companies.get(cid)
+        return bool(company and company.get("automation_processing_enabled") is True)
+    finally:
+        db.set_cid(oldcid)
+
+
 def _automation_triggers_enabled() -> bool:
     return (os.environ.get("automation_triggers_enabled") or "").strip().lower() in (
         "1",
@@ -4813,6 +4823,7 @@ def _automation_processing_account_ids(
             join automations a on a.cid = e.cid and a.id = e.automation_id
             join companies c on c.id = e.cid
             where c.data @> %s
+                and c.data->>'automation_processing_enabled' = 'true'
                 and a.data->'published' is not null
                 and coalesce(a.data->>'status', '') <> 'paused'
                 and (
@@ -4920,6 +4931,30 @@ def process_automation_enrolments_task(
     with open_db() as db:
         db.set_cid(cid)
         limit = _automation_process_limit(limit)
+        if not _customer_automation_processing_enabled(db, cid):
+            result = {
+                "processed": 0,
+                "succeeded": 0,
+                "waiting": 0,
+                "completed": 0,
+                "exited": 0,
+                "failed": 0,
+                "skipped_running": 0,
+                "errors": [
+                    {
+                        "title": "Automation processing is disabled",
+                        "description": "Automation processing is disabled for this customer account.",
+                    }
+                ],
+            }
+            log.info(
+                "Skipped automation enrolment processing because customer flag is disabled cid=%s automation_id=%s limit=%s result=%s",
+                cid,
+                automation_id,
+                limit,
+                result,
+            )
+            return result
         if automation_id and db.automations.get(automation_id) is None:
             raise ValueError("Automation %s was not found for cid %s" % (automation_id, cid))
 
@@ -5015,6 +5050,11 @@ class AutomationEnrolmentProcessor(object):
 
         db = req.context["db"]
         cid = db.get_cid()
+        if not _customer_automation_processing_enabled(db, cid):
+            raise falcon.HTTPBadRequest(
+                title="Automation processing is disabled",
+                description="Automation processing is disabled for this customer account.",
+            )
         if automation_id and db.automations.get(automation_id) is None:
             raise falcon.HTTPForbidden()
 
