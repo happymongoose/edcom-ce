@@ -48,12 +48,17 @@ export default class AutomationEnrolments extends Component {
     this.reload();
   }
 
+  automationId() {
+    return this.props.match && this.props.match.params && this.props.match.params.id;
+  }
+
   reload = async () => {
+    const automationId = this.automationId();
     this.setState({isLoading: true});
     try {
       const [automationResponse, enrolmentsResponse] = await Promise.all([
-        axios.get("/api/automations/" + this.props.id),
-        axios.get("/api/automations/" + this.props.id + "/enrolments", {
+        axios.get("/api/automations/" + automationId),
+        axios.get("/api/automations/" + automationId + "/enrolments", {
           params: {
             view: this.state.view,
             page: this.state.page,
@@ -97,9 +102,10 @@ export default class AutomationEnrolments extends Component {
   }
 
   runNext = async (enrolment, options) => {
+    const automationId = this.automationId();
     this.setState({runningEnrolmentId: enrolment.id});
     try {
-      const url = "/api/automations/" + this.props.id + "/enrolments/" + enrolment.id + "/run-next" +
+      const url = "/api/automations/" + automationId + "/enrolments/" + enrolment.id + "/run-next" +
         (options && options.skip_wait ? "?skip_wait=true" : "");
       await axios.post(url, options || {});
       notify.show(options && options.skip_wait ? "Automation wait skipped" : "Automation test step ran", "success");
@@ -112,9 +118,10 @@ export default class AutomationEnrolments extends Component {
   }
 
   reEnrolContact = async enrolment => {
+    const automationId = this.automationId();
     this.setState({reenrollingEnrolmentId: enrolment.id});
     try {
-      await axios.post("/api/automations/" + this.props.id + "/enrolments", {email: enrolment.contact_email});
+      await axios.post("/api/automations/" + automationId + "/enrolments", {email: enrolment.contact_email});
       notify.show("Automation test restarted", "success");
       await this.reload();
     } catch (error) {
