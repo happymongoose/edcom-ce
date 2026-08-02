@@ -1093,6 +1093,53 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(events[0][1]["source"]["type"], "manual")
         self.assertEqual(events[0][1]["depth"], 0)
 
+    def test_tag_emission_finds_matching_multi_entry_trigger(self):
+        self.enable_emission()
+        email, contact_id = self.create_contact()
+        tag = "%s_multi_emit_tag" % self.test_id
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_trigger_%s" % self.unique()},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {
+                    "type": "multi",
+                    "triggers": [
+                        {"type": "tag_added", "tag": "%s_other" % tag},
+                        {"type": "tag_removed", "tag": tag},
+                    ],
+                },
+                "reentry": "multiple",
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ],
+                },
+            },
+        )
+        self.user_post("/api/automations/%s/publish" % automation["id"])
+        self.add_contact_tag(email, contact_id, tag)
+
+        removed = contacts.remove_tag(
+            self.db,
+            self.user_cookie["cid"],
+            email,
+            contact_id,
+            tag,
+            {},
+            [],
+        )
+
+        self.assertTrue(removed)
+        self.assertEqual(len(self.emitted_events(tag, "tag_removed")), 1)
+
     def test_matching_paused_tag_removed_automation_creates_pending_event(self):
         self.enable_emission()
         email, contact_id = self.create_contact()
@@ -1455,6 +1502,51 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][1]["status"], "pending")
         self.assertEqual(events[0][1]["source"]["type"], "automation")
+
+    def test_list_emission_finds_matching_multi_entry_trigger(self):
+        self.enable_emission()
+        email, _ = self.create_contact()
+        lst = self.create_contact_list()
+        target_automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_trigger_%s" % self.unique()},
+        )
+        self.created_automation_ids.append(target_automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % target_automation["id"],
+            json={
+                "entry": {
+                    "type": "multi",
+                    "triggers": [
+                        {"type": "tag_added", "tag": "%s_other" % self.test_id},
+                        {"type": "list_joined", "list_id": lst["id"]},
+                    ],
+                },
+                "reentry": "multiple",
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ],
+                },
+            },
+        )
+        self.user_post("/api/automations/%s/publish" % target_automation["id"])
+        source_automation = self.create_add_to_list_automation(lst["id"])
+        enrolment = self.user_post(
+            "/api/automations/%s/enrolments" % source_automation["id"],
+            json={"email": email},
+        )
+
+        run = self.run_next(source_automation["id"], enrolment["id"])
+        events = self.emitted_list_events(lst["id"])
+
+        self.assertEqual(run.status_code, 200)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["status"], "pending")
 
     def test_matching_paused_list_joined_automation_creates_pending_event(self):
         self.enable_emission()
