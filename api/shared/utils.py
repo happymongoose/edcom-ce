@@ -1543,6 +1543,29 @@ def user_log(
     )
 
 
+def can_view_automation_diagnostics(req: falcon.Request) -> bool:
+    if req.context.get("admin") or req.context.get("impersonating"):
+        return True
+
+    db = req.context["db"]
+    cid = db.get_cid()
+    oldcid = db.get_cid()
+    db.set_cid(None)
+    try:
+        company = db.companies.get(cid)
+    finally:
+        db.set_cid(oldcid)
+    return bool(company and company.get("automation_diagnostics_visible") is True)
+
+
+def check_automation_diagnostics(req: falcon.Request) -> None:
+    if not can_view_automation_diagnostics(req):
+        raise falcon.HTTPForbidden(
+            title="Automation diagnostics are hidden",
+            description="Automation diagnostics are not enabled for this customer account.",
+        )
+
+
 def run_task(f: Any, *args: Any, **kwargs: Any) -> str | None:
     if not os.environ.get("SYNC_TASKS"):
         log.debug("Running %s with args = %s, kwargs = %s", f.name, args, kwargs)

@@ -81,6 +81,19 @@ class TestAutomationExecution(test_base.TestBase):
             self.user_cookie["cid"],
         )
 
+    def set_customer_automation_diagnostics(self, visible):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_diagnostics_visible": visible},
+            self.user_cookie["cid"],
+        )
+
+    def clear_customer_automation_diagnostics(self):
+        self.db.execute(
+            "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
+            self.user_cookie["cid"],
+        )
+
     def create_admin_cookie(self):
         backend_cid = self.backend_cid()
         oldcid = self.db.get_cid()
@@ -230,10 +243,17 @@ class TestAutomationExecution(test_base.TestBase):
         }
 
     def admin_headers(self):
+        if not self.created_admin_cookie_ids:
+            self.create_admin_cookie()
         return {
             "X-Auth-UID": self.admin_cookie["uid"],
             "X-Auth-Cookie": self.admin_cookie["id"],
         }
+
+    def admin_impersonation_headers(self):
+        headers = self.admin_headers()
+        headers["X-Auth-Impersonate"] = self.user_cookie["cid"]
+        return headers
 
     def create_contact(self):
         suffix = self.unique()
@@ -534,6 +554,7 @@ class TestAutomationExecution(test_base.TestBase):
         )
 
     def processing_status(self):
+        self.set_customer_automation_diagnostics(True)
         return self.simulate_get(
             "/api/automation-processing-status",
             headers=self.headers(),
@@ -2074,6 +2095,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(step_run["target_node_id"], "node_add_tag_1")
         self.assertEqual(step_run["published_revision"], automation["published_revision"])
         self.assertEqual(step_run["status"], "succeeded")
+        self.set_customer_automation_diagnostics(True)
         history = self.user_get("/api/automations/%s/history" % automation["id"])
         step_events = [event for event in history["events"] if event["type"] == "step_run"]
         self.assertEqual(step_events[0]["result"], True)
@@ -2510,6 +2532,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(step_run["published_revision"], automation["published_revision"])
         self.assertEqual(step_run["status"], "succeeded")
         self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 1)
+        self.set_customer_automation_diagnostics(True)
         history = self.user_get("/api/automations/%s/history" % automation["id"])
         step_events = [event for event in history["events"] if event["type"] == "step_run"]
         self.assertEqual(step_events[0]["target_node_id"], "node_exit_1")
@@ -3205,6 +3228,48 @@ class TestAutomationExecution(test_base.TestBase):
         ][0]
         self.assertEqual(breakdown["counts"]["ready"], 1)
 
+        self.cleanup(automation["id"])
+
+    def test_processing_status_hidden_from_customer_by_default(self):
+        self.clear_customer_automation_diagnostics()
+
+        result = self.simulate_get(
+            "/api/automation-processing-status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 403)
+        self.assertIn("Automation diagnostics are not enabled", result.text)
+
+    def test_processing_status_visible_when_customer_flag_enabled(self):
+        self.set_customer_automation_diagnostics(True)
+
+        result = self.simulate_get(
+            "/api/automation-processing-status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+
+    def test_processing_status_visible_to_admin_impersonation_when_customer_flag_false(self):
+        self.set_customer_automation_diagnostics(False)
+
+        result = self.simulate_get(
+            "/api/automation-processing-status",
+            headers=self.admin_impersonation_headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+
+    def test_run_next_remains_allowed_when_diagnostics_hidden(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(tag="diagnostics-hidden-run-next")
+        enrolment = self.enrol(automation["id"], email)
+        self.set_customer_automation_diagnostics(False)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
         self.cleanup(automation["id"])
 
     def test_processing_status_returns_summary_and_per_automation_counts(self):

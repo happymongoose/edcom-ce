@@ -11,6 +11,21 @@ class TestAutomationHistory(test_base.TestBase):
         super(TestAutomationHistory, self).setUp()
         add_automation_emails_table.run(self.db)
         add_automation_email_events_table.run(self.db)
+        company = self.db.companies.get(self.user_cookie["cid"])
+        self.original_automation_diagnostics_visible = company.get("automation_diagnostics_visible")
+
+    def tearDown(self):
+        self.db.execute(
+            "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
+            self.user_cookie["cid"],
+        )
+        if self.original_automation_diagnostics_visible is not None:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                {"automation_diagnostics_visible": self.original_automation_diagnostics_visible},
+                self.user_cookie["cid"],
+            )
+        super(TestAutomationHistory, self).tearDown()
 
     def unique(self):
         return shortuuid.uuid().lower()
@@ -104,7 +119,15 @@ class TestAutomationHistory(test_base.TestBase):
         return result.json
 
     def history(self, automation_id):
+        self.set_automation_diagnostics_visible(True)
         return self.user_get("/api/automations/%s/history" % automation_id)
+
+    def set_automation_diagnostics_visible(self, visible):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_diagnostics_visible": visible},
+            self.user_cookie["cid"],
+        )
 
     def cleanup(self, *automation_ids):
         self.db.execute(
@@ -187,6 +210,19 @@ class TestAutomationHistory(test_base.TestBase):
             data or {},
         )
         return event_id
+
+    def test_history_is_hidden_when_customer_diagnostics_disabled(self):
+        automation = self.create_automation()
+        self.set_automation_diagnostics_visible(False)
+
+        result = self.simulate_get(
+            "/api/automations/%s/history" % automation["id"],
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 403)
+        self.assertIn("Automation diagnostics are not enabled", result.text)
+        self.cleanup(automation["id"])
 
     def test_history_includes_enrolments_and_step_runs(self):
         email, contact_id = self.create_contact()

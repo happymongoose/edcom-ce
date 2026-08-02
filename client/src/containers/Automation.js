@@ -15,6 +15,7 @@ import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
 import copyText from "../utils/clipboard";
+import { canViewAutomationDiagnostics } from "../utils/automationDiagnostics";
 
 import "react-select2-wrapper/css/select2.css";
 
@@ -1769,7 +1770,7 @@ class Automation extends Component {
               }
             </EDFormBox>
             {this.renderEnrolments()}
-            {this.renderHistory()}
+            {canViewAutomationDiagnostics(this.props) ? this.renderHistory() : null}
           </EDFormSection>
         </LoaderPanel>
       </SaveNavbar>
@@ -1798,6 +1799,11 @@ export default withLoadSave({
     lists: async () => _.sortBy((await axios.get('/api/lists')).data, l => (l.name || '').toLowerCase()),
     segments: async () => _.sortBy((await axios.get('/api/segments')).data, s => (s.name || '').toLowerCase()),
     enrolments: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments')).data,
-    historyData: async ({id}) => (await axios.get('/api/automations/' + id + '/history')).data,
+    historyData: async ({id, user, loggedInImpersonate}) => {
+      if (!canViewAutomationDiagnostics({user, loggedInImpersonate})) {
+        return {enrolments: [], events: []};
+      }
+      return (await axios.get('/api/automations/' + id + '/history')).data;
+    },
   },
 });

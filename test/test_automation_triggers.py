@@ -17,6 +17,8 @@ class TestAutomationTriggers(test_base.TestBase):
         self.created_list_ids = []
         self.created_emails = []
         self.created_other_cids = []
+        company = self.db.companies.get(self.user_cookie["cid"])
+        self.original_automation_diagnostics_visible = company.get("automation_diagnostics_visible")
         self.original_env = {
             "automation_triggers_enabled": os.environ.get("automation_triggers_enabled"),
             "automation_trigger_emission_enabled": os.environ.get("automation_trigger_emission_enabled"),
@@ -29,6 +31,16 @@ class TestAutomationTriggers(test_base.TestBase):
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
+        self.db.execute(
+            "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
+            cid,
+        )
+        if self.original_automation_diagnostics_visible is not None:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                {"automation_diagnostics_visible": self.original_automation_diagnostics_visible},
+                cid,
+            )
         self.db.execute(
             "delete from automation_trigger_events where cid = %s and data->>'correlation_id' like %s",
             cid,
@@ -448,10 +460,18 @@ class TestAutomationTriggers(test_base.TestBase):
         return self.user_post("/api/automation-trigger-events/process", json={"limit": limit})
 
     def list_events(self, limit=None):
+        self.set_automation_diagnostics_visible(True)
         path = "/api/automation-trigger-events"
         if limit is not None:
             path += "?limit=%s" % limit
         return self.user_get(path)
+
+    def set_automation_diagnostics_visible(self, visible):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_diagnostics_visible": visible},
+            self.user_cookie["cid"],
+        )
 
     def run_next(self, automation_id, enrolment_id):
         return self.simulate_post(
@@ -565,6 +585,20 @@ class TestAutomationTriggers(test_base.TestBase):
 
         self.assertIn(visible["id"], event_ids)
         self.assertNotIn(hidden["id"], event_ids)
+
+    def test_trigger_event_list_is_hidden_when_customer_diagnostics_disabled(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        self.create_event(email, "%s_list_hidden" % self.test_id)
+        self.set_automation_diagnostics_visible(False)
+
+        result = self.simulate_get(
+            "/api/automation-trigger-events",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 403)
+        self.assertIn("Automation diagnostics are not enabled", result.text)
 
     def test_trigger_event_list_is_newest_first(self):
         self.enable_manual_events()

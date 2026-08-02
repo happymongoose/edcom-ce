@@ -7,6 +7,24 @@ import test_base
 
 class TestAutomationPause(test_base.TestBase):
 
+    def setUp(self):
+        super(TestAutomationPause, self).setUp()
+        company = self.db.companies.get(self.user_cookie["cid"])
+        self.original_automation_diagnostics_visible = company.get("automation_diagnostics_visible")
+
+    def tearDown(self):
+        self.db.execute(
+            "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
+            self.user_cookie["cid"],
+        )
+        if self.original_automation_diagnostics_visible is not None:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                {"automation_diagnostics_visible": self.original_automation_diagnostics_visible},
+                self.user_cookie["cid"],
+            )
+        super(TestAutomationPause, self).tearDown()
+
     def unique(self):
         return shortuuid.uuid().lower()
 
@@ -121,6 +139,11 @@ class TestAutomationPause(test_base.TestBase):
         )
 
     def history(self, automation_id):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_diagnostics_visible": True},
+            self.user_cookie["cid"],
+        )
         return self.user_get("/api/automations/%s/history" % automation_id)
 
     def cleanup(self, *automation_ids):

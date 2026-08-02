@@ -47,6 +47,7 @@ import UserDropdownMenuPasswordIcon from '-!svg-react-loader!../svg/menu-icons/u
 import UserDropdownMenuLogOffIcon from '-!svg-react-loader!../svg/menu-icons/user-dropdown-menu-log-off.svg';
 import BackendDropdownMenuMailgunIcon from '-!svg-react-loader!../svg/menu-icons/backend-dropdown-menu-mailgun.svg';
 import BackendDropdownMenuSESIcon from '-!svg-react-loader!../svg/menu-icons/backend-dropdown-menu-ses.svg';
+import { canViewAutomationDiagnostics } from "../utils/automationDiagnostics";
 
 export default class MenuNavbar extends Component {
   constructor(props) {
@@ -371,18 +372,27 @@ export default class MenuNavbar extends Component {
                           <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
                           Automations
                         </RouteNavItem>
-                        <RouteNavItem href="/debug-email-logs">
-                          <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
-                          Debug Email Logs
-                        </RouteNavItem>
-                        <RouteNavItem href="/automation-trigger-events">
-                          <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
-                          Automation Trigger Events
-                        </RouteNavItem>
-                        <RouteNavItem href="/automation-processing-status">
-                          <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
-                          Automation Processing Status
-                        </RouteNavItem>
+                        {
+                          canViewAutomationDiagnostics(this.props) &&
+                          <RouteNavItem href="/debug-email-logs">
+                            <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
+                            Debug Email Logs
+                          </RouteNavItem>
+                        }
+                        {
+                          canViewAutomationDiagnostics(this.props) &&
+                          <RouteNavItem href="/automation-trigger-events">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Trigger Events
+                          </RouteNavItem>
+                        }
+                        {
+                          canViewAutomationDiagnostics(this.props) &&
+                          <RouteNavItem href="/automation-processing-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Processing Status
+                          </RouteNavItem>
+                        }
                         <RouteNavItem href="/transactional">
                           <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
                           Transactional

@@ -15,8 +15,20 @@ class TestDebugEmailBackend(test_base.TestBase):
         self.test_id = "debug_email_%s" % shortuuid.uuid().lower()
         self.created_route_ids = []
         self.created_backend_ids = []
+        company = self.db.companies.get(self.user_cookie["cid"])
+        self.original_automation_diagnostics_visible = company.get("automation_diagnostics_visible")
 
     def tearDown(self):
+        self.db.execute(
+            "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
+            self.user_cid(),
+        )
+        if self.original_automation_diagnostics_visible is not None:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                {"automation_diagnostics_visible": self.original_automation_diagnostics_visible},
+                self.user_cid(),
+            )
         self.db.execute(
             "delete from debug_email_logs where data->'metadata'->>'test_id' = %s",
             self.test_id,
@@ -43,6 +55,13 @@ class TestDebugEmailBackend(test_base.TestBase):
 
     def user_cid(self):
         return self.user_cookie["cid"]
+
+    def set_automation_diagnostics_visible(self, visible):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_diagnostics_visible": visible},
+            self.user_cid(),
+        )
 
     def create_route(self, backend_id):
         route_id = shortuuid.uuid()
@@ -186,7 +205,22 @@ class TestDebugEmailBackend(test_base.TestBase):
         self.assertIn("backend_id", data)
         self.assertIn("timestamp", data)
 
+    def test_debug_logs_endpoint_is_hidden_when_customer_diagnostics_disabled(self):
+        self.send_debug_email()
+
+        result = self.simulate_get(
+            "/api/debug-email-logs",
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 403)
+        self.assertIn("Automation diagnostics are not enabled", result.text)
+
     def test_debug_logs_are_account_scoped(self):
+        self.set_automation_diagnostics_visible(True)
         self.send_debug_email()
         self.db.execute(
             """
@@ -210,6 +244,7 @@ class TestDebugEmailBackend(test_base.TestBase):
         self.assertTrue(all(row["cid"] == self.user_cid() for row in result))
 
     def test_debug_logs_endpoint_limits_results(self):
+        self.set_automation_diagnostics_visible(True)
         now = datetime.utcnow() + timedelta(days=1)
         for i in range(105):
             self.db.execute(

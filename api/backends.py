@@ -21,6 +21,7 @@ from .shared.utils import (
     handle_mg_error,
     MTA_TIMEOUT,
     fix_sink_url,
+    check_automation_diagnostics,
 )
 from .shared.send import (
     sink_get_settings,
@@ -595,6 +596,7 @@ class DebugEmailLogs(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)
+        check_automation_diagnostics(req)
 
         db = req.context["db"]
         cid = db.get_cid()

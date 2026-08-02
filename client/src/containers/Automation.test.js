@@ -11,8 +11,17 @@ import {
   canReEnrolAutomation,
   displayAutomationEnrolments,
 } from './Automation';
+import { canViewAutomationDiagnostics } from '../utils/automationDiagnostics';
 
 describe('automation enrolment display helpers', () => {
+  it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {
+    expect(canViewAutomationDiagnostics({user: {admin: true}})).toBe(true);
+    expect(canViewAutomationDiagnostics({loggedInImpersonate: true, user: {}})).toBe(true);
+    expect(canViewAutomationDiagnostics({user: {automation_diagnostics_visible: true}})).toBe(true);
+    expect(canViewAutomationDiagnostics({user: {automation_diagnostics_visible: false}})).toBe(false);
+    expect(canViewAutomationDiagnostics({user: {}})).toBe(false);
+  });
+
   it('only allows rerun UI when published reentry is multiple', () => {
     expect(canReEnrolAutomation({published: {reentry: 'multiple'}})).toBe(true);
     expect(canReEnrolAutomation({published: {reentry: 'once'}})).toBe(false);

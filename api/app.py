@@ -290,6 +290,7 @@ class AuthMiddleware(object):
 
                 admin = cookie["admin"]
                 cid = cookie["cid"]
+                impersonating = False
 
                 impersonateid = req.get_header("X-Auth-Impersonate")
 
@@ -306,8 +307,11 @@ class AuthMiddleware(object):
                         )
 
                     cid = impersonateid
+                    impersonating = True
 
                     admin = False
+            if apikey:
+                impersonating = False
         except:
             db.close()
             raise
@@ -316,6 +320,7 @@ class AuthMiddleware(object):
         req.context["db"] = db
         req.context["uid"] = uid
         req.context["admin"] = admin
+        req.context["impersonating"] = impersonating
         req.context["api"] = bool(apikey)
 
     def process_response(
@@ -3050,6 +3055,7 @@ class User(object):
                     fe.pop("bodydomain", None)
                     r["frontend"] = fe
             r["paid"] = pc.get("paid")
+            r["automation_diagnostics_visible"] = pc.get("automation_diagnostics_visible") is True
             r["hasmoderation"] = pc.get("moderation") is not None
             r["limit"] = fix_empty_limit(pc.get("daylimit"))
             r["inreview"] = pc.get("inreview")

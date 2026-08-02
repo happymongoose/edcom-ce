@@ -25,6 +25,7 @@ from .shared.utils import user_log
 from .shared.utils import emailre
 from .shared.utils import fix_tag
 from .shared.utils import generate_html, remove_newlines
+from .shared.utils import check_automation_diagnostics
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
 from .shared.send import check_test_limit, send_backend_mail
 from .transactional import add_test_txn_log
@@ -2969,6 +2970,7 @@ class AutomationHistory(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
+        check_automation_diagnostics(req)
 
         db = req.context["db"]
         cid = db.get_cid()
@@ -5070,6 +5072,7 @@ class AutomationProcessingStatus(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)
+        check_automation_diagnostics(req)
 
         db = req.context["db"]
         cid = db.get_cid()
@@ -5080,6 +5083,7 @@ class AutomationTriggerEvents(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)
+        check_automation_diagnostics(req)
 
         db = req.context["db"]
         cid = db.get_cid()
