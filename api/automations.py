@@ -493,7 +493,7 @@ AUTOMATION_TRIGGER_EVENT_SCHEMA = {
     "properties": {
         "event_type": {
             "type": "string",
-            "enum": ["tag_added", "tag_removed", "list_joined", "list_left"],
+            "enum": ["tag_added", "tag_removed", "list_joined", "list_left", "segment_entered", "segment_left"],
         },
         "contact_email": {
             "type": "string",
@@ -506,6 +506,11 @@ AUTOMATION_TRIGGER_EVENT_SCHEMA = {
             "maxLength": 1024,
         },
         "list_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+        },
+        "segment_id": {
             "type": "string",
             "minLength": 1,
             "maxLength": 64,
@@ -1608,7 +1613,8 @@ AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
 AUTOMATION_TRIGGER_FINISHED_STATUSES = ("processed", "suppressed", "failed", "enrolled")
 TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
 LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
-SUPPORTED_TRIGGER_EVENT_TYPES = TAG_TRIGGER_EVENT_TYPES + LIST_TRIGGER_EVENT_TYPES
+SEGMENT_TRIGGER_EVENT_TYPES = ("segment_entered", "segment_left")
+SUPPORTED_TRIGGER_EVENT_TYPES = TAG_TRIGGER_EVENT_TYPES + LIST_TRIGGER_EVENT_TYPES + SEGMENT_TRIGGER_EVENT_TYPES
 AUTOMATION_PROCESSING_STATUSES = (
     "ready",
     "waiting",
@@ -4438,6 +4444,7 @@ def _bounded_trigger_result_items(items: object) -> List[JsonObj]:
         "event_type",
         "tag",
         "list_id",
+        "segment_id",
         "enrolment_id",
         "existing_enrolment_id",
     }
@@ -4503,6 +4510,7 @@ def _project_automation_trigger_event(row, source_names: Dict[str, str]) -> Json
         "contact_email": event["contact_email"],
         "tag": data.get("tag"),
         "list_id": data.get("list_id"),
+        "segment_id": data.get("segment_id"),
         "status": data.get("status"),
         "source_type": source.get("type"),
         "source_automation_id": source_automation_id,
@@ -4533,6 +4541,8 @@ def _trigger_event_selector(event: JsonObj) -> tuple[str | None, str | None]:
         return "tag", event.get("tag")
     if event_type in LIST_TRIGGER_EVENT_TYPES:
         return "list_id", event.get("list_id")
+    if event_type in SEGMENT_TRIGGER_EVENT_TYPES:
+        return "segment_id", event.get("segment_id")
     return None, None
 
 
@@ -4543,6 +4553,7 @@ def _create_automation_trigger_event(
     contact_email: str,
     tag: str | None = None,
     list_id: str | None = None,
+    segment_id: str | None = None,
     source: JsonObj | None = None,
     correlation_id: str | None = None,
     depth: int = 0,
@@ -4552,7 +4563,7 @@ def _create_automation_trigger_event(
     if event_type not in SUPPORTED_TRIGGER_EVENT_TYPES:
         raise falcon.HTTPBadRequest(
             title="Unsupported trigger event",
-            description="Only tag_added, tag_removed, list_joined and list_left trigger events are supported.",
+            description="Only tag_added, tag_removed, list_joined, list_left, segment_entered and segment_left trigger events are supported.",
         )
 
     if event_type in TAG_TRIGGER_EVENT_TYPES:
@@ -4562,7 +4573,7 @@ def _create_automation_trigger_event(
                 title="Trigger tag is required",
                 description="Tag trigger events require a tag.",
             )
-    else:
+    elif event_type in LIST_TRIGGER_EVENT_TYPES:
         list_id = (list_id or "").strip()
         if not list_id:
             raise falcon.HTTPBadRequest(
@@ -4573,6 +4584,18 @@ def _create_automation_trigger_event(
             raise falcon.HTTPBadRequest(
                 title="Trigger list not found",
                 description="List trigger events require a contact list from this account.",
+            )
+    else:
+        segment_id = (segment_id or "").strip()
+        if not segment_id:
+            raise falcon.HTTPBadRequest(
+                title="Trigger segment is required",
+                description="Segment trigger events require a segment.",
+            )
+        if db.segments.get(segment_id) is None:
+            raise falcon.HTTPBadRequest(
+                title="Trigger segment not found",
+                description="Segment trigger events require a segment from this account.",
             )
 
     if not contact_email or len(contact_email) > 320:
@@ -4623,8 +4646,10 @@ def _create_automation_trigger_event(
     }
     if event_type in TAG_TRIGGER_EVENT_TYPES:
         data["tag"] = tag
-    else:
+    elif event_type in LIST_TRIGGER_EVENT_TYPES:
         data["list_id"] = list_id
+    else:
+        data["segment_id"] = segment_id
     db.execute(
         """
         insert into automation_trigger_events
@@ -5648,15 +5673,16 @@ class AutomationTriggerEvents(object):
         event = _create_automation_trigger_event(
             db,
             cid,
-            doc["event_type"],
-            doc["contact_email"],
-            doc.get("tag"),
-            doc.get("list_id"),
-            doc.get("source"),
-            doc.get("correlation_id"),
-            int(doc.get("depth") or 0),
-            req.context.get("uid"),
-            True,
+            event_type=doc["event_type"],
+            contact_email=doc["contact_email"],
+            tag=doc.get("tag"),
+            list_id=doc.get("list_id"),
+            segment_id=doc.get("segment_id"),
+            source=doc.get("source"),
+            correlation_id=doc.get("correlation_id"),
+            depth=int(doc.get("depth") or 0),
+            created_by=req.context.get("uid"),
+            manual_debug=True,
         )
         resp.status = falcon.HTTP_201
         req.context["result"] = event

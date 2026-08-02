@@ -15,6 +15,7 @@ class TestAutomationTriggers(test_base.TestBase):
         self.test_id = "automation_trigger_%s" % shortuuid.uuid().lower()
         self.created_automation_ids = []
         self.created_list_ids = []
+        self.created_segment_ids = []
         self.created_emails = []
         self.created_other_cids = []
         company = self.db.companies.get(self.user_cookie["cid"])
@@ -62,6 +63,10 @@ class TestAutomationTriggers(test_base.TestBase):
             )
             self.db.execute(
                 "delete from automations where cid = any(%s)",
+                self.created_other_cids,
+            )
+            self.db.execute(
+                "delete from segments where cid = any(%s)",
                 self.created_other_cids,
             )
         if self.created_automation_ids:
@@ -117,6 +122,12 @@ class TestAutomationTriggers(test_base.TestBase):
             self.db.execute(
                 "delete from lists where id = any(%s) and cid = %s",
                 self.created_list_ids,
+                cid,
+            )
+        if self.created_segment_ids:
+            self.db.execute(
+                "delete from segments where id = any(%s) and cid = %s",
+                self.created_segment_ids,
                 cid,
             )
         for key, value in self.original_env.items():
@@ -176,6 +187,17 @@ class TestAutomationTriggers(test_base.TestBase):
         self.created_list_ids.append(lst["id"])
         return lst
 
+    def create_segment(self, name=None):
+        segment = self.user_post(
+            "/api/segments",
+            json={
+                "name": name or "automation_trigger_segment_%s" % self.unique(),
+                "parts": [],
+            },
+        )
+        self.created_segment_ids.append(segment["id"])
+        return segment
+
     def workflow(self, tag, reentry="once", entry_type="tag_added"):
         return {
             "entry": {
@@ -199,6 +221,24 @@ class TestAutomationTriggers(test_base.TestBase):
             "entry": {
                 "type": entry_type,
                 "list_id": list_id,
+            },
+            "reentry": reentry,
+            "draft": {
+                "nodes": [
+                    {
+                        "id": "node_exit_1",
+                        "type": "exit",
+                        "label": "Exit automation",
+                    },
+                ],
+            },
+        }
+
+    def segment_workflow(self, segment_id, reentry="once", entry_type="segment_entered"):
+        return {
+            "entry": {
+                "type": entry_type,
+                "segment_id": segment_id,
             },
             "reentry": reentry,
             "draft": {
@@ -368,6 +408,30 @@ class TestAutomationTriggers(test_base.TestBase):
             return paused_result.json
         return published.json
 
+    def create_segment_trigger_automation(self, segment_id, reentry="once", paused=False, entry_type="segment_entered"):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_segment_automation_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.segment_workflow(segment_id, reentry, entry_type),
+        )
+        published = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(published.status_code, 200)
+        if paused:
+            paused_result = self.simulate_post(
+                "/api/automations/%s/pause" % automation["id"],
+                headers=self.headers(),
+            )
+            self.assertEqual(paused_result.status_code, 200)
+            return paused_result.json
+        return published.json
+
     def create_add_tag_automation(self, add_tag, entry_type="manual", entry_tag=None):
         automation = self.user_post(
             "/api/automations",
@@ -451,6 +515,16 @@ class TestAutomationTriggers(test_base.TestBase):
             "event_type": event_type,
             "contact_email": email,
             "list_id": list_id,
+            "correlation_id": "%s_%s" % (self.test_id, self.unique()),
+        }
+        doc.update(overrides)
+        return self.user_post("/api/automation-trigger-events", json=doc)
+
+    def create_segment_event(self, email, segment_id, event_type="segment_entered", **overrides):
+        doc = {
+            "event_type": event_type,
+            "contact_email": email,
+            "segment_id": segment_id,
             "correlation_id": "%s_%s" % (self.test_id, self.unique()),
         }
         doc.update(overrides)
@@ -759,6 +833,39 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertNotIn("metadata", listed["results"][0])
         self.assertEqual(listed["results"][0]["list_id"], lst["id"])
 
+    def test_trigger_event_list_projects_segment_id_without_raw_metadata(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        event = self.create_segment_event(email, segment["id"], "segment_entered")
+        self.db.execute(
+            """
+            update automation_trigger_events
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {
+                "large_metadata": "x" * 5000,
+                "results": [
+                    {
+                        "status": "no_match",
+                        "reason": "test",
+                        "segment_id": segment["id"],
+                        "metadata": "x" * 5000,
+                    }
+                ],
+            },
+            self.user_cookie["cid"],
+            event["id"],
+        )
+
+        listed = [item for item in self.list_events()["events"] if item["id"] == event["id"]][0]
+
+        self.assertEqual(listed["segment_id"], segment["id"])
+        self.assertNotIn("large_metadata", listed)
+        self.assertNotIn("metadata", listed["results"][0])
+        self.assertEqual(listed["results"][0]["segment_id"], segment["id"])
+
     def test_manual_event_insertion_disabled_by_default(self):
         email, _ = self.create_contact()
         result = self.simulate_post(
@@ -820,6 +927,30 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(event["list_id"], lst["id"])
         self.assertEqual(event["status"], "pending")
 
+    def test_manual_segment_entered_event_insertion_works_when_enabled(self):
+        self.enable_manual_events()
+        email, contact_id = self.create_contact()
+        segment = self.create_segment()
+
+        event = self.create_segment_event(email, segment["id"], "segment_entered")
+
+        self.assertEqual(event["event_type"], "segment_entered")
+        self.assertEqual(event["contact_id"], contact_id)
+        self.assertEqual(event["segment_id"], segment["id"])
+        self.assertEqual(event["status"], "pending")
+
+    def test_manual_segment_left_event_insertion_works_when_enabled(self):
+        self.enable_manual_events()
+        email, contact_id = self.create_contact()
+        segment = self.create_segment()
+
+        event = self.create_segment_event(email, segment["id"], "segment_left")
+
+        self.assertEqual(event["event_type"], "segment_left")
+        self.assertEqual(event["contact_id"], contact_id)
+        self.assertEqual(event["segment_id"], segment["id"])
+        self.assertEqual(event["status"], "pending")
+
     def test_manual_list_event_missing_list_id_fails(self):
         self.enable_manual_events()
         email, _ = self.create_contact()
@@ -871,6 +1002,54 @@ class TestAutomationTriggers(test_base.TestBase):
                 self.user_cookie["cid"],
                 lst["id"],
             )
+
+    def test_manual_segment_event_missing_segment_id_fails(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        result = self.simulate_post(
+            "/api/automation-trigger-events",
+            json={
+                "event_type": "segment_entered",
+                "contact_email": email,
+            },
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 400)
+
+    def test_manual_segment_event_unknown_or_unowned_segment_fails(self):
+        self.enable_manual_events()
+        email, _ = self.create_contact()
+        unknown = self.simulate_post(
+            "/api/automation-trigger-events",
+            json={
+                "event_type": "segment_left",
+                "contact_email": email,
+                "segment_id": "missing-segment-id",
+            },
+            headers=self.headers(),
+        )
+        self.assertEqual(unknown.status_code, 400)
+
+        other_cid = "%s_other_segment_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        other_segment_id = "%s_other_segment" % self.test_id
+        self.db.execute(
+            "insert into segments (id, cid, data) values (%s, %s, %s)",
+            other_segment_id,
+            other_cid,
+            {"name": "Other segment", "parts": []},
+        )
+        unowned = self.simulate_post(
+            "/api/automation-trigger-events",
+            json={
+                "event_type": "segment_entered",
+                "contact_email": email,
+                "segment_id": other_segment_id,
+            },
+            headers=self.headers(),
+        )
+        self.assertEqual(unowned.status_code, 400)
 
     def test_processor_disabled_by_default(self):
         self.enable_manual_events()
@@ -1004,6 +1183,100 @@ class TestAutomationTriggers(test_base.TestBase):
         email, _ = self.create_contact()
         lst = self.create_contact_list()
         event = self.create_list_event(email, lst["id"], "list_joined")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 0)
+        self.assertEqual(result["no_match"], 1)
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_enabled_processor_enrols_matching_segment_entered_automation(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        automation = self.create_segment_trigger_automation(segment["id"])
+        event = self.create_segment_event(email, segment["id"], "segment_entered")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["status"], "ready")
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_enabled_processor_enrols_matching_segment_left_automation(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        automation = self.create_segment_trigger_automation(segment["id"], entry_type="segment_left")
+        event = self.create_segment_event(email, segment["id"], "segment_left")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["status"], "ready")
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+        self.assertEqual(self.event_status(event["id"]), "processed")
+
+    def test_processor_matches_non_first_segment_trigger_in_multi_entry(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        tag = "%s_segment_multi_tag" % self.test_id
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "%s_segment_multi_%s" % (self.test_id, self.unique())},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {
+                    "type": "multi",
+                    "triggers": [
+                        {"type": "tag_added", "tag": tag},
+                        {"type": "segment_entered", "segment_id": segment["id"]},
+                    ],
+                },
+                "reentry": "once",
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ],
+                },
+            },
+        )
+        published = self.user_post("/api/automations/%s/publish" % automation["id"])
+        event = self.create_segment_event(email, segment["id"], "segment_entered")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(published["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+
+    def test_no_match_segment_event_is_processed_without_enrolment(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        event = self.create_segment_event(email, segment["id"], "segment_entered")
 
         result = self.process_events()
 
@@ -1849,6 +2122,21 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(result["details"][0]["reason"], "active_pass")
         self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
 
+    def test_active_pass_suppresses_segment_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        automation = self.create_segment_trigger_automation(segment["id"], reentry="multiple")
+        self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        self.create_segment_event(email, segment["id"], "segment_entered")
+
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "active_pass")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
     def test_once_suppresses_prior_enrolment(self):
         self.enable_manual_events()
         self.enable_processing()
@@ -1881,6 +2169,22 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(result["details"][0]["reason"], "once")
         self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
 
+    def test_once_suppresses_prior_enrolment_for_segment_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        automation = self.create_segment_trigger_automation(segment["id"])
+        enrolment = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        self.patch_enrolment_status(enrolment["id"], "completed")
+        self.create_segment_event(email, segment["id"], "segment_entered")
+
+        result = self.process_events()
+
+        self.assertEqual(result["suppressed"], 1)
+        self.assertEqual(result["details"][0]["reason"], "once")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
     def test_multiple_allows_terminal_previous_pass(self):
         self.enable_manual_events()
         self.enable_processing()
@@ -1905,6 +2209,21 @@ class TestAutomationTriggers(test_base.TestBase):
         enrolment = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
         self.patch_enrolment_status(enrolment["id"], "completed")
         self.create_list_event(email, lst["id"], "list_joined")
+
+        result = self.process_events()
+
+        self.assertEqual(result["enrolled"], 1)
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 2)
+
+    def test_multiple_allows_terminal_previous_pass_for_segment_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        automation = self.create_segment_trigger_automation(segment["id"], reentry="multiple")
+        enrolment = self.user_post("/api/automations/%s/enrolments" % automation["id"], json={"email": email})
+        self.patch_enrolment_status(enrolment["id"], "completed")
+        self.create_segment_event(email, segment["id"], "segment_entered")
 
         result = self.process_events()
 
@@ -1971,6 +2290,25 @@ class TestAutomationTriggers(test_base.TestBase):
         self.patch_enrolment_status(enrolment_id, "completed")
 
         self.create_list_event(email, lst["id"], "list_joined")
+        second = self.process_events()
+
+        self.assertEqual(second["suppressed"], 1)
+        self.assertEqual(second["details"][0]["reason"], "cooldown")
+        self.assertEqual(len(self.enrolment_rows(automation["id"])), 1)
+
+    def test_cooldown_suppresses_repeat_segment_event(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        segment = self.create_segment()
+        automation = self.create_segment_trigger_automation(segment["id"], reentry="multiple")
+        self.create_segment_event(email, segment["id"], "segment_entered")
+        first = self.process_events()
+        self.assertEqual(first["enrolled"], 1)
+        enrolment_id = self.enrolment_rows(automation["id"])[0][0]
+        self.patch_enrolment_status(enrolment_id, "completed")
+
+        self.create_segment_event(email, segment["id"], "segment_entered")
         second = self.process_events()
 
         self.assertEqual(second["suppressed"], 1)

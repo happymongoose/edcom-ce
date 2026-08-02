@@ -38,6 +38,7 @@ function eventJson(event) {
         automation_name: event.source_automation_name || "",
       },
       list_id: event.list_id || "",
+      segment_id: event.segment_id || "",
       correlation_id: event.correlation_id || "",
       depth: event.depth,
       processed_at: event.processed_at || "",
@@ -93,7 +94,7 @@ export default class AutomationTriggerEvents extends Component {
             <td>{moment(event.timestamp).format("l LTS")}</td>
             <td>{event.event_type || ""}</td>
             <td>{event.contact_email || ""}</td>
-            <td>{event.tag || event.list_id || ""}</td>
+            <td>{event.tag || event.list_id || event.segment_id || ""}</td>
             <td>{event.status || ""}</td>
             <td>{sourceSummary(event)}</td>
             <td>{event.correlation_id || ""}</td>
@@ -133,7 +134,7 @@ export default class AutomationTriggerEvents extends Component {
                       <th>Timestamp</th>
                       <th>Event Type</th>
                       <th>Contact</th>
-                      <th>Tag/List</th>
+                      <th>Selector</th>
                       <th>Status</th>
                       <th>Source</th>
                       <th>Correlation ID</th>
@@ -146,7 +147,7 @@ export default class AutomationTriggerEvents extends Component {
               :
                 <div className="text-center space-top-sm">
                   <h4>No automation trigger events found.</h4>
-                  <h5>Recent tag-added trigger events will appear here when trigger emission or manual trigger events are enabled.</h5>
+                  <h5>Recent automation trigger events will appear here when trigger emission or manual trigger events are enabled.</h5>
                 </div>
             }
           </LoaderPanel>
