@@ -882,6 +882,199 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("Segment entry trigger must reference a segment from this account", result.text)
 
+    def test_multi_manual_and_tag_entry_publishes(self):
+        automation = self.create_tracked_automation("Multi Manual Tag Entry Publish")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "manual"},
+                {"type": "tag_added", "tag": "automation-entry-multi-vip"},
+            ],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(published["published"]["entry"], workflow["entry"])
+
+    def test_multi_tag_list_segment_entry_publishes(self):
+        automation = self.create_tracked_automation("Multi Entry Publish")
+        lst = self.create_contact_list("automation_crud_multi_entry")
+        segment = self.create_segment("automation_crud_multi_segment_entry")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-multi-added"},
+                {"type": "tag_removed", "tag": "automation-entry-multi-removed"},
+                {"type": "list_left", "list_id": lst["id"]},
+                {"type": "segment_entered", "segment_id": segment["id"]},
+            ],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(published["published"]["entry"], workflow["entry"])
+
+    def test_multi_single_trigger_publishes_as_single_shape(self):
+        automation = self.create_tracked_automation("Multi Single Entry Publish")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-single-shape"},
+            ],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        published = self.user_publish(automation["id"])
+
+        self.assertEqual(
+            published["published"]["entry"],
+            {"type": "tag_added", "tag": "automation-entry-single-shape"},
+        )
+
+    def test_multi_entry_missing_required_selector_fails(self):
+        automation = self.create_tracked_automation("Multi Entry Missing Selector")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "manual"},
+                {"type": "tag_removed", "tag": ""},
+            ],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Tag removed entry trigger requires a tag", result.text)
+
+    def test_multi_entry_unknown_or_unowned_list_and_segment_fail(self):
+        automation = self.create_tracked_automation("Multi Entry Unknown List")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-multi-known"},
+                {"type": "list_joined", "list_id": "missing-list-id"},
+            ],
+        }
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("List entry trigger must reference a contact list from this account", result.text)
+
+        segment_automation = self.create_tracked_automation("Multi Entry Unknown Segment")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-multi-known"},
+                {"type": "segment_left", "segment_id": "missing-segment-id"},
+            ],
+        }
+        self.user_patch("/api/automations/%s" % segment_automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % segment_automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Segment entry trigger must reference a segment from this account", result.text)
+
+        unowned_list_automation = self.create_tracked_automation("Multi Entry Unowned List")
+        lst = self.create_contact_list("automation_crud_multi_unowned_list")
+        self.db.execute(
+            "update lists set cid = %s where id = %s",
+            "other-account-cid",
+            lst["id"],
+        )
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-multi-known"},
+                {"type": "list_left", "list_id": lst["id"]},
+            ],
+        }
+        self.user_patch("/api/automations/%s" % unowned_list_automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % unowned_list_automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("List entry trigger must reference a contact list from this account", result.text)
+
+        unowned_segment_automation = self.create_tracked_automation("Multi Entry Unowned Segment")
+        segment = self.create_segment("automation_crud_multi_unowned_segment")
+        self.db.execute(
+            "update segments set cid = %s where id = %s",
+            "other-account-cid",
+            segment["id"],
+        )
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-multi-known"},
+                {"type": "segment_entered", "segment_id": segment["id"]},
+            ],
+        }
+        self.user_patch("/api/automations/%s" % unowned_segment_automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % unowned_segment_automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Segment entry trigger must reference a segment from this account", result.text)
+
+    def test_multi_entry_duplicate_trigger_fails(self):
+        automation = self.create_tracked_automation("Multi Entry Duplicate")
+        workflow = self.valid_workflow()
+        workflow["entry"] = {
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "automation-entry-duplicate"},
+                {"type": "tag_added", "tag": "automation-entry-duplicate"},
+            ],
+        }
+
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers={
+                "X-Auth-UID": self.user_cookie["uid"],
+                "X-Auth-Cookie": self.user_cookie["id"],
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Automation entry contains duplicate triggers", result.text)
+
     def test_publish_validation_failure_does_not_modify_existing_published_data(self):
         created = self.user_post("/api/automations", json={"name": "Publish Failure"})
         automation_id = created["id"]

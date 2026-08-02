@@ -163,11 +163,9 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.created_segment_ids.append(segment["id"])
         return segment
 
-    def workflow(self, reentry=None):
+    def workflow(self, reentry=None, entry=None):
         doc = {
-            "entry": {
-                "type": "manual",
-            },
+            "entry": entry or {"type": "manual"},
             "draft": {
                 "nodes": [
                     {
@@ -188,7 +186,7 @@ class TestAutomationEnrolments(test_base.TestBase):
             doc["reentry"] = reentry
         return doc
 
-    def create_automation(self, reentry=None, publish=True):
+    def create_automation(self, reentry=None, publish=True, entry=None):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -197,7 +195,7 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.created_automation_ids.append(automation["id"])
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(reentry),
+            json=self.workflow(reentry, entry),
         )
         if publish:
             automation = self.simulate_post(
@@ -510,6 +508,26 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(enrolment["published_revision"], automation["published_revision"])
         self.assertIn("created", enrolment)
         self.assertIn("modified", enrolment)
+
+        self.cleanup(automation["id"])
+
+    def test_manual_enrolment_allowed_with_automatic_only_multi_entry(self):
+        email, _, _ = self.create_contact()
+        automation = self.create_automation(
+            entry={
+                "type": "multi",
+                "triggers": [
+                    {"type": "tag_added", "tag": "automation-enrolments-auto-only"},
+                    {"type": "tag_removed", "tag": "automation-enrolments-auto-only-removed"},
+                ],
+            },
+        )
+
+        result = self.enrol(automation["id"], email)
+
+        self.assertEqual(result.status_code, 201)
+        self.assertEqual(result.json["source"], "manual")
+        self.assertEqual(result.json["status"], "ready")
 
         self.cleanup(automation["id"])
 

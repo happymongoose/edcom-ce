@@ -91,11 +91,26 @@ def matching_tag_trigger_automation_exists(db: DB, cid: str, event_type: str, ta
             where cid = %s
                 and data->>'status' in ('published', 'paused')
                 and data->'published' is not null
-                and data->'published'->'entry'->>'type' = %s
-                and data->'published'->'entry'->>'tag' = %s
+                and (
+                    (
+                        data->'published'->'entry'->>'type' = %s
+                        and data->'published'->'entry'->>'tag' = %s
+                    )
+                    or (
+                        data->'published'->'entry'->>'type' = 'multi'
+                        and exists (
+                            select 1
+                            from jsonb_array_elements(coalesce(data->'published'->'entry'->'triggers', '[]'::jsonb)) trigger
+                            where trigger->>'type' = %s
+                                and trigger->>'tag' = %s
+                        )
+                    )
+                )
             limit 1
             """,
             cid,
+            event_type,
+            tag,
             event_type,
             tag,
         )
@@ -111,11 +126,26 @@ def matching_list_trigger_automation_exists(db: DB, cid: str, event_type: str, l
             where cid = %s
                 and data->>'status' in ('published', 'paused')
                 and data->'published' is not null
-                and data->'published'->'entry'->>'type' = %s
-                and data->'published'->'entry'->>'list_id' = %s
+                and (
+                    (
+                        data->'published'->'entry'->>'type' = %s
+                        and data->'published'->'entry'->>'list_id' = %s
+                    )
+                    or (
+                        data->'published'->'entry'->>'type' = 'multi'
+                        and exists (
+                            select 1
+                            from jsonb_array_elements(coalesce(data->'published'->'entry'->'triggers', '[]'::jsonb)) trigger
+                            where trigger->>'type' = %s
+                                and trigger->>'list_id' = %s
+                        )
+                    )
+                )
             limit 1
             """,
             cid,
+            event_type,
+            list_id,
             event_type,
             list_id,
         )

@@ -28,44 +28,115 @@ function errorMessage(error, fallback) {
 }
 
 function normalizeAutomation(automation) {
-  automation.entry = automation.entry || {type: 'manual'};
-  if (_.contains(['tag_added', 'tag_removed'], automation.entry.type)) {
-    automation.entry.tag = automation.entry.tag || '';
-  } else if (_.contains(['list_joined', 'list_left'], automation.entry.type)) {
-    automation.entry.list_id = automation.entry.list_id || '';
-  } else if (_.contains(['segment_entered', 'segment_left'], automation.entry.type)) {
-    automation.entry.segment_id = automation.entry.segment_id || '';
-  } else {
-    automation.entry = {type: 'manual'};
-  }
+  automation.entry = entryPayload(automation.entry || {type: 'manual'});
   automation.reentry = automation.reentry || 'once';
   automation.draft = automation.draft || {};
   automation.draft.nodes = automation.draft.nodes || [];
   return automation;
 }
 
-function entryPayload(entry) {
-  if (entry && _.contains(['tag_added', 'tag_removed'], entry.type)) {
+export function normalizeEntryTrigger(trigger) {
+  if (trigger && _.contains(['tag_added', 'tag_removed'], trigger.type)) {
     return {
-      type: entry.type,
-      tag: entry.tag || '',
+      type: trigger.type,
+      tag: trigger.tag || '',
     };
   }
-  if (entry && _.contains(['list_joined', 'list_left'], entry.type)) {
+  if (trigger && _.contains(['list_joined', 'list_left'], trigger.type)) {
     return {
-      type: entry.type,
-      list_id: entry.list_id || '',
+      type: trigger.type,
+      list_id: trigger.list_id || '',
     };
   }
-  if (entry && _.contains(['segment_entered', 'segment_left'], entry.type)) {
+  if (trigger && _.contains(['segment_entered', 'segment_left'], trigger.type)) {
     return {
-      type: entry.type,
-      segment_id: entry.segment_id || '',
+      type: trigger.type,
+      segment_id: trigger.segment_id || '',
     };
   }
   return {
     type: 'manual',
   };
+}
+
+export function entryTriggers(entry) {
+  if (entry && entry.type === 'multi') {
+    const triggers = _.map(entry.triggers || [], normalizeEntryTrigger);
+    return triggers.length ? triggers : [{type: 'manual'}];
+  }
+  return [normalizeEntryTrigger(entry || {type: 'manual'})];
+}
+
+export function entryPayload(entry) {
+  const triggers = entryTriggers(entry);
+  if (triggers.length > 1) {
+    return {
+      type: 'multi',
+      triggers: triggers,
+    };
+  }
+  const trigger = triggers[0] || {type: 'manual'};
+  return normalizeEntryTrigger(trigger);
+}
+
+function triggerPayloadForType(type, current, lists, segments) {
+  if (_.contains(['tag_added', 'tag_removed'], type)) {
+    return {
+      type: type,
+      tag: (current && current.tag) || '',
+    };
+  }
+  if (_.contains(['list_joined', 'list_left'], type)) {
+    return {
+      type: type,
+      list_id: (current && current.list_id) || (lists.length ? lists[0].id : ''),
+    };
+  }
+  if (_.contains(['segment_entered', 'segment_left'], type)) {
+    return {
+      type: type,
+      segment_id: (current && current.segment_id) || (segments.length ? segments[0].id : ''),
+    };
+  }
+  return {
+    type: 'manual',
+  };
+}
+
+function replaceEntryTrigger(entry, index, trigger) {
+  const triggers = entryTriggers(entry);
+  triggers[index] = trigger;
+  return entryPayload({type: 'multi', triggers: triggers});
+}
+
+function addEntryTriggerToEntry(entry, trigger) {
+  const triggers = entryTriggers(entry).concat([trigger]);
+  return entryPayload({type: 'multi', triggers: triggers});
+}
+
+function removeEntryTriggerFromEntry(entry, index) {
+  const triggers = entryTriggers(entry);
+  triggers.splice(index, 1);
+  return entryPayload({type: 'multi', triggers: triggers.length ? triggers : [{type: 'manual'}]});
+}
+
+function entryTagValues(entry) {
+  return _.chain(entryTriggers(entry))
+    .filter(trigger => _.contains(['tag_added', 'tag_removed'], trigger.type) && trigger.tag)
+    .pluck('tag')
+    .value();
+}
+
+function triggerOptions() {
+  return [
+    {id: 'manual', name: 'Manual'},
+    {id: 'tag_added', name: 'Tag added'},
+    {id: 'tag_removed', name: 'Tag removed'},
+    {id: 'list_joined', name: 'Joined list'},
+    {id: 'list_left', name: 'Left list'},
+    {id: 'segment_entered', name: 'Entered segment'},
+    {id: 'segment_left', name: 'Left segment'},
+  ];
 }
 
 function patchPayload(data) {
@@ -524,47 +595,73 @@ class Automation extends Component {
     });
   }
 
-  entryTypeChange = event => {
+  entryTypeChange = (index, event) => {
     const type = getvalue(event);
     const lists = this.props.lists || [];
     const segments = this.props.segments || [];
+    const current = entryTriggers(this.props.data.entry)[index] || {};
     this.props.update({
-      entry: {$set: _.contains(['tag_added', 'tag_removed'], type) ? {
-        type: type,
-        tag: (this.props.data.entry && this.props.data.entry.tag) || '',
-      } : _.contains(['list_joined', 'list_left'], type) ? {
-        type: type,
-        list_id: (this.props.data.entry && this.props.data.entry.list_id) || (lists.length ? lists[0].id : ''),
-      } : _.contains(['segment_entered', 'segment_left'], type) ? {
-        type: type,
-        segment_id: (this.props.data.entry && this.props.data.entry.segment_id) || (segments.length ? segments[0].id : ''),
-      } : {
-        type: 'manual',
-      }},
+      entry: {$set: replaceEntryTrigger(
+        this.props.data.entry,
+        index,
+        triggerPayloadForType(type, current, lists, segments),
+      )},
     });
   }
 
-  entryTagChange = event => {
+  entryTagChange = (index, event) => {
     this.props.update({
-      entry: {
-        tag: {$set: event.params.data.id},
-      },
+      entry: {$set: replaceEntryTrigger(
+        this.props.data.entry,
+        index,
+        {
+          ...entryTriggers(this.props.data.entry)[index],
+          tag: event.params.data.id,
+        },
+      )},
     });
   }
 
-  entryListChange = event => {
+  entryListChange = (index, event) => {
     this.props.update({
-      entry: {
-        list_id: {$set: getvalue(event)},
-      },
+      entry: {$set: replaceEntryTrigger(
+        this.props.data.entry,
+        index,
+        {
+          ...entryTriggers(this.props.data.entry)[index],
+          list_id: getvalue(event),
+        },
+      )},
     });
   }
 
-  entrySegmentChange = event => {
+  entrySegmentChange = (index, event) => {
     this.props.update({
-      entry: {
-        segment_id: {$set: getvalue(event)},
-      },
+      entry: {$set: replaceEntryTrigger(
+        this.props.data.entry,
+        index,
+        {
+          ...entryTriggers(this.props.data.entry)[index],
+          segment_id: getvalue(event),
+        },
+      )},
+    });
+  }
+
+  addEntryTrigger = type => {
+    const lists = this.props.lists || [];
+    const segments = this.props.segments || [];
+    this.props.update({
+      entry: {$set: addEntryTriggerToEntry(
+        this.props.data.entry,
+        triggerPayloadForType(type, {}, lists, segments),
+      )},
+    });
+  }
+
+  removeEntryTrigger = index => {
+    this.props.update({
+      entry: {$set: removeEntryTriggerFromEntry(this.props.data.entry, index)},
     });
   }
 
@@ -599,8 +696,7 @@ class Automation extends Component {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
     const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
-    const entry = this.props.data.entry || {};
-    const entryTags = _.contains(['tag_added', 'tag_removed'], entry.type) && entry.tag ? [entry.tag] : [];
+    const entryTags = entryTagValues(this.props.data.entry);
 
     return _.map(_.uniq(tags.concat(draftTags).concat(entryTags)), tag => ({id: tag, text: tag}));
   }
@@ -660,6 +756,96 @@ class Automation extends Component {
       name: (list.name || 'Untitled list') +
         (list.count !== undefined && list.count !== null ? ' (' + list.count + ' contacts)' : ''),
     }));
+  }
+
+  renderEntryTrigger(trigger, index, count) {
+    return (
+      <div key={index} className="space-bottom" style={{borderBottom: '1px solid #eee', paddingBottom: '12px', maxWidth: '720px'}}>
+        <div style={{display: 'flex', alignItems: 'flex-start', gap: '12px'}}>
+          <div style={{width: '260px'}}>
+            <SelectLabel
+              id="type"
+              label={index === 0 ? 'Entry trigger' : 'Additional trigger'}
+              obj={trigger}
+              onChange={event => this.entryTypeChange(index, event)}
+              options={triggerOptions()}
+            />
+          </div>
+          {
+            count > 1 ?
+              <Button
+                bsStyle="link"
+                style={{marginTop: '27px'}}
+                onClick={() => this.removeEntryTrigger(index)}
+              >
+                Remove
+              </Button>
+            :
+              null
+          }
+        </div>
+        {
+          _.contains(['tag_added', 'tag_removed'], trigger.type) ?
+            <div style={{maxWidth: '360px'}}>
+              <label>Trigger tag</label>
+              <Select2
+                data={this.tagData()}
+                value={trigger.tag || ''}
+                onSelect={event => this.entryTagChange(index, event)}
+                style={{width:'100%'}}
+                options={{
+                  placeholder: 'Select or create tag',
+                  tags: true,
+                  createTag: function (params) {
+                    const fixed = fixTag(params.term);
+                    if (!fixed) {
+                      return null;
+                    }
+                    return {
+                      id: fixed,
+                      text: fixed,
+                    };
+                  }
+                }}
+              />
+            </div>
+          :
+            _.contains(['list_joined', 'list_left'], trigger.type) ?
+              (this.listOptions().length ?
+                <div style={{maxWidth: '360px'}}>
+                  <SelectLabel
+                    id="list_id"
+                    label="Trigger list"
+                    obj={trigger}
+                    onChange={event => this.entryListChange(index, event)}
+                    options={this.listOptions()}
+                    emptyVal="Select list"
+                  />
+                </div>
+              :
+                <p className="help-block">Create a contact list before selecting this trigger.</p>
+              )
+            :
+              _.contains(['segment_entered', 'segment_left'], trigger.type) ?
+                (this.segmentOptions().length ?
+                  <div style={{maxWidth: '360px'}}>
+                    <SelectLabel
+                      id="segment_id"
+                      label="Trigger segment"
+                      obj={trigger}
+                      onChange={event => this.entrySegmentChange(index, event)}
+                      options={this.segmentOptions()}
+                      emptyVal="Select segment"
+                    />
+                  </div>
+                :
+                  <p className="help-block">Create a segment before selecting this trigger.</p>
+                )
+              :
+                <p>Contacts can be added manually from this automation or from a contact/list action.</p>
+        }
+      </div>
+    );
   }
 
   addNode = type => {
@@ -1775,81 +1961,17 @@ class Automation extends Component {
             </EDFormBox>
             <EDFormBox space>
               <h4>Entry</h4>
-              <SelectLabel
-                id="type"
-                label="Entry trigger"
-                obj={data.entry || {type: 'manual'}}
-                onChange={this.entryTypeChange}
-                options={[
-                  {id: 'manual', name: 'Manual'},
-                  {id: 'tag_added', name: 'Tag added'},
-                  {id: 'tag_removed', name: 'Tag removed'},
-                  {id: 'list_joined', name: 'Joined list'},
-                  {id: 'list_left', name: 'Left list'},
-                  {id: 'segment_entered', name: 'Entered segment'},
-                  {id: 'segment_left', name: 'Left segment'},
-                ]}
-              />
-              {
-                data.entry && _.contains(['tag_added', 'tag_removed'], data.entry.type) ?
-                  <div style={{maxWidth: '360px'}} className="space-bottom">
-                    <label>Trigger tag</label>
-                    <Select2
-                      data={this.tagData()}
-                      value={data.entry.tag || ''}
-                      onSelect={this.entryTagChange}
-                      style={{width:'100%'}}
-                      options={{
-                        placeholder: 'Select or create tag',
-                        tags: true,
-                        createTag: function (params) {
-                          const fixed = fixTag(params.term);
-                          if (!fixed) {
-                            return null;
-                          }
-                          return {
-                            id: fixed,
-                            text: fixed,
-                          };
-                        }
-                      }}
-                    />
-                  </div>
-                :
-                  data.entry && _.contains(['list_joined', 'list_left'], data.entry.type) ?
-                    (this.listOptions().length ?
-                      <div style={{maxWidth: '360px'}} className="space-bottom">
-                        <SelectLabel
-                          id="list_id"
-                          label="Trigger list"
-                          obj={data.entry}
-                          onChange={this.entryListChange}
-                          options={this.listOptions()}
-                          emptyVal="Select list"
-                        />
-                      </div>
-                    :
-                      <p className="help-block">Create a contact list before selecting this trigger.</p>
-                    )
-                  :
-                    data.entry && _.contains(['segment_entered', 'segment_left'], data.entry.type) ?
-                      (this.segmentOptions().length ?
-                        <div style={{maxWidth: '360px'}} className="space-bottom">
-                          <SelectLabel
-                            id="segment_id"
-                            label="Trigger segment"
-                            obj={data.entry}
-                            onChange={this.entrySegmentChange}
-                            options={this.segmentOptions()}
-                            emptyVal="Select segment"
-                          />
-                        </div>
-                      :
-                        <p className="help-block">Create a segment before selecting this trigger.</p>
-                      )
-                  :
-                    <p>Contacts can be added manually from this automation or from a contact/list action.</p>
-              }
+              {_.map(entryTriggers(data.entry), (trigger, index, triggers) => this.renderEntryTrigger(trigger, index, triggers.length))}
+              <DropdownButton
+                id="add-entry-trigger"
+                title="Add trigger"
+              >
+                {_.map(triggerOptions(), option =>
+                  <MenuItem key={option.id} onClick={() => this.addEntryTrigger(option.id)}>
+                    {option.name}
+                  </MenuItem>
+                )}
+              </DropdownButton>
               <SelectLabel
                 id="reentry"
                 label="Contact re-entry"

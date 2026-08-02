@@ -15,6 +15,8 @@ import {
   sortAutomationHistoryContacts,
   canReEnrolAutomation,
   displayAutomationEnrolments,
+  entryPayload,
+  entryTriggers,
 } from './Automation';
 import { canViewAutomationDiagnostics } from '../utils/automationDiagnostics';
 
@@ -31,6 +33,35 @@ describe('automation enrolment display helpers', () => {
     expect(canReEnrolAutomation({published: {reentry: 'multiple'}})).toBe(true);
     expect(canReEnrolAutomation({published: {reentry: 'once'}})).toBe(false);
     expect(canReEnrolAutomation({reentry: 'multiple'})).toBe(true);
+  });
+
+  it('loads old single entry triggers as one trigger row', () => {
+    expect(entryTriggers({type: 'tag_added', tag: 'vip'})).toEqual([
+      {type: 'tag_added', tag: 'vip'},
+    ]);
+  });
+
+  it('saves one entry trigger as the existing single shape', () => {
+    expect(entryPayload({type: 'multi', triggers: [{type: 'tag_removed', tag: 'old'}]})).toEqual({
+      type: 'tag_removed',
+      tag: 'old',
+    });
+  });
+
+  it('saves multiple entry triggers as multi shape', () => {
+    expect(entryPayload({
+      type: 'multi',
+      triggers: [
+        {type: 'manual'},
+        {type: 'list_left', list_id: 'list-1'},
+      ],
+    })).toEqual({
+      type: 'multi',
+      triggers: [
+        {type: 'manual'},
+        {type: 'list_left', list_id: 'list-1'},
+      ],
+    });
   });
 
   it('counts active and ever-enrolled automation contacts', () => {

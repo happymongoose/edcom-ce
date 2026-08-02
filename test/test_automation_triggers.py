@@ -919,6 +919,49 @@ class TestAutomationTriggers(test_base.TestBase):
         self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
         self.assertEqual(self.event_status(event["id"]), "processed")
 
+    def test_processor_matches_non_first_multi_entry_trigger(self):
+        self.enable_manual_events()
+        self.enable_processing()
+        email, _ = self.create_contact()
+        tag = "%s_multi_second" % self.test_id
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_trigger_%s" % self.unique()},
+        )
+        self.created_automation_ids.append(automation["id"])
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {
+                    "type": "multi",
+                    "triggers": [
+                        {"type": "tag_added", "tag": "%s_other" % tag},
+                        {"type": "tag_removed", "tag": tag},
+                    ],
+                },
+                "reentry": "once",
+                "draft": {
+                    "nodes": [
+                        {
+                            "id": "node_exit_1",
+                            "type": "exit",
+                            "label": "Exit automation",
+                        },
+                    ],
+                },
+            },
+        )
+        automation = self.user_post("/api/automations/%s/publish" % automation["id"])
+        event = self.create_event(email, tag, event_type="tag_removed")
+
+        result = self.process_events()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["enrolled"], 1)
+        rows = self.enrolment_rows(automation["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1]["source"], "trigger:%s" % event["id"])
+
     def test_enabled_processor_enrols_matching_list_joined_automation(self):
         self.enable_manual_events()
         self.enable_processing()

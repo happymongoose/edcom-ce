@@ -326,7 +326,7 @@ ACTIVE_ENROLMENT_STATUSES = (
 )
 
 
-ENTRY_SCHEMA = {
+ENTRY_TRIGGER_SCHEMA = {
     "oneOf": [
         {
             "type": "object",
@@ -380,6 +380,28 @@ ENTRY_SCHEMA = {
                 "segment_id": {
                     "type": "string",
                     "maxLength": 64,
+                },
+            },
+            "additionalProperties": False,
+        },
+    ],
+}
+
+
+ENTRY_SCHEMA = {
+    "oneOf": ENTRY_TRIGGER_SCHEMA["oneOf"] + [
+        {
+            "type": "object",
+            "required": ["type", "triggers"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["multi"],
+                },
+                "triggers": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": ENTRY_TRIGGER_SCHEMA,
                 },
             },
             "additionalProperties": False,
@@ -682,7 +704,7 @@ def _validation_error(message: str) -> None:
     raise falcon.HTTPBadRequest(title="Automation publish validation failed", description=message)
 
 
-def _published_entry(entry: JsonObj) -> JsonObj:
+def _published_single_entry(entry: JsonObj) -> JsonObj:
     entry_type = entry.get("type")
     if entry_type == "manual":
         return {"type": "manual"}
@@ -714,6 +736,47 @@ def _published_entry(entry: JsonObj) -> JsonObj:
             "segment_id": segment_id,
         }
     _validation_error("Automation entry trigger type is not supported.")
+
+
+def _entry_triggers(entry: JsonObj | None) -> List[JsonObj]:
+    if not entry:
+        return []
+    if entry.get("type") == "multi":
+        return [trigger for trigger in entry.get("triggers") or [] if isinstance(trigger, dict)]
+    return [entry]
+
+
+def _entry_trigger_key(trigger: JsonObj) -> str:
+    trigger_type = trigger.get("type")
+    if trigger_type == "manual":
+        return "manual"
+    if trigger_type in ("tag_added", "tag_removed"):
+        return "%s:%s" % (trigger_type, trigger.get("tag") or "")
+    if trigger_type in ("list_joined", "list_left"):
+        return "%s:%s" % (trigger_type, trigger.get("list_id") or "")
+    if trigger_type in ("segment_entered", "segment_left"):
+        return "%s:%s" % (trigger_type, trigger.get("segment_id") or "")
+    return "%s:" % (trigger_type or "")
+
+
+def _published_entry(entry: JsonObj) -> JsonObj:
+    triggers = [_published_single_entry(trigger) for trigger in _entry_triggers(entry)]
+    if not triggers:
+        _validation_error("Automation entry requires at least one trigger.")
+
+    seen = set()
+    for trigger in triggers:
+        key = _entry_trigger_key(trigger)
+        if key in seen:
+            _validation_error("Automation entry contains duplicate triggers.")
+        seen.add(key)
+
+    if len(triggers) == 1:
+        return triggers[0]
+    return {
+        "type": "multi",
+        "triggers": triggers,
+    }
 
 
 def _duration_minutes(duration: JsonObj) -> int:
@@ -1033,11 +1096,10 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
         _validation_error("Automation entry is required.")
     _validate_doc(entry, ENTRY_SCHEMA)
     entry = _published_entry(entry)
-    if entry.get("type") in ("list_joined", "list_left"):
-        if db.lists.get(entry.get("list_id")) is None:
+    for trigger in _entry_triggers(entry):
+        if trigger.get("type") in ("list_joined", "list_left") and db.lists.get(trigger.get("list_id")) is None:
             _validation_error("List entry trigger must reference a contact list from this account.")
-    if entry.get("type") in ("segment_entered", "segment_left"):
-        if db.segments.get(entry.get("segment_id")) is None:
+        if trigger.get("type") in ("segment_entered", "segment_left") and db.segments.get(trigger.get("segment_id")) is None:
             _validation_error("Segment entry trigger must reference a segment from this account.")
 
     reentry = automation.get("reentry", "once")
@@ -4651,11 +4713,27 @@ def _matching_trigger_automations(db: DB, cid: str, event: JsonObj) -> List[Json
         where cid = %s
             and data->>'status' in ('published', 'paused')
             and data->'published' is not null
-            and data->'published'->'entry'->>'type' = %s
-            and data->'published'->'entry'->>%s = %s
+            and (
+                (
+                    data->'published'->'entry'->>'type' = %s
+                    and data->'published'->'entry'->>%s = %s
+                )
+                or (
+                    data->'published'->'entry'->>'type' = 'multi'
+                    and exists (
+                        select 1
+                        from jsonb_array_elements(coalesce(data->'published'->'entry'->'triggers', '[]'::jsonb)) trigger
+                        where trigger->>'type' = %s
+                            and trigger->>%s = %s
+                    )
+                )
+            )
         order by data->>'name', id
         """,
         cid,
+        event.get("event_type"),
+        selector_field,
+        selector_value,
         event.get("event_type"),
         selector_field,
         selector_value,
