@@ -107,6 +107,13 @@ export function automationEnrolmentCounts(enrolments) {
   };
 }
 
+export function automationImpersonatedHref(path, impersonateId) {
+  if (!impersonateId) {
+    return path;
+  }
+  return path + (path.indexOf('?') === -1 ? '?' : '&') + 'impersonate=' + encodeURIComponent(impersonateId);
+}
+
 export function displayAutomationEnrolments(enrolments) {
   return _.chain(enrolments)
     .groupBy(contactKey)
@@ -858,6 +865,10 @@ class Automation extends Component {
     return displayAutomationEnrolments(enrolments);
   }
 
+  impersonatedHref(path) {
+    return automationImpersonatedHref(path, this.props.loggedInImpersonate);
+  }
+
   renderEnrolmentTable(enrolments, emptyMessage) {
     const data = this.props.data;
     const displayEnrolments = this.displayEnrolments(enrolments);
@@ -1312,11 +1323,11 @@ class Automation extends Component {
             />
           </form>
           <div>
-            <Button href={fullActiveHref} target="_blank" rel="noopener noreferrer">
+            <Button href={this.impersonatedHref(fullActiveHref)} target="_blank" rel="noopener noreferrer">
               Show all active contacts
             </Button>
             {' '}
-            <Button href={fullAllHref} target="_blank" rel="noopener noreferrer">
+            <Button href={this.impersonatedHref(fullAllHref)} target="_blank" rel="noopener noreferrer">
               Show all enrolled contacts
             </Button>
           </div>

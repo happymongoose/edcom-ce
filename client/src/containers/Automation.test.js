@@ -7,6 +7,7 @@ import {
   automationHistoryLogForEnrolment,
   automationHistoryLog,
   automationEnrolmentCounts,
+  automationImpersonatedHref,
   paginateAutomationHistoryContacts,
   sortAutomationHistoryContacts,
   canReEnrolAutomation,
@@ -42,6 +43,16 @@ describe('automation enrolment display helpers', () => {
       active: 2,
       enrolled: 4,
     });
+  });
+
+  it('preserves impersonation when opening automation enrolment pages in new tabs', () => {
+    expect(automationImpersonatedHref('/automations/abc/enrolments?view=active', 'customer-1')).toBe(
+      '/automations/abc/enrolments?view=active&impersonate=customer-1'
+    );
+    expect(automationImpersonatedHref('/automations/abc/enrolments', 'customer 1')).toBe(
+      '/automations/abc/enrolments?impersonate=customer%201'
+    );
+    expect(automationImpersonatedHref('/automations/abc/enrolments', '')).toBe('/automations/abc/enrolments');
   });
 
   it('collapses sessions by contact and prefers the latest ready session', () => {
