@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import test_base
 from api import automations
+from api.shared.db import open_db
 from api.migrations import (
     add_automation_email_events_table,
     add_automation_enrolments_table,
@@ -241,3 +242,38 @@ class TestAutomationRetentionCleanup(test_base.TestBase):
         self.assertEqual(self.count_rows("automation_email_events", [email_event_id]), 1)
         self.assertEqual(self.count_rows("automation_step_runs", [step_run_id]), 1)
         self.assertEqual(self.count_rows("automation_enrolments", [enrolment_id]), 1)
+
+    def test_advisory_lock_prevents_overlapping_cleanup(self):
+        self.enable_cleanup()
+        old_id = self.insert_debug_log(ts=datetime.utcnow() - timedelta(days=60))
+
+        with open_db() as db:
+            with db.transaction():
+                self.assertTrue(
+                    db.single(
+                        "select pg_try_advisory_xact_lock(%s)",
+                        automations.AUTOMATION_RETENTION_CLEANUP_LOCK,
+                    )
+                )
+                result = automations.check_automation_retention_cleanup()
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["locked"], True)
+        self.assertEqual(result["deleted"], 0)
+        self.assertEqual(self.count_rows("debug_email_logs", [old_id]), 1)
+
+    def test_invalid_env_values_fall_back_safely(self):
+        self.enable_cleanup()
+        os.environ["automation_retention_debug_email_log_days"] = "not-a-number"
+        os.environ["automation_retention_trigger_event_days"] = "also-bad"
+        os.environ["automation_retention_delete_limit"] = "bad-limit"
+        os.environ["automation_retention_account_limit"] = "bad-account-limit"
+        debug_id = self.insert_debug_log(ts=datetime.utcnow() - timedelta(days=15))
+        trigger_id = self.insert_trigger_event("processed", ts=datetime.utcnow() - timedelta(days=31))
+
+        result = automations.check_automation_retention_cleanup()
+
+        self.assertEqual(result["debug_email_logs_deleted"], 1)
+        self.assertEqual(result["automation_trigger_events_deleted"], 1)
+        self.assertEqual(self.count_rows("debug_email_logs", [debug_id]), 0)
+        self.assertEqual(self.count_rows("automation_trigger_events", [trigger_id]), 0)
