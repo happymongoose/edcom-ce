@@ -975,6 +975,29 @@ class Automation extends Component {
     );
   }
 
+  renderNodeContactCount(node) {
+    const summary = (this.props.enrolmentsData && this.props.enrolmentsData.summary) || {};
+    const count = ((summary.nodes || {})[node.id]) || 0;
+    const href = this.impersonatedHref(
+      '/automations/' + this.props.id + '/enrolments?view=active&node_id=' + encodeURIComponent(node.id)
+    );
+
+    return (
+      <div style={{minWidth: '150px'}}>
+        <h4 style={{whiteSpace: 'nowrap'}}>{count} {count === 1 ? 'contact' : 'contacts'}</h4>
+        <Button
+          bsSize="small"
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          disabled={!count}
+        >
+          View contacts
+        </Button>
+      </div>
+    );
+  }
+
   handleSubmit = async event => {
     const isclose = this.props.formClose(event);
 
@@ -1861,6 +1884,7 @@ class Automation extends Component {
                         <th>Type</th>
                         <th>Label</th>
                         <th>Configuration</th>
+                        <th>Contacts at step</th>
                         <th></th>
                       </tr>
                     </thead>
@@ -1885,6 +1909,9 @@ class Automation extends Component {
                           </td>
                           <td>
                             {this.renderNodeConfig(node, index)}
+                          </td>
+                          <td>
+                            {this.renderNodeContactCount(node)}
                           </td>
                           <td style={{minWidth: '92px'}} className="last-cell">
                             <Button onClick={this.deleteNode.bind(this, index)}>Delete</Button>

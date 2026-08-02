@@ -24,6 +24,11 @@ function initialView(props) {
   return params.get("view") === "active" ? "active" : "all";
 }
 
+function initialNodeId(props) {
+  const params = new URLSearchParams(props.location.search);
+  return params.get("node_id") || "";
+}
+
 export default class AutomationEnrolments extends Component {
   constructor(props) {
     super(props);
@@ -36,6 +41,7 @@ export default class AutomationEnrolments extends Component {
       total: 0,
       totalPages: 1,
       view: initialView(props),
+      nodeId: initialNodeId(props),
       search: "",
       appliedSearch: "",
       isLoading: false,
@@ -64,6 +70,7 @@ export default class AutomationEnrolments extends Component {
             page: this.state.page,
             page_size: this.state.pageSize,
             search: this.state.appliedSearch,
+            node_id: this.state.nodeId,
           },
         }),
       ]);
@@ -195,6 +202,10 @@ export default class AutomationEnrolments extends Component {
   render() {
     const title = this.state.view === "active" ? "Active Automation Contacts" : "Enrolled Automation Contacts";
     const summary = this.state.summary || {};
+    const node = this.state.nodeId && this.state.automation && this.state.automation.published ?
+      _.find((this.state.automation.published.nodes || []), item => item.id === this.state.nodeId)
+    :
+      null;
 
     return (
       <MenuNavbar {...this.props}>
@@ -205,6 +216,14 @@ export default class AutomationEnrolments extends Component {
               <div>
                 <h4>{this.state.automation ? this.state.automation.name : ""}</h4>
                 <p>Active {summary.active || 0} / Enrolled {summary.enrolled || 0}</p>
+                {
+                  this.state.nodeId ?
+                    <p>
+                      Step filter: {node ? (node.label || node.type || node.id) : this.state.nodeId}
+                    </p>
+                  :
+                    null
+                }
               </div>
               <div>
                 <Button

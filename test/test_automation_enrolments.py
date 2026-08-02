@@ -330,6 +330,55 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertNotIn(completed_email, emails)
         self.assertEqual(result["total"], 1)
 
+    def test_enrolment_summary_counts_active_contacts_by_current_node(self):
+        first_email, _, _ = self.create_contact()
+        second_email, _, _ = self.create_contact()
+        completed_email, _, _ = self.create_contact()
+        automation = self.create_automation()
+        first = self.enrol(automation["id"], first_email).json
+        second = self.enrol(automation["id"], second_email).json
+        completed = self.enrol(automation["id"], completed_email).json
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {"current_node_id": "node_exit_1"},
+            self.user_cookie["cid"],
+            second["id"],
+        )
+        self.set_enrolment_status(completed["id"], "completed")
+
+        result = self.paged_enrolments(automation["id"], summary="true")
+
+        self.assertEqual(result["summary"]["nodes"]["node_add_tag_1"], 1)
+        self.assertEqual(result["summary"]["nodes"]["node_exit_1"], 1)
+
+    def test_enrolment_paged_view_filters_by_current_node(self):
+        first_email, _, _ = self.create_contact()
+        second_email, _, _ = self.create_contact()
+        automation = self.create_automation()
+        self.enrol(automation["id"], first_email)
+        second = self.enrol(automation["id"], second_email).json
+        self.db.execute(
+            """
+            update automation_enrolments
+            set data = data || %s
+            where cid = %s and id = %s
+            """,
+            {"current_node_id": "node_exit_1"},
+            self.user_cookie["cid"],
+            second["id"],
+        )
+
+        result = self.paged_enrolments(automation["id"], view="active", node_id="node_exit_1")
+
+        emails = [enrolment["contact_email"] for enrolment in result["enrolments"]]
+        self.assertEqual(emails, [second_email])
+        self.assertEqual(result["node_id"], "node_exit_1")
+        self.assertEqual(result["total"], 1)
+
     def test_enrolment_paged_view_searches_email_and_paginates(self):
         automation = self.create_automation()
         created = []

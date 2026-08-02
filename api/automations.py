@@ -2490,6 +2490,24 @@ class AutomationResume(object):
 class AutomationEnrolments(object):
 
     def _summary(self, db: DB, cid: str, automation_id: str) -> JsonObj:
+        node_counts = {
+            row[0]: row[1]
+            for row in db.execute(
+                f"""
+                select e.data->>'current_node_id', count(distinct coalesce(e.contact_id::text, e.contact_email))
+                from automation_enrolments e
+                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+                where e.cid = %s
+                  and e.automation_id = %s
+                  and e.data->>'status' = any(%s)
+                  and coalesce(e.data->>'current_node_id', '') <> ''
+                group by e.data->>'current_node_id'
+                """,
+                cid,
+                automation_id,
+                list(ACTIVE_ENROLMENT_STATUSES),
+            )
+        }
         active = db.single(
             f"""
             select count(distinct coalesce(e.contact_id::text, e.contact_email))
@@ -2516,6 +2534,7 @@ class AutomationEnrolments(object):
         return {
             "active": active or 0,
             "enrolled": enrolled or 0,
+            "nodes": node_counts,
         }
 
     def _paged(self, req: falcon.Request, db: DB, cid: str, automation_id: str) -> JsonObj:
@@ -2538,6 +2557,10 @@ class AutomationEnrolments(object):
         if search:
             filters.append("lower(e.contact_email) like %s")
             params.append("%%%s%%" % search)
+        node_id = (req.get_param("node_id") or "").strip()
+        if node_id:
+            filters.append("e.data->>'current_node_id' = %s")
+            params.append(node_id)
         where = " and ".join(filters)
         count = db.single(
             f"""
@@ -2587,6 +2610,7 @@ class AutomationEnrolments(object):
             "total_pages": max(1, (total + page_size - 1) // page_size),
             "view": view,
             "search": search,
+            "node_id": node_id,
         }
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
