@@ -10,6 +10,7 @@ import TitlePage from "../components/TitlePage";
 import { EDTableSection } from "../components/EDDOM";
 import notify from "../utils/notify";
 import { automationEnrolmentAction } from "./Automation";
+import { enrolmentQueryParams } from "../utils/automationEnrolments";
 
 function errorMessage(error, fallback) {
   const data = error && error.response && error.response.data;
@@ -71,14 +72,7 @@ export default class AutomationEnrolments extends Component {
       const [automationResponse, enrolmentsResponse] = await Promise.all([
         axios.get("/api/automations/" + automationId),
         axios.get("/api/automations/" + automationId + "/enrolments", {
-          params: {
-            view: this.state.view,
-            page: this.state.page,
-            page_size: this.state.pageSize,
-            search: this.state.appliedSearch,
-            node_id: this.state.nodeId,
-            node_position: this.state.nodePosition,
-          },
+          params: enrolmentQueryParams(this.state),
         }),
       ]);
       const data = enrolmentsResponse.data;

@@ -18,6 +18,7 @@ import {
   entryPayload,
   entryTriggers,
 } from './Automation';
+import { enrolmentQueryParams } from '../utils/automationEnrolments';
 import { canViewAutomationDiagnostics } from '../utils/automationDiagnostics';
 
 describe('automation enrolment display helpers', () => {
@@ -61,6 +62,21 @@ describe('automation enrolment display helpers', () => {
         {type: 'manual'},
         {type: 'list_left', list_id: 'list-1'},
       ],
+    });
+  });
+
+  it('omits empty optional enrolment query parameters', () => {
+    expect(enrolmentQueryParams({
+      view: 'all',
+      page: 1,
+      pageSize: 50,
+      appliedSearch: '',
+      nodeId: '',
+      nodePosition: '',
+    })).toEqual({
+      view: 'all',
+      page: 1,
+      page_size: 50,
     });
   });
 
