@@ -8,6 +8,8 @@ import {
   automationHistoryLog,
   automationEnrolmentCounts,
   automationImpersonatedHref,
+  automationNodeContactCount,
+  automationNodeContactFilterId,
   paginateAutomationHistoryContacts,
   sortAutomationHistoryContacts,
   canReEnrolAutomation,
@@ -53,6 +55,28 @@ describe('automation enrolment display helpers', () => {
       '/automations/abc/enrolments?impersonate=customer%201'
     );
     expect(automationImpersonatedHref('/automations/abc/enrolments', '')).toBe('/automations/abc/enrolments');
+  });
+
+  it('maps draft step contact counts to matching published step ids', () => {
+    const draftNodes = [
+      {id: 'draft-send', label: 'Send email'},
+      {id: 'draft-tag', label: 'Add tag'},
+    ];
+    const publishedNodes = [
+      {id: 'published-send', label: 'Send email'},
+      {id: 'published-tag', label: 'Add tag'},
+    ];
+    const summary = {
+      nodes: {
+        'published-send': 1,
+        'draft-tag': 2,
+        'published-tag': 3,
+      },
+    };
+
+    expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(1);
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(5);
+    expect(automationNodeContactFilterId(draftNodes[0], draftNodes, publishedNodes)).toBe('published-send');
   });
 
   it('collapses sessions by contact and prefers the latest ready session', () => {

@@ -292,7 +292,8 @@ class AutomationEmail extends Component {
 
     return (
       <SaveNavbar title={title} user={this.props.user} isSaving={this.props.isSaving}
-        onBack={this.goBack} buttons={this.navbarButtons()} id={this.props.data.id}>
+        onBack={this.goBack} buttons={this.navbarButtons()} id={this.props.data.id}
+        loggedInImpersonate={this.props.loggedInImpersonate}>
         <LoaderPanel isLoading={this.props.isLoading}>
           <div className="automation-email-editor-page">
           {

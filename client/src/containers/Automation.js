@@ -114,6 +114,26 @@ export function automationImpersonatedHref(path, impersonateId) {
   return path + (path.indexOf('?') === -1 ? '?' : '&') + 'impersonate=' + encodeURIComponent(impersonateId);
 }
 
+export function automationNodeContactIds(node, draftNodes, publishedNodes) {
+  const index = _.findIndex(draftNodes || [], item => item.id === node.id);
+  const publishedNode = index >= 0 ? (publishedNodes || [])[index] : null;
+  return _.uniq(_.compact([node.id, publishedNode && publishedNode.id]));
+}
+
+export function automationNodeContactCount(node, draftNodes, publishedNodes, summary) {
+  const counts = (summary && summary.nodes) || {};
+  return _.reduce(
+    automationNodeContactIds(node, draftNodes, publishedNodes),
+    (total, nodeId) => total + (counts[nodeId] || 0),
+    0
+  );
+}
+
+export function automationNodeContactFilterId(node, draftNodes, publishedNodes) {
+  const ids = automationNodeContactIds(node, draftNodes, publishedNodes);
+  return ids.length > 1 ? ids[1] : ids[0];
+}
+
 export function displayAutomationEnrolments(enrolments) {
   return _.chain(enrolments)
     .groupBy(contactKey)
@@ -977,9 +997,13 @@ class Automation extends Component {
 
   renderNodeContactCount(node) {
     const summary = (this.props.enrolmentsData && this.props.enrolmentsData.summary) || {};
-    const count = ((summary.nodes || {})[node.id]) || 0;
+    const data = this.props.data || {};
+    const nodes = (data.draft && data.draft.nodes) || [];
+    const publishedNodes = (data.published && data.published.nodes) || [];
+    const count = automationNodeContactCount(node, nodes, publishedNodes, summary);
+    const filterNodeId = automationNodeContactFilterId(node, nodes, publishedNodes);
     const href = this.impersonatedHref(
-      '/automations/' + this.props.id + '/enrolments?view=active&node_id=' + encodeURIComponent(node.id)
+      '/automations/' + this.props.id + '/enrolments?view=active&node_id=' + encodeURIComponent(filterNodeId)
     );
 
     return (
@@ -1697,7 +1721,8 @@ class Automation extends Component {
 
     return (
       <SaveNavbar title={'Edit Automation'} user={this.props.user} isSaving={this.props.isSaving}
-        onBack={this.goBack} buttons={this.navbarButtons()} id={this.props.id}>
+        onBack={this.goBack} buttons={this.navbarButtons()} id={this.props.id}
+        loggedInImpersonate={this.props.loggedInImpersonate}>
         <LoaderPanel isLoading={this.props.isLoading}>
           <EDFormSection onSubmit={this.handleSubmit} formRef={this.props.formRef}>
             <EDFormBox>
