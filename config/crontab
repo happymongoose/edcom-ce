@@ -1,4 +1,5 @@
 0 4 * * * /scripts/cron.py api.cleanup cleanup_db 4
+15 4 * * * /scripts/cron.py api.automations check_automation_retention_cleanup 22
 * * * * * /scripts/cron.py api.campaigns run_scheduled 6
 */5 * * * * /scripts/cron.py api.campaigns check_resends 8
 * * * * * /scripts/cron.py api.funnels check_funnels 12
