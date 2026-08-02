@@ -93,6 +93,7 @@ import FunnelMessageEdit from "./containers/FunnelMessageEdit";
 import FunnelMessageStats from "./containers/FunnelMessageStats";
 import Automations from "./containers/Automations";
 import Automation from "./containers/Automation";
+import AutomationEnrolments from "./containers/AutomationEnrolments";
 import AutomationEmail from "./containers/AutomationEmail";
 import AutomationProcessingStatus from "./containers/AutomationProcessingStatus";
 import AutomationTriggerEvents from "./containers/AutomationTriggerEvents";
@@ -216,6 +217,7 @@ export default ({ childProps }) => {
     <AppliedRoute path="/funnels/message/stats" exact component={FunnelMessageStats} props={childProps} />
     <AppliedRoute path="/automations" exact component={Automations} props={childProps} />
     <AppliedRoute path="/automations/:automation_id/emails/:email_id" exact component={AutomationEmail} props={childProps} />
+    <AppliedRoute path="/automations/:id/enrolments" exact component={AutomationEnrolments} props={childProps} />
     <AppliedRoute path="/automations/:id" exact component={Automation} props={childProps} />
     <AppliedRoute path="/automation-processing-status" exact component={AutomationProcessingStatus} props={childProps} />
     <AppliedRoute path="/automation-trigger-events" exact component={AutomationTriggerEvents} props={childProps} />

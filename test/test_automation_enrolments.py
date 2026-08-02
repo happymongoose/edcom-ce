@@ -264,6 +264,15 @@ class TestAutomationEnrolments(test_base.TestBase):
     def list_enrolments(self, automation_id):
         return self.user_get("/api/automations/%s/enrolments" % automation_id)
 
+    def paged_enrolments(self, automation_id, **params):
+        query = "&".join("%s=%s" % (key, value) for key, value in params.items())
+        path = "/api/automations/%s/enrolments" % automation_id
+        if query:
+            path += "?%s" % query
+        result = self.simulate_get(path, headers=self.headers())
+        self.assertEqual(result.status_code, 200, result.text)
+        return result.json
+
     def cleanup(self, *automation_ids):
         self.db.execute(
             "delete from automation_enrolments where automation_id = any(%s)",
@@ -289,6 +298,57 @@ class TestAutomationEnrolments(test_base.TestBase):
         self.assertEqual(result.status_code, 404)
 
         self.cleanup(automation["id"])
+
+    def test_enrolment_summary_counts_active_and_ever_enrolled_contacts(self):
+        ready_email, _, _ = self.create_contact()
+        waiting_email, _, _ = self.create_contact()
+        completed_email, _, _ = self.create_contact()
+        automation = self.create_automation()
+        ready = self.enrol(automation["id"], ready_email).json
+        waiting = self.enrol(automation["id"], waiting_email).json
+        completed = self.enrol(automation["id"], completed_email).json
+        self.set_enrolment_status(waiting["id"], "waiting")
+        self.set_enrolment_status(completed["id"], "completed")
+
+        result = self.paged_enrolments(automation["id"], summary="true")
+
+        self.assertEqual(result["summary"]["active"], 2)
+        self.assertEqual(result["summary"]["enrolled"], 3)
+
+    def test_enrolment_paged_active_view_excludes_terminal_statuses(self):
+        active_email, _, _ = self.create_contact()
+        completed_email, _, _ = self.create_contact()
+        automation = self.create_automation()
+        self.enrol(automation["id"], active_email)
+        completed = self.enrol(automation["id"], completed_email).json
+        self.set_enrolment_status(completed["id"], "completed")
+
+        result = self.paged_enrolments(automation["id"], view="active")
+
+        emails = [enrolment["contact_email"] for enrolment in result["enrolments"]]
+        self.assertIn(active_email, emails)
+        self.assertNotIn(completed_email, emails)
+        self.assertEqual(result["total"], 1)
+
+    def test_enrolment_paged_view_searches_email_and_paginates(self):
+        automation = self.create_automation()
+        created = []
+        for index in range(3):
+            email, _, _ = self.create_contact()
+            created.append(email)
+            self.enrol(automation["id"], email)
+
+        result = self.paged_enrolments(
+            automation["id"],
+            view="all",
+            search=created[0].split("@")[0],
+            page_size=1,
+        )
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["page"], 1)
+        self.assertEqual(result["page_size"], 1)
+        self.assertEqual(result["enrolments"][0]["contact_email"], created[0])
 
     def test_successful_enrolment_stores_expected_fields(self):
         email, contact_id, _ = self.create_contact()

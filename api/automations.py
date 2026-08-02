@@ -316,6 +316,14 @@ REENTRY_SCHEMA = {
 }
 
 TERMINAL_ENROLMENT_STATUSES = ("completed", "exited", "cancelled", "failed")
+ACTIVE_ENROLMENT_STATUSES = (
+    "ready",
+    "waiting",
+    "held",
+    "paused_ready",
+    "paused_waiting",
+    "running",
+)
 
 
 ENTRY_SCHEMA = {
@@ -2481,6 +2489,106 @@ class AutomationResume(object):
 
 class AutomationEnrolments(object):
 
+    def _summary(self, db: DB, cid: str, automation_id: str) -> JsonObj:
+        active = db.single(
+            f"""
+            select count(distinct coalesce(e.contact_id::text, e.contact_email))
+            from automation_enrolments e
+            join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+            where e.cid = %s
+              and e.automation_id = %s
+              and e.data->>'status' = any(%s)
+            """,
+            cid,
+            automation_id,
+            list(ACTIVE_ENROLMENT_STATUSES),
+        )
+        enrolled = db.single(
+            f"""
+            select count(distinct coalesce(e.contact_id::text, e.contact_email))
+            from automation_enrolments e
+            join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+            where e.cid = %s and e.automation_id = %s
+            """,
+            cid,
+            automation_id,
+        )
+        return {
+            "active": active or 0,
+            "enrolled": enrolled or 0,
+        }
+
+    def _paged(self, req: falcon.Request, db: DB, cid: str, automation_id: str) -> JsonObj:
+        page = req.get_param_as_int("page") or 1
+        page = max(1, page)
+        page_size = req.get_param_as_int("page_size") or 50
+        page_size = max(1, min(page_size, 100))
+        view = req.get_param("view") or "all"
+        if view not in ("active", "all"):
+            raise falcon.HTTPBadRequest(
+                title="Invalid enrolment view",
+                description="Enrolment view must be active or all.",
+            )
+        search = (req.get_param("search") or "").strip().lower()
+        params = [cid, automation_id]
+        filters = ["e.cid = %s", "e.automation_id = %s"]
+        if view == "active":
+            filters.append("e.data->>'status' = any(%s)")
+            params.append(list(ACTIVE_ENROLMENT_STATUSES))
+        if search:
+            filters.append("lower(e.contact_email) like %s")
+            params.append("%%%s%%" % search)
+        where = " and ".join(filters)
+        count = db.single(
+            f"""
+            select count(*) from (
+                select distinct coalesce(e.contact_id::text, e.contact_email)
+                from automation_enrolments e
+                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+                where {where}
+            ) contacts
+            """,
+            *params,
+        )
+        rows = db.execute(
+            f"""
+            with picked as (
+                select distinct on (coalesce(e.contact_id::text, e.contact_email))
+                    e.id,
+                    e.cid,
+                    e.automation_id,
+                    e.contact_id,
+                    e.contact_email,
+                    e.data
+                from automation_enrolments e
+                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+                where {where}
+                order by
+                    coalesce(e.contact_id::text, e.contact_email),
+                    case when e.data->>'status' = 'ready' then 0 else 1 end,
+                    e.data->>'created' desc,
+                    e.id desc
+            )
+            select id, cid, automation_id, contact_id, contact_email, data
+            from picked
+            order by data->>'created' desc, id desc
+            limit %s offset %s
+            """,
+            *(params + [page_size, (page - 1) * page_size]),
+        )
+        total = count or 0
+        enrolments = [_enrolment_obj(row) for row in rows]
+        return {
+            "summary": self._summary(db, cid, automation_id),
+            "enrolments": enrolments,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "view": view,
+            "search": search,
+        }
+
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
 
@@ -2488,6 +2596,15 @@ class AutomationEnrolments(object):
         cid = db.get_cid()
         if db.automations.get(id) is None:
             raise falcon.HTTPForbidden()
+
+        if req.get_param("summary") or req.get_param("page") or req.get_param("view") or req.get_param("search"):
+            if req.get_param_as_bool("summary") and not (req.get_param("page") or req.get_param("view") or req.get_param("search")):
+                req.context["result"] = {
+                    "summary": self._summary(db, cid, id),
+                }
+                return
+            req.context["result"] = self._paged(req, db, cid, id)
+            return
 
         req.context["result"] = [
             _enrolment_obj(row)

@@ -88,9 +88,28 @@ export function isTerminalEnrolmentStatus(status) {
   return _.contains(['completed', 'exited', 'cancelled'], status);
 }
 
+export function isActiveEnrolmentStatus(status) {
+  return _.contains(['ready', 'waiting', 'held', 'paused_ready', 'paused_waiting', 'running'], status);
+}
+
+function contactKey(enrolment) {
+  return enrolment.contact_id || enrolment.contact_email;
+}
+
+export function automationEnrolmentCounts(enrolments) {
+  const contacts = _.groupBy(enrolments || [], contactKey);
+  const activeContacts = _.filter(_.values(contacts), group =>
+    _.some(group, enrolment => isActiveEnrolmentStatus(enrolment.status))
+  );
+  return {
+    active: activeContacts.length,
+    enrolled: _.keys(contacts).length,
+  };
+}
+
 export function displayAutomationEnrolments(enrolments) {
   return _.chain(enrolments)
-    .groupBy(enrolment => enrolment.contact_id || enrolment.contact_email)
+    .groupBy(contactKey)
     .map(group => {
       const ready = _.filter(group, enrolment => enrolment.status === 'ready');
       if (ready.length) {
@@ -363,6 +382,9 @@ class Automation extends Component {
       runningEnrolmentId: null,
       reenrollingEnrolmentId: null,
       enrolEmail: '',
+      enrolmentSearch: '',
+      enrolmentSearchResults: null,
+      isSearchingEnrolments: false,
       isCreatingEmail: false,
       deletingEmailId: null,
       duplicatingEmailId: null,
@@ -382,6 +404,35 @@ class Automation extends Component {
 
   enrolEmailChange = event => {
     this.setState({enrolEmail: event.target.value});
+  }
+
+  enrolmentSearchChange = event => {
+    this.setState({enrolmentSearch: event.target.value});
+  }
+
+  searchEnrolments = async event => {
+    event.preventDefault();
+    const search = this.state.enrolmentSearch.trim();
+    if (!search) {
+      this.setState({enrolmentSearchResults: null});
+      return;
+    }
+
+    this.setState({isSearchingEnrolments: true});
+    try {
+      const response = await axios.get('/api/automations/' + this.props.id + '/enrolments', {
+        params: {
+          view: 'all',
+          search: search,
+          page_size: 50,
+        },
+      });
+      this.setState({enrolmentSearchResults: response.data});
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to search enrolments'), 'error');
+    } finally {
+      this.setState({isSearchingEnrolments: false});
+    }
   }
 
   historyContactSearchChange = event => {
@@ -698,6 +749,9 @@ class Automation extends Component {
       notify.show('Contact enrolled', 'success');
       this.setState({enrolEmail: ''});
       await this.props.reloadExtra();
+      if (this.state.enrolmentSearchResults && this.state.enrolmentSearch.trim()) {
+        await this.searchEnrolments({preventDefault: () => {}});
+      }
     } catch (error) {
       notify.show(errorMessage(error, 'Unable to enrol contact'), 'error');
     } finally {
@@ -714,6 +768,9 @@ class Automation extends Component {
       await axios.post(url, options || {});
       notify.show(options && options.skip_wait ? 'Automation wait skipped' : 'Automation test step ran', 'success');
       await this.props.reloadExtra();
+      if (this.state.enrolmentSearchResults && this.state.enrolmentSearch.trim()) {
+        await this.searchEnrolments({preventDefault: () => {}});
+      }
     } catch (error) {
       notify.show(errorMessage(error, 'Unable to run next automation step'), 'error');
     } finally {
@@ -740,6 +797,9 @@ class Automation extends Component {
       await axios.post('/api/automations/' + this.props.id + '/enrolments', {email: enrolment.contact_email});
       notify.show('Automation test restarted', 'success');
       await this.props.reloadExtra();
+      if (this.state.enrolmentSearchResults && this.state.enrolmentSearch.trim()) {
+        await this.searchEnrolments({preventDefault: () => {}});
+      }
     } catch (error) {
       notify.show(errorMessage(error, 'Unable to restart automation test'), 'error');
     } finally {
@@ -796,6 +856,112 @@ class Automation extends Component {
 
   displayEnrolments(enrolments) {
     return displayAutomationEnrolments(enrolments);
+  }
+
+  renderEnrolmentTable(enrolments, emptyMessage) {
+    const data = this.props.data;
+    const displayEnrolments = this.displayEnrolments(enrolments);
+
+    if (!displayEnrolments.length) {
+      return (
+        <div className="text-center space-top-sm">
+          <h4>{emptyMessage}</h4>
+        </div>
+      );
+    }
+
+    return (
+      <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
+        <thead>
+          <tr>
+            <th>Contact</th>
+            <th>Status</th>
+            <th>Current Node</th>
+            <th>Source</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        {
+          _.map(displayEnrolments, (enrolment, index) =>
+            {
+              const action = automationEnrolmentAction(enrolment, data);
+              return (
+                <EDTableRow key={enrolment.id} index={index}>
+                  <td>
+                    <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
+                  </td>
+                  <td>
+                    <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.status}</h4>
+                  </td>
+                  <td>
+                    <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.current_node_id}</h4>
+                  </td>
+                  <td>
+                    <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.source}</h4>
+                  </td>
+                  <td>
+                    <h4 style={{whiteSpace: 'nowrap'}}>
+                      {enrolment.created ? moment(enrolment.created).format('lll') : ''}
+                    </h4>
+                  </td>
+                  <td className="last-cell" style={{minWidth: '150px'}}>
+                    {
+                      action.type === 'run_next' || action.type === 'continue_wait' ?
+                        <Button
+                          bsSize="small"
+                          disabled={this.state.runningEnrolmentId === enrolment.id}
+                          onClick={this.runNext.bind(this, enrolment)}
+                        >
+                          {
+                            this.state.runningEnrolmentId === enrolment.id ?
+                              'Running...'
+                            :
+                              action.label
+                          }
+                        </Button>
+                      :
+                        action.type === 'skip_wait' ?
+                          <div>
+                            <div style={{whiteSpace: 'nowrap', marginBottom: '6px'}}>{action.waitLabel}</div>
+                            <Button
+                              bsSize="small"
+                              disabled={this.state.runningEnrolmentId === enrolment.id}
+                              onClick={this.runNext.bind(this, enrolment, {skip_wait: true})}
+                            >
+                              {
+                                this.state.runningEnrolmentId === enrolment.id ?
+                                  'Moving...'
+                                :
+                                  action.label
+                              }
+                            </Button>
+                          </div>
+                      :
+                        action.type === 'reenrol' ?
+                          <Button
+                            bsSize="small"
+                            disabled={this.state.reenrollingEnrolmentId === enrolment.id}
+                            onClick={this.reEnrolContact.bind(this, enrolment)}
+                          >
+                            {
+                              this.state.reenrollingEnrolmentId === enrolment.id ?
+                                'Starting...'
+                              :
+                                action.label
+                            }
+                          </Button>
+                      :
+                        null
+                    }
+                  </td>
+                </EDTableRow>
+              );
+            }
+          )
+        }
+      </EDTable>
+    );
   }
 
   handleSubmit = async event => {
@@ -1080,8 +1246,11 @@ class Automation extends Component {
 
   renderEnrolments() {
     const data = this.props.data;
-    const enrolments = this.props.enrolments || [];
-    const displayEnrolments = this.displayEnrolments(enrolments);
+    const summary = (this.props.enrolmentsData && this.props.enrolmentsData.summary) || automationEnrolmentCounts(this.props.enrolments || []);
+    const searchResults = this.state.enrolmentSearchResults;
+    const searchEnrolments = (searchResults && searchResults.enrolments) || [];
+    const fullActiveHref = '/automations/' + this.props.id + '/enrolments?view=active';
+    const fullAllHref = '/automations/' + this.props.id + '/enrolments?view=all';
 
     if (!data.published_at) {
       return (
@@ -1095,7 +1264,13 @@ class Automation extends Component {
     return (
       <EDFormBox space>
         <div className="flex-items space-between">
-          <h4>Enrolments</h4>
+          <h4>
+            Enrolments
+            {' '}
+            <span className="text-muted" style={{fontWeight: 'normal'}}>
+              Active {summary.active || 0} / Enrolled {summary.enrolled || 0}
+            </span>
+          </h4>
           <form className="form-inline" onSubmit={this.enrolContact}>
             <FormControl
               type="email"
@@ -1116,102 +1291,46 @@ class Automation extends Component {
             />
           </form>
         </div>
+        <div className="flex-items space-between" style={{gap: '12px', marginTop: '14px'}}>
+          <form className="form-inline" onSubmit={this.searchEnrolments}>
+            <FormControl
+              type="email"
+              value={this.state.enrolmentSearch}
+              onChange={this.enrolmentSearchChange}
+              placeholder="Search enrolled email"
+              style={{width: '260px'}}
+              disabled={this.state.isSearchingEnrolments}
+            />
+            {' '}
+            <LoaderButton
+              type="submit"
+              bsStyle="default"
+              text="Search"
+              loadingText="Searching..."
+              isLoading={this.state.isSearchingEnrolments}
+              disabled={this.state.isSearchingEnrolments || !this.state.enrolmentSearch.trim()}
+            />
+          </form>
+          <div>
+            <Button href={fullActiveHref} target="_blank" rel="noopener noreferrer">
+              Show all active contacts
+            </Button>
+            {' '}
+            <Button href={fullAllHref} target="_blank" rel="noopener noreferrer">
+              Show all enrolled contacts
+            </Button>
+          </div>
+        </div>
         {
-          displayEnrolments.length ?
-            <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
-              <thead>
-                <tr>
-                  <th>Contact</th>
-                  <th>Status</th>
-                  <th>Current Node</th>
-                  <th>Source</th>
-                  <th>Created</th>
-                  <th></th>
-                </tr>
-              </thead>
-              {
-                _.map(displayEnrolments, (enrolment, index) =>
-                  {
-                    const action = automationEnrolmentAction(enrolment, data);
-                    return (
-                      <EDTableRow key={enrolment.id} index={index}>
-                        <td>
-                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
-                        </td>
-                        <td>
-                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.status}</h4>
-                        </td>
-                        <td>
-                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.current_node_id}</h4>
-                        </td>
-                        <td>
-                          <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.source}</h4>
-                        </td>
-                        <td>
-                          <h4 style={{whiteSpace: 'nowrap'}}>
-                            {enrolment.created ? moment(enrolment.created).format('lll') : ''}
-                          </h4>
-                        </td>
-                        <td className="last-cell" style={{minWidth: '150px'}}>
-                          {
-                            action.type === 'run_next' || action.type === 'continue_wait' ?
-                              <Button
-                                bsSize="small"
-                                disabled={this.state.runningEnrolmentId === enrolment.id}
-                                onClick={this.runNext.bind(this, enrolment)}
-                              >
-                                {
-                                  this.state.runningEnrolmentId === enrolment.id ?
-                                    'Running...'
-                                  :
-                                    action.label
-                                }
-                              </Button>
-                            :
-                              action.type === 'skip_wait' ?
-                                <div>
-                                  <div style={{whiteSpace: 'nowrap', marginBottom: '6px'}}>{action.waitLabel}</div>
-                                  <Button
-                                    bsSize="small"
-                                    disabled={this.state.runningEnrolmentId === enrolment.id}
-                                    onClick={this.runNext.bind(this, enrolment, {skip_wait: true})}
-                                  >
-                                    {
-                                      this.state.runningEnrolmentId === enrolment.id ?
-                                        'Moving...'
-                                      :
-                                        action.label
-                                    }
-                                  </Button>
-                                </div>
-                            :
-                              action.type === 'reenrol' ?
-                                <Button
-                                  bsSize="small"
-                                  disabled={this.state.reenrollingEnrolmentId === enrolment.id}
-                                  onClick={this.reEnrolContact.bind(this, enrolment)}
-                                >
-                                  {
-                                    this.state.reenrollingEnrolmentId === enrolment.id ?
-                                      'Starting...'
-                                    :
-                                      action.label
-                                  }
-                                </Button>
-                            :
-                              null
-                          }
-                        </td>
-                      </EDTableRow>
-                    );
-                  }
-                )
-              }
-            </EDTable>
-          :
-            <div className="text-center space-top-sm">
-              <h4>No contacts are enrolled yet.</h4>
+          searchResults ?
+            <div style={{marginTop: '16px'}}>
+              <p>
+                Showing {searchEnrolments.length} of {searchResults.total || 0} matching enrolled contacts.
+              </p>
+              {this.renderEnrolmentTable(searchEnrolments, 'No enrolled contacts match that email search.')}
             </div>
+          :
+            null
         }
       </EDFormBox>
     );
@@ -1798,7 +1917,7 @@ export default withLoadSave({
     emails: async ({id}) => (await axios.get('/api/automations/' + id + '/emails')).data,
     lists: async () => _.sortBy((await axios.get('/api/lists')).data, l => (l.name || '').toLowerCase()),
     segments: async () => _.sortBy((await axios.get('/api/segments')).data, s => (s.name || '').toLowerCase()),
-    enrolments: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments')).data,
+    enrolmentsData: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments?summary=true')).data,
     historyData: async ({id, user, loggedInImpersonate}) => {
       if (!canViewAutomationDiagnostics({user, loggedInImpersonate})) {
         return {enrolments: [], events: []};

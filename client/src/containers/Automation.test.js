@@ -6,6 +6,7 @@ import {
   automationHistoryContacts,
   automationHistoryLogForEnrolment,
   automationHistoryLog,
+  automationEnrolmentCounts,
   paginateAutomationHistoryContacts,
   sortAutomationHistoryContacts,
   canReEnrolAutomation,
@@ -26,6 +27,21 @@ describe('automation enrolment display helpers', () => {
     expect(canReEnrolAutomation({published: {reentry: 'multiple'}})).toBe(true);
     expect(canReEnrolAutomation({published: {reentry: 'once'}})).toBe(false);
     expect(canReEnrolAutomation({reentry: 'multiple'})).toBe(true);
+  });
+
+  it('counts active and ever-enrolled automation contacts', () => {
+    const counts = automationEnrolmentCounts([
+      {id: 'ready-1', contact_id: 1, contact_email: 'one@example.com', status: 'ready'},
+      {id: 'waiting-1', contact_id: 2, contact_email: 'two@example.com', status: 'waiting'},
+      {id: 'completed-1', contact_id: 3, contact_email: 'three@example.com', status: 'completed'},
+      {id: 'completed-2', contact_id: 1, contact_email: 'one@example.com', status: 'completed'},
+      {id: 'failed-1', contact_id: 4, contact_email: 'four@example.com', status: 'failed'},
+    ]);
+
+    expect(counts).toEqual({
+      active: 2,
+      enrolled: 4,
+    });
   });
 
   it('collapses sessions by contact and prefers the latest ready session', () => {
