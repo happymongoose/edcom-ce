@@ -144,9 +144,18 @@ class TestSegmentContacts(test_base.TestBase):
         second_list = self.create_contact_list()
         first_email = "all-contacts-%s-0@example.com" % suffix
         second_email = "all-contacts-%s-1@example.com" % suffix
+        orphan_email = "all-contacts-%s-orphan@example.com" % suffix
         self.add_contact(first_list["id"], first_email)
         self.add_contact(first_list["id"], second_email)
         self.add_contact(second_list["id"], first_email)
+        self.db.execute(
+            f"""insert into contacts."contacts_{self.user_cookie['cid']}" (email, added, props)
+                values (%s, 1700000000, %s)
+                on conflict (email) do nothing""",
+            orphan_email,
+            {},
+        )
+        self.created_emails.append(orphan_email)
 
         first_page = self.user_get(
             "/api/contacts?page=1&page_size=1&search=all-contacts-%s" % suffix

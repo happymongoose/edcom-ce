@@ -666,13 +666,18 @@ class ContactsAll(object):
         if search:
             filters.append("lower(email) like %s")
             params.append("%%%s%%" % search)
-        where = ("where " + " and ".join(filters)) if filters else ""
+        filter_clause = ("and " + " and ".join(filters)) if filters else ""
 
         total = db.single(
             f"""
             select count(*)
-            from contacts."contacts_{cid}"
-            {where}
+            from contacts."contacts_{cid}" c
+            where exists (
+                select 1
+                from contacts."contact_lists_{cid}" cl
+                where cl.contact_id = c.contact_id
+            )
+            {filter_clause}
             """,
             *params,
         ) or 0
@@ -686,8 +691,13 @@ class ContactsAll(object):
             for contact_id, email, added in db.execute(
                 f"""
                 select contact_id, email, added
-                from contacts."contacts_{cid}"
-                {where}
+                from contacts."contacts_{cid}" c
+                where exists (
+                    select 1
+                    from contacts."contact_lists_{cid}" cl
+                    where cl.contact_id = c.contact_id
+                )
+                {filter_clause}
                 order by lower(email), contact_id
                 limit %s offset %s
                 """,
