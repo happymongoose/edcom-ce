@@ -156,6 +156,16 @@ class TestSegmentContacts(test_base.TestBase):
             {},
         )
         self.created_emails.append(orphan_email)
+        orphan_contact_id = self.db.single(
+            f"""select contact_id from contacts."contacts_{self.user_cookie['cid']}" where email = %s""",
+            orphan_email,
+        )
+        self.db.execute(
+            f"""insert into contacts."contact_lists_{self.user_cookie['cid']}" (contact_id, list_id)
+                values (%s, %s)""",
+            orphan_contact_id,
+            "deleted-list-%s" % suffix,
+        )
 
         first_page = self.user_get(
             "/api/contacts?page=1&page_size=1&search=all-contacts-%s" % suffix

@@ -675,11 +675,12 @@ class ContactsAll(object):
             where exists (
                 select 1
                 from contacts."contact_lists_{cid}" cl
+                join lists l on l.cid = %s and l.id = cl.list_id
                 where cl.contact_id = c.contact_id
             )
             {filter_clause}
             """,
-            *params,
+            *([cid] + params),
         ) or 0
 
         rows = [
@@ -695,13 +696,14 @@ class ContactsAll(object):
                 where exists (
                     select 1
                     from contacts."contact_lists_{cid}" cl
+                    join lists l on l.cid = %s and l.id = cl.list_id
                     where cl.contact_id = c.contact_id
                 )
                 {filter_clause}
                 order by lower(email), contact_id
                 limit %s offset %s
                 """,
-                *(params + [page_size, (page - 1) * page_size]),
+                *([cid] + params + [page_size, (page - 1) * page_size]),
             )
         ]
 
@@ -2750,8 +2752,42 @@ class ContactMemberships(object):
         contact_id: int,
         email: str,
     ) -> bool:
-        contacts = SegmentContacts()._evaluate_contacts(db, cid, segment, email.lower())
-        return any(contact.get("email", "").lower() == email.lower() for contact in contacts)
+        segments: Dict[str, JsonObj | None] = {}
+        segment_get_segments(db, segment.get("parts", []), segments)
+        campaignids = segment_get_campaignids(segment, list(segments.values()))
+        hashlimit, listfactors = segment_get_params(db, cid, segment)
+        cache = Cache()
+        for hashval in range(hashlimit):
+            sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+            rows = get_segment_rows(
+                db,
+                cid,
+                hashval,
+                listfactors,
+                hashlimit,
+                rowset={email},
+            )
+            if not rows:
+                continue
+            segcounts: Dict[str, int] = {}
+            numrows = len(rows)
+            for row in rows:
+                if row.get("Email", [""])[0].lower() != email.lower():
+                    continue
+                if segment_eval_parts(
+                    segment.get("parts", []),
+                    segment.get("operator", "and"),
+                    row,
+                    segcounts,
+                    numrows,
+                    segments,
+                    sentrows,
+                    segment,
+                    hashlimit,
+                    cache,
+                ):
+                    return True
+        return False
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
         check_noadmin(req, True)
@@ -2791,12 +2827,13 @@ class ContactMemberships(object):
         ]
 
         matching_segments = []
-        for segment in json_iter(
+        segments = list(json_iter(
             db.execute(
                 "select id, cid, data - 'rawText' from segments where cid = %s order by lower(data->>'name'), id",
                 cid,
             )
-        ):
+        ))
+        for segment in segments:
             try:
                 if self._segment_matches_contact(db, cid, segment, contact_id, email):
                     matching_segments.append(
