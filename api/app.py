@@ -3964,6 +3964,7 @@ app.add_route("/api/automation-enrolments/process", automations.AutomationEnrolm
 app.add_route("/api/automation-processing-status", automations.AutomationProcessingStatus())
 app.add_route("/api/automation-trigger-events", automations.AutomationTriggerEvents())
 app.add_route("/api/automation-trigger-events/process", automations.AutomationTriggerEventProcessor())
+app.add_route("/api/automation-segment-trigger-baselines", automations.AutomationSegmentTriggerBaselines())
 app.add_route("/api/automations/{id}/enrolments/list", automations.AutomationListEnrolments())
 app.add_route("/api/automation-list-enrolments/{id}", automations.AutomationListEnrolmentStatus())
 app.add_route("/api/automations/{id}/enrolments/segment", automations.AutomationSegmentEnrolments())

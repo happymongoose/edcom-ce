@@ -19,7 +19,7 @@ from .shared.crud import (
     check_noadmin,
     get_orig,
 )
-from .shared.db import DB, JsonObj, json_obj, open_db
+from .shared.db import DB, JsonObj, json_iter, json_obj, open_db
 from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
@@ -549,6 +549,26 @@ AUTOMATION_TRIGGER_EVENT_SCHEMA = {
             "type": "integer",
             "minimum": 0,
             "maximum": 100,
+        },
+    },
+    "additionalProperties": False,
+}
+
+AUTOMATION_SEGMENT_TRIGGER_BASELINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segment_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+        },
+        "limit_segments": {
+            "type": "integer",
+            "minimum": 1,
+        },
+        "limit_buckets": {
+            "type": "integer",
+            "minimum": 1,
         },
     },
     "additionalProperties": False,
@@ -1611,6 +1631,10 @@ AUTOMATION_TRIGGER_COOLDOWN_MINUTES = 15
 AUTOMATION_TRIGGER_EVENT_LIST_DEFAULT_LIMIT = 50
 AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
 AUTOMATION_TRIGGER_FINISHED_STATUSES = ("processed", "suppressed", "failed", "enrolled")
+AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT = 10
+AUTOMATION_SEGMENT_BASELINE_MAX_SEGMENT_LIMIT = 50
+AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT = 25
+AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT = 100
 TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
 LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
 SEGMENT_TRIGGER_EVENT_TYPES = ("segment_entered", "segment_left")
@@ -4212,6 +4236,15 @@ def _automation_trigger_manual_events_enabled() -> bool:
     )
 
 
+def _automation_segment_trigger_baseline_enabled() -> bool:
+    return (os.environ.get("automation_segment_trigger_baseline_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _automation_trigger_limit(value: object) -> int:
     if value is None:
         return AUTOMATION_TRIGGER_DEFAULT_LIMIT
@@ -4228,6 +4261,29 @@ def _automation_trigger_limit(value: object) -> int:
             description="limit must be at least 1.",
         )
     return min(limit, AUTOMATION_TRIGGER_MAX_LIMIT)
+
+
+def _automation_segment_baseline_limit(
+    value: object,
+    default: int,
+    maximum: int,
+    name: str,
+) -> int:
+    if value is None:
+        return default
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation segment baseline limit",
+            description="%s must be a positive integer." % name,
+        )
+    if limit < 1:
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation segment baseline limit",
+            description="%s must be at least 1." % name,
+        )
+    return min(limit, maximum)
 
 
 def _automation_trigger_event_list_limit(value: object) -> int:
@@ -5053,6 +5109,489 @@ def _process_pending_automation_trigger_events(db: DB, cid: str, limit: int) -> 
     return result
 
 
+def _referenced_segment_trigger_ids(
+    db: DB,
+    cid: str,
+    segment_id: str | None = None,
+) -> List[str]:
+    if segment_id:
+        db.set_cid(cid)
+        if db.segments.get(segment_id) is None:
+            raise falcon.HTTPBadRequest(
+                title="Segment not found",
+                description="Segment trigger baselines require a segment from this account.",
+            )
+
+    segment_ids = set()
+    for automation in json_iter(
+        db.execute(
+            """
+            select id, cid, data
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+            order by data->>'name', id
+            """,
+            cid,
+        )
+    ):
+        published = automation.get("published") or {}
+        for trigger in _entry_triggers(published.get("entry") or {"type": "manual"}):
+            if trigger.get("type") not in SEGMENT_TRIGGER_EVENT_TYPES:
+                continue
+            trigger_segment_id = (trigger.get("segment_id") or "").strip()
+            if not trigger_segment_id:
+                continue
+            if segment_id and trigger_segment_id != segment_id:
+                continue
+            segment_ids.add(trigger_segment_id)
+
+    return sorted(segment_ids)
+
+
+def _claim_segment_trigger_baseline_snapshot(
+    db: DB,
+    cid: str,
+    segment_id: str,
+    claim_token: str,
+    now_dt: datetime,
+) -> JsonObj | None:
+    now = now_dt.isoformat() + "Z"
+    stale_before = now_dt - CLAIM_STALE_AFTER
+    snapshot_id = "%s:%s" % (cid, segment_id)
+    with db.transaction():
+        db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, data)
+            values (%s, %s, %s, 'idle', 1, null, %s)
+            on conflict (cid, segment_id) do nothing
+            """,
+            snapshot_id,
+            cid,
+            segment_id,
+            {
+                "baseline_complete": False,
+                "hashlimit_initialized": False,
+                "errors": [],
+            },
+        )
+        row = db.row(
+            """
+            select id, cid, segment_id, status, hashlimit, last_hashval, claimed_at, data
+            from automation_segment_trigger_snapshots
+            where cid = %s and segment_id = %s
+            for update
+            """,
+            cid,
+            segment_id,
+        )
+        if row is None:
+            return None
+
+        _, _, _, status, _, _, claimed_at, data = row
+        if claimed_at is not None and getattr(claimed_at, "tzinfo", None) is not None:
+            claimed_at = claimed_at.astimezone(tzutc()).replace(tzinfo=None)
+        if status == "baselining" and claimed_at is not None and claimed_at >= stale_before:
+            return None
+
+        data = data or {}
+        reset_progress = status != "baselining" and data.get("baseline_complete") is True
+        recovered = status == "baselining"
+        updated = db.row(
+            """
+            update automation_segment_trigger_snapshots
+            set status = 'baselining',
+                claim_token = %s,
+                claimed_at = %s,
+                last_started_at = %s,
+                last_hashval = case when %s then null else last_hashval end,
+                data = data || jsonb_build_object(
+                    'last_claimed_at', %s,
+                    'recovered_claim', %s
+                )
+            where cid = %s and segment_id = %s
+            returning id, cid, segment_id, status, hashlimit, last_hashval, claimed_at, data
+            """,
+            claim_token,
+            now_dt,
+            now_dt,
+            reset_progress,
+            now,
+            recovered,
+            cid,
+            segment_id,
+        )
+        if updated is None:
+            return None
+
+    snapshot_id, row_cid, row_segment_id, status, hashlimit, last_hashval, claimed_at, data = updated
+    return {
+        "id": snapshot_id,
+        "cid": row_cid,
+        "segment_id": row_segment_id,
+        "status": status,
+        "hashlimit": hashlimit,
+        "last_hashval": last_hashval,
+        "claimed_at": claimed_at.isoformat() if hasattr(claimed_at, "isoformat") else claimed_at,
+        "data": data or {},
+        "claim_token": claim_token,
+    }
+
+
+def _release_segment_trigger_baseline_snapshot(
+    db: DB,
+    cid: str,
+    segment_id: str,
+    claim_token: str,
+    status: str,
+    hashlimit: int,
+    last_hashval: int | None,
+    data_patch: JsonObj,
+) -> bool:
+    updated = db.row(
+        """
+        update automation_segment_trigger_snapshots
+        set status = %s,
+            hashlimit = %s,
+            last_hashval = %s,
+            last_completed_at = case when %s = 'completed' then now() at time zone 'utc' else last_completed_at end,
+            claimed_at = null,
+            claim_token = null,
+            data = data || %s
+        where cid = %s and segment_id = %s and claim_token = %s
+        returning id
+        """,
+        status,
+        hashlimit,
+        last_hashval,
+        status,
+        data_patch,
+        cid,
+        segment_id,
+        claim_token,
+    )
+    return updated is not None
+
+
+def _evaluate_segment_bucket_contacts(
+    db: DB,
+    cid: str,
+    segment: JsonObj,
+    hashval: int,
+    listfactors: List[str],
+    hashlimit: int,
+    campaignids: List[str],
+) -> List[tuple[int, str]]:
+    segments: Dict[str, JsonObj | None] = {}
+    segment_get_segments(db, segment["parts"], segments)
+    sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+    rows = get_segment_rows(db, cid, hashval, listfactors, hashlimit)
+
+    cache = Cache()
+    segcounts: Dict[str, int] = {}
+    numrows = len(rows)
+    emails = []
+    for row in rows:
+        if segment_eval_parts(
+            segment["parts"],
+            segment["operator"],
+            row,
+            segcounts,
+            numrows,
+            segments,
+            sentrows,
+            segment,
+            hashlimit,
+            cache,
+        ):
+            emails.append(row["Email"][0])
+
+    if not emails:
+        return []
+
+    return [
+        (contact_id, contact_email)
+        for contact_id, contact_email in db.execute(
+            f"""
+            select contact_id, email
+            from contacts."contacts_{cid}"
+            where email = any(%s)
+                and ({hashlimit} = 1 or mod(contact_id, {hashlimit}) = %s)
+            order by contact_id
+            """,
+            emails,
+            hashval,
+        )
+    ]
+
+
+def _store_segment_baseline_bucket_members(
+    db: DB,
+    cid: str,
+    segment_id: str,
+    bucket: int,
+    contacts_for_bucket: List[tuple[int, str]],
+    scan_id: str,
+) -> JsonObj:
+    now_dt = datetime.utcnow()
+    contact_ids = [contact_id for contact_id, _ in contacts_for_bucket]
+    if contact_ids:
+        deleted = db.execute(
+            """
+            delete from automation_segment_trigger_members
+            where cid = %s and segment_id = %s and bucket = %s and not (contact_id = any(%s))
+            """,
+            cid,
+            segment_id,
+            bucket,
+            contact_ids,
+        ).rowcount
+    else:
+        deleted = db.execute(
+            """
+            delete from automation_segment_trigger_members
+            where cid = %s and segment_id = %s and bucket = %s
+            """,
+            cid,
+            segment_id,
+            bucket,
+        ).rowcount
+
+    for contact_id, contact_email in contacts_for_bucket:
+        db.execute(
+            """
+            insert into automation_segment_trigger_members
+                (cid, segment_id, contact_id, contact_email, bucket, first_seen_at, last_seen_at, scan_id)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            on conflict (cid, segment_id, contact_id)
+            do update set
+                contact_email = excluded.contact_email,
+                bucket = excluded.bucket,
+                last_seen_at = excluded.last_seen_at,
+                scan_id = excluded.scan_id
+            """,
+            cid,
+            segment_id,
+            contact_id,
+            contact_email,
+            bucket,
+            now_dt,
+            now_dt,
+            scan_id,
+        )
+
+    return {
+        "members_seen": len(contacts_for_bucket),
+        "members_removed": max(0, deleted or 0),
+    }
+
+
+def _baseline_automation_segment_triggers(
+    db: DB,
+    cid: str,
+    segment_id: str | None = None,
+    limit_segments: int = AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT,
+    limit_buckets: int = AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT,
+) -> JsonObj:
+    if not _automation_segment_trigger_baseline_enabled():
+        return {
+            "enabled": False,
+            "segments_seen": 0,
+            "segments_claimed": 0,
+            "buckets_processed": 0,
+            "members_upserted": 0,
+            "members_removed": 0,
+            "events_created": 0,
+            "skipped": [],
+            "errors": [],
+        }
+
+    result: JsonObj = {
+        "enabled": True,
+        "segments_seen": 0,
+        "segments_claimed": 0,
+        "buckets_processed": 0,
+        "members_upserted": 0,
+        "members_removed": 0,
+        "events_created": 0,
+        "skipped": [],
+        "errors": [],
+    }
+    referenced_segment_ids = _referenced_segment_trigger_ids(db, cid, segment_id)
+    result["segments_seen"] = len(referenced_segment_ids)
+
+    for referenced_segment_id in referenced_segment_ids[:limit_segments]:
+        if result["buckets_processed"] >= limit_buckets:
+            break
+
+        claim_token = shortuuid.uuid()
+        snapshot = _claim_segment_trigger_baseline_snapshot(
+            db,
+            cid,
+            referenced_segment_id,
+            claim_token,
+            datetime.utcnow(),
+        )
+        if snapshot is None:
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "already_baselining",
+                })
+            continue
+
+        result["segments_claimed"] += 1
+        segment = db.segments.get(referenced_segment_id)
+        if segment is None:
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "skipped_invalid",
+                int(snapshot.get("hashlimit") or 1),
+                snapshot.get("last_hashval"),
+                {
+                    "baseline_complete": False,
+                    "last_error": "Segment not found.",
+                    "updated": _utc_now(),
+                },
+            )
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "segment_not_found",
+                })
+            continue
+
+        try:
+            if not segment.get("parts"):
+                raise ValueError("No rules in segment")
+            nested_segments: Dict[str, JsonObj | None] = {}
+            segment_get_segments(db, segment["parts"], nested_segments)
+            campaignids = segment_get_campaignids(segment, list(nested_segments.values()))
+            hashlimit, listfactors = segment_get_params(db, cid, segment)
+        except Exception as e:
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "skipped_invalid",
+                int(snapshot.get("hashlimit") or 1),
+                snapshot.get("last_hashval"),
+                {
+                    "baseline_complete": False,
+                    "last_error": str(e)[:512],
+                    "updated": _utc_now(),
+                },
+            )
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "invalid_segment",
+                    "description": str(e)[:256],
+                })
+            continue
+
+        snapshot_data = snapshot.get("data") or {}
+        stored_hashlimit = int(snapshot.get("hashlimit") or 1)
+        last_hashval = snapshot.get("last_hashval")
+        if snapshot_data.get("hashlimit_initialized") and stored_hashlimit != hashlimit:
+            db.execute(
+                """
+                delete from automation_segment_trigger_members
+                where cid = %s and segment_id = %s
+                """,
+                cid,
+                referenced_segment_id,
+            )
+            last_hashval = None
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "hashlimit_changed_rebaseline",
+                    "previous_hashlimit": stored_hashlimit,
+                    "hashlimit": hashlimit,
+                })
+
+        start_bucket = 0 if last_hashval is None else int(last_hashval) + 1
+        scan_id = shortuuid.uuid()
+        current_bucket = start_bucket
+        segment_buckets_processed = 0
+        try:
+            while current_bucket < hashlimit and result["buckets_processed"] < limit_buckets:
+                bucket_contacts = _evaluate_segment_bucket_contacts(
+                    db,
+                    cid,
+                    segment,
+                    current_bucket,
+                    listfactors,
+                    hashlimit,
+                    campaignids,
+                )
+                bucket_result = _store_segment_baseline_bucket_members(
+                    db,
+                    cid,
+                    referenced_segment_id,
+                    current_bucket,
+                    bucket_contacts,
+                    scan_id,
+                )
+                result["members_upserted"] += bucket_result["members_seen"]
+                result["members_removed"] += bucket_result["members_removed"]
+                result["buckets_processed"] += 1
+                segment_buckets_processed += 1
+                last_hashval = current_bucket
+                current_bucket += 1
+        except Exception as e:
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "idle",
+                hashlimit,
+                last_hashval,
+                {
+                    "baseline_complete": False,
+                    "hashlimit_initialized": True,
+                    "last_error": str(e)[:512],
+                    "updated": _utc_now(),
+                },
+            )
+            if len(result["errors"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["errors"].append({
+                    "segment_id": referenced_segment_id,
+                    "description": str(e)[:256],
+                })
+            continue
+
+        complete = current_bucket >= hashlimit
+        _release_segment_trigger_baseline_snapshot(
+            db,
+            cid,
+            referenced_segment_id,
+            claim_token,
+            "completed" if complete else "idle",
+            hashlimit,
+            None if complete else last_hashval,
+            {
+                "baseline_complete": complete,
+                "hashlimit_initialized": True,
+                "last_scan_id": scan_id,
+                "last_bucket_processed": last_hashval,
+                "buckets_processed_last_call": segment_buckets_processed,
+                "updated": _utc_now(),
+                "last_error": None,
+            },
+        )
+
+    return result
+
+
 def _eligible_automation_enrolments(
     db: DB,
     cid: str,
@@ -5708,6 +6247,43 @@ class AutomationTriggerEventProcessor(object):
             db,
             cid,
             limit,
+        )
+
+
+class AutomationSegmentTriggerBaselines(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc") or {}
+        if not isinstance(doc, dict):
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+        _validate_doc(doc, AUTOMATION_SEGMENT_TRIGGER_BASELINE_SCHEMA)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit_segments = _automation_segment_baseline_limit(
+            doc.get("limit_segments"),
+            AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT,
+            AUTOMATION_SEGMENT_BASELINE_MAX_SEGMENT_LIMIT,
+            "limit_segments",
+        )
+        limit_buckets = _automation_segment_baseline_limit(
+            doc.get("limit_buckets"),
+            AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT,
+            AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT,
+            "limit_buckets",
+        )
+
+        req.context["result"] = _baseline_automation_segment_triggers(
+            db,
+            cid,
+            doc.get("segment_id"),
+            limit_segments,
+            limit_buckets,
         )
 
 
