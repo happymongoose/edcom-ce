@@ -112,6 +112,9 @@ class TestSegmentContacts(test_base.TestBase):
         assert first_page["total_pages"] == 2
         assert len(first_page["contacts"]) == 1
         assert set(first_page["contacts"][0].keys()) == {"contact_id", "email", "added"}
+        assert first_page["contacts"][0]["added"].endswith("Z")
+        assert "1970" not in first_page["contacts"][0]["added"]
+        assert self.db.segments.get(segment["id"])["count"] == 2
 
         second_page = self.user_get(
             "/api/segments/%s/contacts?page=2&page_size=1" % segment["id"]
@@ -134,3 +137,22 @@ class TestSegmentContacts(test_base.TestBase):
             },
         )
         assert result.status_code == 403
+
+    def test_contact_memberships_include_lists_and_matching_segments(self):
+        suffix = shortuuid.uuid().lower()
+        prefix = "segment-memberships-%s" % suffix
+        contact_list = self.create_contact_list()
+        email = "%s@example.com" % prefix
+        self.add_contact(contact_list["id"], email)
+        matching_segment = self.create_segment(prefix)
+        non_matching_segment = self.create_segment("segment-memberships-no-match-%s" % suffix)
+
+        result = self.user_get("/api/contactdata/%s/memberships" % email)
+
+        assert result["email"] == email
+        assert [
+            item["id"] for item in result["lists"]
+        ] == [contact_list["id"]]
+        segment_ids = [item["id"] for item in result["segments"]]
+        assert matching_segment["id"] in segment_ids
+        assert non_matching_segment["id"] not in segment_ids

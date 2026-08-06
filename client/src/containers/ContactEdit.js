@@ -12,6 +12,7 @@ import Select2 from 'react-select2-wrapper';
 import _ from 'lodash';
 import notify from "../utils/notify";
 import moment from "moment";
+import { automationImpersonatedHref } from "./Automation";
 
 const builtIn = ['Email', 'Opened', 'Clicked', 'Unsubscribed', 'Bounced', 'Complained', 'Soft Bounced'];
 
@@ -37,13 +38,17 @@ class ContactEdit extends Component {
       emailHistory: null,
       emailHistoryPage: 1,
       isEmailHistoryLoading: false,
+      memberships: null,
+      isMembershipsLoading: false,
     };
     this.emailHistoryRequest = 0;
+    this.membershipsRequest = 0;
   }
 
   componentDidMount() {
     if (this.props.data && this.props.data.email) {
       this.loadEmailHistory(1);
+      this.loadMemberships();
     }
   }
 
@@ -52,6 +57,7 @@ class ContactEdit extends Component {
     const nextEmail = nextProps.data && nextProps.data.email;
     if (nextEmail && nextEmail !== currentEmail) {
       this.loadEmailHistory(1, nextEmail);
+      this.loadMemberships(nextEmail);
     }
   }
 
@@ -206,6 +212,88 @@ class ContactEdit extends Component {
       return;
     }
     this.loadEmailHistory(this.state.emailHistoryPage + 1);
+  }
+
+  loadMemberships = async email => {
+    const contactEmail = email || (this.props.data && this.props.data.email);
+    if (!contactEmail) {
+      return;
+    }
+
+    const requestId = ++this.membershipsRequest;
+    this.setState({isMembershipsLoading: true});
+    try {
+      const response = await axios.get('/api/contactdata/' + encodeURIComponent(contactEmail) + '/memberships');
+      if (requestId === this.membershipsRequest) {
+        this.setState({memberships: response.data});
+      }
+    } catch (error) {
+      if (requestId === this.membershipsRequest) {
+        notify.show(errorMessage(error, 'Unable to load contact memberships'), 'error');
+      }
+    } finally {
+      if (requestId === this.membershipsRequest) {
+        this.setState({isMembershipsLoading: false});
+      }
+    }
+  }
+
+  renderMembershipList(items, emptyText, hrefForItem) {
+    if (!items || !items.length) {
+      return <p>{emptyText}</p>;
+    }
+    return (
+      <ul className="list-unstyled">
+        {
+          _.map(items, item =>
+            <li key={item.id} style={{marginBottom: '6px'}}>
+              <a href={hrefForItem(item)} target="_blank" rel="noopener noreferrer">
+                {item.name || item.id}
+              </a>
+              {
+                _.isNumber(item.count) &&
+                <span className="text-muted"> ({item.count.toLocaleString()} contacts)</span>
+              }
+            </li>
+          )
+        }
+      </ul>
+    );
+  }
+
+  renderMemberships() {
+    const memberships = this.state.memberships;
+    if (this.state.isMembershipsLoading && !memberships) {
+      return <p>Loading contact memberships...</p>;
+    }
+
+    const impersonateId = this.props.loggedInImpersonate;
+    return (
+      <div>
+        <Row>
+          <Col xs={12} md={6}>
+            <h5>Contact lists</h5>
+            {this.renderMembershipList(
+              (memberships && memberships.lists) || [],
+              'This contact is not currently in any contact lists.',
+              item => automationImpersonatedHref('/contacts/find?id=' + item.id, impersonateId)
+            )}
+          </Col>
+          <Col xs={12} md={6}>
+            <h5>Segments</h5>
+            {this.renderMembershipList(
+              (memberships && memberships.segments) || [],
+              'This contact is not currently in any segments.',
+              item => automationImpersonatedHref('/segments/' + item.id + '/contacts?search=' + encodeURIComponent(this.props.data.email), impersonateId)
+            )}
+          </Col>
+        </Row>
+        {
+          this.state.isMembershipsLoading &&
+          <p>Refreshing contact memberships...</p>
+        }
+      </div>
+    );
   }
 
   renderEmailHistory() {
@@ -385,6 +473,10 @@ class ContactEdit extends Component {
                   }
                 </Row>
               </div>
+            </EDFormBox>
+            <EDFormBox space>
+              <h4>List and Segment Memberships</h4>
+              {this.renderMemberships()}
             </EDFormBox>
             <EDFormBox space>
               <h4>Automation Enrolment</h4>

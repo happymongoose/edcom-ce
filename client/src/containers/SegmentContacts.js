@@ -19,16 +19,21 @@ function errorMessage(error, fallback) {
 }
 
 export default class SegmentContacts extends Component {
-  state = {
-    segment: null,
-    contacts: [],
-    page: 1,
-    pageSize: 50,
-    total: 0,
-    totalPages: 1,
-    search: "",
-    appliedSearch: "",
-    isLoading: false,
+  constructor(props) {
+    super(props);
+    const params = new URLSearchParams(props.location.search);
+    const search = params.get("search") || "";
+    this.state = {
+      segment: null,
+      contacts: [],
+      page: 1,
+      pageSize: 50,
+      total: 0,
+      totalPages: 1,
+      search: search,
+      appliedSearch: search,
+      isLoading: false,
+    };
   }
 
   componentDidMount() {

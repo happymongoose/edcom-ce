@@ -2605,7 +2605,7 @@ class SegmentContacts(object):
             {
                 "contact_id": contact_id,
                 "email": email,
-                "added": added.isoformat() + "Z" if hasattr(added, "isoformat") else added,
+                "added": datetime.utcfromtimestamp(added).isoformat() + "Z" if added else None,
             }
             for contact_id, email, added in db.execute(
                 f"""
@@ -2641,6 +2641,14 @@ class SegmentContacts(object):
             )
 
         total = len(contacts)
+        if segment.get("count") != total:
+            db.segments.patch(
+                segment["id"],
+                {
+                    "count": total,
+                    "last_update": datetime.utcnow().isoformat() + "Z",
+                },
+            )
         offset = (page - 1) * page_size
         req.context["result"] = {
             "segment": {
@@ -2654,6 +2662,112 @@ class SegmentContacts(object):
             "total": total,
             "total_pages": max(1, (total + page_size - 1) // page_size),
             "search": search,
+        }
+
+
+class ContactMemberships(object):
+
+    def _segment_matches_contact(
+        self,
+        db: DB,
+        cid: str,
+        segment: JsonObj,
+        contact_id: int,
+        email: str,
+    ) -> bool:
+        hashlimit, listfactors = segment_get_params(db, cid, segment)
+        segments: Dict[str, JsonObj | None] = {}
+        segment_get_segments(db, segment.get("parts", []), segments)
+        campaignids = segment_get_campaignids(segment, list(segments.values()))
+
+        cache = Cache()
+        for hashval in range(hashlimit):
+            sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+            rows = get_segment_rows(db, cid, hashval, listfactors, hashlimit, rowset={email})
+            if not rows:
+                continue
+
+            segcounts: Dict[str, int] = {}
+            numrows = len(rows)
+            if any(
+                segment_eval_parts(
+                    segment.get("parts", []),
+                    segment.get("operator", "and"),
+                    row,
+                    segcounts,
+                    numrows,
+                    segments,
+                    sentrows,
+                    segment,
+                    hashlimit,
+                    cache,
+                )
+                for row in rows
+            ):
+                return True
+        return False
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        contact_id = db.single(
+            f"""
+            select contact_id
+            from contacts."contacts_{cid}"
+            where email = %s
+            """,
+            email,
+        )
+        if contact_id is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found", description="Contact not found"
+            )
+
+        lists = [
+            {
+                "id": list_id,
+                "name": name,
+                "count": count,
+            }
+            for list_id, name, count in db.execute(
+                f"""
+                select l.id, l.data->>'name', l.data->'count'
+                from lists l
+                join contacts."contact_lists_{cid}" cl on cl.list_id = l.id
+                where l.cid = %s and cl.contact_id = %s
+                order by lower(l.data->>'name'), l.id
+                """,
+                cid,
+                contact_id,
+            )
+        ]
+
+        matching_segments = []
+        for segment in json_iter(
+            db.execute(
+                "select id, cid, data - 'rawText' from segments where cid = %s order by lower(data->>'name'), id",
+                cid,
+            )
+        ):
+            try:
+                if self._segment_matches_contact(db, cid, segment, contact_id, email):
+                    matching_segments.append(
+                        {
+                            "id": segment["id"],
+                            "name": segment.get("name", segment["id"]),
+                            "count": segment.get("count"),
+                        }
+                    )
+            except Exception as exc:
+                log.info("skipping segment membership evaluation for %s: %s", segment.get("id"), exc)
+
+        req.context["result"] = {
+            "contact_id": contact_id,
+            "email": email,
+            "lists": lists,
+            "segments": matching_segments,
         }
 
 
