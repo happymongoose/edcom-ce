@@ -7388,3 +7388,88 @@ class AutomationEnrolmentRunNext(object):
             enrolment_id,
             skip_wait,
         )
+
+
+class AutomationEnrolmentCancel(object):
+
+    CANCELLABLE_STATUSES = {
+        "ready",
+        "waiting",
+        "held",
+        "paused_ready",
+        "paused_waiting",
+    }
+
+    def on_post(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        enrolment_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        now = _iso_datetime(datetime.utcnow())
+
+        enrolment = _enrolment_obj(
+            db.row(
+                f"""
+                select e.id, e.cid, e.automation_id, e.contact_id, e.contact_email, e.data
+                from automation_enrolments e
+                join contacts."contacts_{cid}" c on c.contact_id = e.contact_id
+                where e.cid = %s and e.automation_id = %s and e.id = %s
+                """,
+                cid,
+                id,
+                enrolment_id,
+            )
+        )
+        if enrolment is None:
+            raise falcon.HTTPForbidden()
+
+        status = enrolment.get("status") or ""
+        if status == "running":
+            raise falcon.HTTPBadRequest(
+                title="Automation enrolment is currently running",
+                description="This enrolment is currently running and cannot be cancelled until the current execution attempt finishes.",
+            )
+        if status not in self.CANCELLABLE_STATUSES:
+            raise falcon.HTTPBadRequest(
+                title="Automation enrolment cannot be cancelled",
+                description="Only ready, waiting, held, or paused enrolments can be cancelled.",
+            )
+
+        cancelled_metadata = {
+            "source": "contact_edit",
+            "previous_status": status,
+        }
+        updated = _enrolment_obj(
+            db.row(
+                """
+                update automation_enrolments
+                set data = data || jsonb_build_object(
+                    'status', 'cancelled',
+                    'modified', %s,
+                    'cancelled_at', %s,
+                    'cancelled_by_uid', %s,
+                    'cancelled_metadata', %s::jsonb,
+                    'retry_after', null,
+                    'retry_count', 0,
+                    'last_error', null
+                )
+                where cid = %s and automation_id = %s and id = %s
+                returning id, cid, automation_id, contact_id, contact_email, data
+                """,
+                now,
+                now,
+                req.context.get("uid"),
+                cancelled_metadata,
+                cid,
+                id,
+                enrolment_id,
+            )
+        )
+        user_log(req, "remove", "cancelled automation enrolment ", "automations", id, ".")
+        req.context["result"] = updated

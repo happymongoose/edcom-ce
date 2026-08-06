@@ -545,6 +545,18 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         )
 
+    def contact_automation_enrolments(self, email, limit=None):
+        url = "/api/contactdata/%s/automation-enrolments" % email
+        if limit is not None:
+            url += "?limit=%s" % limit
+        return self.simulate_get(url, headers=self.headers())
+
+    def cancel_enrolment(self, automation_id, enrolment_id, headers=None):
+        return self.simulate_post(
+            "/api/automations/%s/enrolments/%s/cancel" % (automation_id, enrolment_id),
+            headers=headers or self.headers(),
+        )
+
     def process_enrolments(self, **doc):
         self.set_customer_automation_processing(True)
         return self.simulate_post(
@@ -1009,6 +1021,154 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["step_run"]["status"], "succeeded")
         self.assert_claim_cleared(result.json["enrolment"])
         self.assert_claim_cleared(self.enrolment_data(enrolment["id"]))
+
+        self.cleanup(automation["id"])
+
+    def test_contact_automation_enrolments_lists_active_and_terminal(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(
+            reentry="multiple",
+            nodes=[
+                {
+                    "id": "node_add_tag_1",
+                    "type": "add_tag",
+                    "label": "Add first tag",
+                    "draft_tag": "contact-status-first",
+                },
+                {
+                    "id": "node_exit_1",
+                    "type": "exit",
+                    "label": "Exit automation",
+                },
+            ],
+        )
+        terminal = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            terminal["id"],
+            {"status": "completed", "current_node_id": None, "source": "manual-terminal"},
+        )
+        active = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(
+            active["id"],
+            {"status": "waiting", "current_node_id": "node_exit_1", "source": "manual-test"},
+        )
+
+        result = self.contact_automation_enrolments(email)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        records = result.json["records"]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["id"], active["id"])
+        self.assertEqual(records[0]["status"], "waiting")
+        self.assertEqual(records[0]["progress"], 50)
+        self.assertEqual(records[0]["current_node_label"], "Exit automation")
+        self.assertEqual(records[0]["current_node_type"], "exit")
+        self.assertEqual(records[0]["source"], "manual-test")
+        self.assertTrue(records[0]["cancellable"])
+        self.assertEqual(records[1]["id"], terminal["id"])
+        self.assertEqual(records[1]["progress"], 100)
+        self.assertFalse(records[1]["cancellable"])
+        self.assertNotIn("published", records[0])
+        self.assertNotIn("data", records[0])
+
+        self.cleanup(automation["id"])
+
+    def test_contact_automation_enrolments_missing_current_node_safe_fallback(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.patch_enrolment_data(enrolment["id"], {"current_node_id": "missing-node"})
+
+        result = self.contact_automation_enrolments(email)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        record = result.json["records"][0]
+        self.assertIsNone(record["progress"])
+        self.assertEqual(record["current_node_label"], "Unknown step")
+        self.assertEqual(record["current_node_type"], "")
+
+        self.cleanup(automation["id"])
+
+    def test_contact_automation_enrolments_are_account_scoped(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        self.enrol(automation["id"], email)
+        other_cid = self.create_scheduler_candidate_account(status="ready")
+
+        result = self.contact_automation_enrolments(email)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(len(result.json["records"]), 1)
+        self.assertNotEqual(result.json["records"][0]["automation_id"], other_cid)
+
+        self.cleanup(automation["id"])
+
+    def test_cancel_active_automation_enrolment_statuses(self):
+        for status in ("ready", "waiting", "held", "paused_ready", "paused_waiting"):
+            email, _ = self.create_contact()
+            automation = self.create_automation(tag="cancel-%s" % status)
+            enrolment = self.enrol(automation["id"], email)
+            self.patch_enrolment_data(enrolment["id"], {"status": status})
+
+            result = self.cancel_enrolment(automation["id"], enrolment["id"])
+
+            self.assertEqual(result.status_code, 200, result.text)
+            data = self.enrolment_data(enrolment["id"])
+            self.assertEqual(data["status"], "cancelled")
+            self.assertEqual(data["cancelled_by_uid"], self.user_cookie["uid"])
+            self.assertIsNotNone(data.get("cancelled_at"))
+            self.assertEqual(data["cancelled_metadata"]["previous_status"], status)
+
+            self.cleanup(automation["id"])
+
+    def test_cancel_running_and_terminal_automation_enrolments_fails(self):
+        for status in ("running", "completed", "exited", "cancelled", "failed"):
+            email, _ = self.create_contact()
+            automation = self.create_automation(tag="cancel-blocked-%s" % status)
+            enrolment = self.enrol(automation["id"], email)
+            self.patch_enrolment_data(enrolment["id"], {"status": status})
+
+            result = self.cancel_enrolment(automation["id"], enrolment["id"])
+
+            self.assertEqual(result.status_code, 400)
+            if status == "running":
+                self.assertIn("currently running", result.text)
+            else:
+                self.assertIn("cannot be cancelled", result.text)
+            self.assertEqual(self.enrolment_data(enrolment["id"])["status"], status)
+
+            self.cleanup(automation["id"])
+
+    def test_cancel_automation_enrolment_is_account_scoped(self):
+        other_cid = self.create_scheduler_candidate_account(status="ready")
+        automation_id = self.db.single(
+            "select id from automations where cid = %s limit 1",
+            other_cid,
+        )
+        enrolment_id = self.db.single(
+            "select id from automation_enrolments where cid = %s limit 1",
+            other_cid,
+        )
+
+        result = self.cancel_enrolment(automation_id, enrolment_id)
+
+        self.assertEqual(result.status_code, 403)
+
+    def test_cancel_automation_enrolment_preserves_step_runs(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        enrolment = self.enrol(automation["id"], email)
+        run = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(run.status_code, 200, run.text)
+        before = self.step_runs(automation["id"], enrolment["id"])
+        self.assertEqual(len(before), 1)
+
+        result = self.cancel_enrolment(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        after = self.step_runs(automation["id"], enrolment["id"])
+        self.assertEqual([row[0] for row in after], [row[0] for row in before])
+        self.assertEqual(self.enrolment_data(enrolment["id"])["status"], "cancelled")
 
         self.cleanup(automation["id"])
 

@@ -650,6 +650,136 @@ class ContactEmailHistory(object):
         }
 
 
+CONTACT_AUTOMATION_ACTIVE_STATUSES = {
+    "ready",
+    "waiting",
+    "held",
+    "paused_ready",
+    "paused_waiting",
+    "running",
+}
+
+CONTACT_AUTOMATION_CANCELLABLE_STATUSES = {
+    "ready",
+    "waiting",
+    "held",
+    "paused_ready",
+    "paused_waiting",
+}
+
+
+def _automation_enrolment_progress(
+    status: str,
+    current_node_id: str | None,
+    published: JsonObj | None,
+) -> Tuple[int | None, str, str]:
+    nodes = (published or {}).get("nodes") or []
+    if status in ("completed", "exited"):
+        return 100, "", ""
+    if not current_node_id:
+        return None, "", ""
+
+    for index, node in enumerate(nodes):
+        if node.get("id") == current_node_id:
+            count = len(nodes)
+            progress = int(index * 100 / count) if count else None
+            return progress, node.get("label") or "", node.get("type") or ""
+    return None, "Unknown step", ""
+
+
+class ContactAutomationEnrolments(object):
+
+    DEFAULT_LIMIT = 25
+    MAX_LIMIT = 100
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit = max(1, min(req.get_param_as_int("limit") or self.DEFAULT_LIMIT, self.MAX_LIMIT))
+
+        contact_id = db.single(
+            f"""
+            select contact_id
+            from contacts."contacts_{cid}"
+            where email = %s
+            """,
+            email,
+        )
+        if contact_id is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found", description="Contact not found"
+            )
+
+        records = []
+        for (
+            enrolment_id,
+            automation_id,
+            automation_name,
+            automation_status,
+            contact_email,
+            enrolment_data,
+            published,
+        ) in db.execute(
+            """
+            select
+                e.id,
+                e.automation_id,
+                a.data->>'name',
+                a.data->>'status',
+                e.contact_email,
+                e.data,
+                a.data->'published'
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            where e.cid = %s and e.contact_id = %s
+            order by
+                case when e.data->>'status' = any(%s) then 0 else 1 end,
+                coalesce(
+                    nullif(e.data->>'modified', '')::timestamptz,
+                    nullif(e.data->>'created', '')::timestamptz
+                ) desc nulls last,
+                e.id desc
+            limit %s
+            """,
+            cid,
+            contact_id,
+            list(CONTACT_AUTOMATION_ACTIVE_STATUSES),
+            limit,
+        ):
+            status = enrolment_data.get("status") or ""
+            current_node_id = enrolment_data.get("current_node_id")
+            progress, node_label, node_type = _automation_enrolment_progress(
+                status,
+                current_node_id,
+                published,
+            )
+            records.append(
+                {
+                    "id": enrolment_id,
+                    "automation_id": automation_id,
+                    "automation_name": automation_name or automation_id,
+                    "automation_status": automation_status or "",
+                    "contact_email": contact_email,
+                    "status": status,
+                    "progress": progress,
+                    "current_node_id": current_node_id,
+                    "current_node_label": node_label,
+                    "current_node_type": node_type,
+                    "started_at": enrolment_data.get("created"),
+                    "updated_at": enrolment_data.get("modified") or enrolment_data.get("created"),
+                    "source": enrolment_data.get("source") or "",
+                    "cancellable": status in CONTACT_AUTOMATION_CANCELLABLE_STATUSES,
+                }
+            )
+
+        req.context["result"] = {
+            "records": records,
+            "limit": limit,
+        }
+
+
 class ContactsAll(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:

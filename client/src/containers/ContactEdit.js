@@ -4,7 +4,7 @@ import LoaderPanel from "../components/LoaderPanel";
 import LoaderButton from "../components/LoaderButton";
 import withLoadSave from "../components/LoadSave";
 import { FormControlLabel, SelectLabel } from "../components/FormControls";
-import { Button, Row, Col, Table } from "react-bootstrap";
+import { Button, Row, Col, Table, Modal } from "react-bootstrap";
 import SaveNavbar from "../components/SaveNavbar";
 import { EDFormSection, EDFormBox } from "../components/EDDOM";
 import parse from "../utils/parse";
@@ -40,15 +40,21 @@ class ContactEdit extends Component {
       isEmailHistoryLoading: false,
       memberships: null,
       isMembershipsLoading: false,
+      automationEnrolments: null,
+      isAutomationEnrolmentsLoading: false,
+      cancellingEnrolment: null,
+      isCancellingAutomation: false,
     };
     this.emailHistoryRequest = 0;
     this.membershipsRequest = 0;
+    this.automationEnrolmentsRequest = 0;
   }
 
   componentDidMount() {
     if (this.props.data && this.props.data.email) {
       this.loadEmailHistory(1);
       this.loadMemberships();
+      this.loadAutomationEnrolments();
     }
   }
 
@@ -58,6 +64,7 @@ class ContactEdit extends Component {
     if (nextEmail && nextEmail !== currentEmail) {
       this.loadEmailHistory(1, nextEmail);
       this.loadMemberships(nextEmail);
+      this.loadAutomationEnrolments(nextEmail);
     }
   }
 
@@ -159,10 +166,64 @@ class ContactEdit extends Component {
         email: this.props.data.email,
       });
       notify.show('Contact added to automation', 'success');
+      this.loadAutomationEnrolments();
     } catch (error) {
       notify.show(errorMessage(error, 'Unable to add contact to automation'), 'error');
     } finally {
       this.setState({isEnrolling: false});
+    }
+  }
+
+  loadAutomationEnrolments = async email => {
+    const contactEmail = email || (this.props.data && this.props.data.email);
+    if (!contactEmail) {
+      return;
+    }
+
+    const requestId = ++this.automationEnrolmentsRequest;
+    this.setState({isAutomationEnrolmentsLoading: true});
+    try {
+      const response = await axios.get('/api/contactdata/' + encodeURIComponent(contactEmail) + '/automation-enrolments');
+      if (requestId === this.automationEnrolmentsRequest) {
+        this.setState({automationEnrolments: response.data});
+      }
+    } catch (error) {
+      if (requestId === this.automationEnrolmentsRequest) {
+        notify.show(errorMessage(error, 'Unable to load automation enrolments'), 'error');
+      }
+    } finally {
+      if (requestId === this.automationEnrolmentsRequest) {
+        this.setState({isAutomationEnrolmentsLoading: false});
+      }
+    }
+  }
+
+  confirmCancelAutomation = enrolment => {
+    this.setState({cancellingEnrolment: enrolment});
+  }
+
+  closeCancelAutomation = () => {
+    if (!this.state.isCancellingAutomation) {
+      this.setState({cancellingEnrolment: null});
+    }
+  }
+
+  cancelAutomation = async () => {
+    const enrolment = this.state.cancellingEnrolment;
+    if (!enrolment) {
+      return;
+    }
+
+    this.setState({isCancellingAutomation: true});
+    try {
+      await axios.post('/api/automations/' + enrolment.automation_id + '/enrolments/' + enrolment.id + '/cancel');
+      notify.show('Automation pass ended', 'success');
+      this.setState({cancellingEnrolment: null});
+      this.loadAutomationEnrolments();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to end automation'), 'error');
+    } finally {
+      this.setState({isCancellingAutomation: false});
     }
   }
 
@@ -373,6 +434,86 @@ class ContactEdit extends Component {
     );
   }
 
+  renderAutomationEnrolments() {
+    const data = this.state.automationEnrolments;
+    const records = (data && data.records) || [];
+
+    if (this.state.isAutomationEnrolmentsLoading && !data) {
+      return <p>Loading automation enrolments...</p>;
+    }
+
+    if (!records.length) {
+      return (
+        <div>
+          <p>This contact is not currently or recently enrolled in any automations.</p>
+          {
+            this.state.isAutomationEnrolmentsLoading &&
+            <p>Refreshing automation enrolments...</p>
+          }
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <Table responsive className="space15">
+          <thead>
+            <tr>
+              <th>Automation</th>
+              <th>Status</th>
+              <th>Progress</th>
+              <th>Current step</th>
+              <th>Started</th>
+              <th>Updated</th>
+              <th>Source</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              _.map(records, enrolment => {
+                const currentStep = enrolment.current_node_label ?
+                  enrolment.current_node_label + (enrolment.current_node_type ? ' (' + enrolment.current_node_type + ')' : '')
+                  :
+                  '';
+                const terminal = _.includes(['completed', 'exited'], enrolment.status);
+                return (
+                  <tr key={enrolment.id}>
+                    <td>{enrolment.automation_name}</td>
+                    <td>{enrolment.status}</td>
+                    <td>{_.isNumber(enrolment.progress) ? enrolment.progress + '%' : 'Unknown'}</td>
+                    <td>{currentStep || (terminal ? 'Complete' : 'Unknown')}</td>
+                    <td>{enrolment.started_at ? moment(enrolment.started_at).format('l LTS') : ''}</td>
+                    <td>{enrolment.updated_at ? moment(enrolment.updated_at).format('l LTS') : ''}</td>
+                    <td>{enrolment.source}</td>
+                    <td>
+                      {
+                        enrolment.cancellable ?
+                          <Button
+                            type="button"
+                            bsStyle="danger"
+                            onClick={this.confirmCancelAutomation.bind(null, enrolment)}
+                          >
+                            End automation
+                          </Button>
+                        :
+                          null
+                      }
+                    </td>
+                  </tr>
+                );
+              })
+            }
+          </tbody>
+        </Table>
+        {
+          this.state.isAutomationEnrolmentsLoading &&
+          <p>Refreshing automation enrolments...</p>
+        }
+      </div>
+    );
+  }
+
   render() {
     var tagitems = _.map(_.filter(this.props.tags, l => !_.find(this.props.data.tags, id => id === l)), t => ({id: t, text: t}));
     var fields = _.filter(this.props.allfields, f => this.isValidNewField(f));
@@ -507,10 +648,44 @@ class ContactEdit extends Component {
               }
             </EDFormBox>
             <EDFormBox space>
+              <h4>Automation Status</h4>
+              {this.renderAutomationEnrolments()}
+            </EDFormBox>
+            <EDFormBox space>
               <h4>Recent automation and transactional emails</h4>
               {this.renderEmailHistory()}
             </EDFormBox>
           </EDFormSection>
+          <Modal show={!!this.state.cancellingEnrolment} onHide={this.closeCancelAutomation}>
+            <Modal.Header closeButton>
+              <Modal.Title>End automation?</Modal.Title>
+            </Modal.Header>
+            <Modal.Body>
+              {
+                this.state.cancellingEnrolment &&
+                <p>
+                  This will cancel this contact&apos;s current pass through {this.state.cancellingEnrolment.automation_name}. History will be kept.
+                </p>
+              }
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                type="button"
+                bsStyle="danger"
+                disabled={this.state.isCancellingAutomation}
+                onClick={this.cancelAutomation}
+              >
+                {this.state.isCancellingAutomation ? 'Ending...' : 'End automation'}
+              </Button>
+              <Button
+                type="button"
+                disabled={this.state.isCancellingAutomation}
+                onClick={this.closeCancelAutomation}
+              >
+                Cancel
+              </Button>
+            </Modal.Footer>
+          </Modal>
         </LoaderPanel>
       </SaveNavbar>
     );

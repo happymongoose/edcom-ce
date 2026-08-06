@@ -3927,6 +3927,7 @@ app.add_route("/api/domainthrottles/{id}", DomainThrottle())
 app.add_route("/api/contactexport", lists.ContactExport())
 app.add_route("/api/contacts", lists.ContactsAll())
 app.add_route("/api/contactdata/{email}/email-history", lists.ContactEmailHistory())
+app.add_route("/api/contactdata/{email}/automation-enrolments", lists.ContactAutomationEnrolments())
 app.add_route("/api/contactdata/{email}/memberships", lists.ContactMemberships())
 app.add_route("/api/contactdata/{email}", lists.ContactData())
 app.add_route("/api/recenttags", lists.RecentTags())
@@ -4005,6 +4006,10 @@ app.add_route("/api/automations/{id}/history", automations.AutomationHistory())
 app.add_route(
     "/api/automations/{id}/enrolments/{enrolment_id}/run-next",
     automations.AutomationEnrolmentRunNext(),
+)
+app.add_route(
+    "/api/automations/{id}/enrolments/{enrolment_id}/cancel",
+    automations.AutomationEnrolmentCancel(),
 )
 app.add_route("/api/messages", funnels.Messages())
 app.add_route("/api/messages/{id}", funnels.Message())
