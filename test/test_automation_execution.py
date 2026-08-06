@@ -1893,6 +1893,54 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_send_email_preflight_body_detection_by_editor_type(self):
+        self.assign_single_debug_route()
+        self.add_verified_sender_domain()
+        cases = [
+            ("raw", "", [], True),
+            ("raw", "<p>Raw body</p>", [], False),
+            ("wysiwyg", "", [], True),
+            ("wysiwyg", "<p>WYSIWYG body</p>", [], False),
+            ("beefree", '{"page": {"body": {}}}', [], True),
+            ("beefree", '{"html": "<p>BeeFree body</p>"}', [], False),
+            ("", "", [], True),
+            ("", "", [{"type": "text", "html": "<p>Legacy body</p>"}], False),
+        ]
+        created_automation_ids = []
+        try:
+            for email_type, raw_text, parts, should_error in cases:
+                with self.subTest(email_type=email_type, should_error=should_error):
+                    automation = self.create_send_email_automation()
+                    created_automation_ids.append(automation["id"])
+                    self.db.execute(
+                        """
+                        update automation_emails
+                        set data = data || %s
+                        where cid = %s and automation_id = %s and id = %s
+                        """,
+                        {
+                            "type": email_type,
+                            "rawText": raw_text,
+                            "parts": parts,
+                            "bodyStyle": {},
+                        },
+                        self.user_cookie["cid"],
+                        automation["id"],
+                        automation["execution_email_id"],
+                    )
+
+                    result = self.preflight(automation["id"], "published")
+                    codes = {error["code"] for error in result["nodes"][0]["errors"]}
+
+                    if should_error:
+                        self.assertIn("missing_body", codes)
+                    else:
+                        self.assertNotIn("missing_body", codes)
+                        self.assertTrue(result["ready"])
+        finally:
+            if created_automation_ids:
+                self.cleanup(*created_automation_ids)
+
     def test_send_email_preflight_no_route_and_multiple_route_errors(self):
         self.add_verified_sender_domain()
         automation = self.create_send_email_automation()

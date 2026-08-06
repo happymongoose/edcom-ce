@@ -1,6 +1,7 @@
 import falcon
 import copy
 import email.utils
+import json
 import logging
 import os
 import shortuuid
@@ -1692,7 +1693,13 @@ def _automation_email_has_body(email_doc: JsonObj) -> bool:
     email_type = email_doc.get("type", "raw")
     raw = email_doc.get("rawText")
     parts = email_doc.get("parts") or []
-    if email_type in ("raw", "wysiwyg", "beefree"):
+    if email_type == "beefree":
+        try:
+            bee_doc = json.loads(str(raw or ""))
+        except (TypeError, ValueError):
+            return False
+        return bool(str((bee_doc or {}).get("html") or "").strip())
+    if email_type in ("raw", "wysiwyg"):
         return bool(str(raw or "").strip())
     return bool(str(raw or "").strip()) or bool(parts)
 
