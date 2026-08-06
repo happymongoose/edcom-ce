@@ -23,6 +23,8 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.created_segment_ids = []
         self.created_emails = []
         self.created_other_cids = []
+        self.created_admin_user_ids = []
+        self.created_admin_cookie_ids = []
         self.original_env = {
             "automation_segment_trigger_baseline_enabled": os.environ.get("automation_segment_trigger_baseline_enabled"),
             "automation_segment_trigger_diff_enabled": os.environ.get("automation_segment_trigger_diff_enabled"),
@@ -170,6 +172,16 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
                 company_patch,
                 self.user_cookie["cid"],
             )
+        if self.created_admin_cookie_ids:
+            self.db.execute(
+                "delete from cookies where id = any(%s)",
+                self.created_admin_cookie_ids,
+            )
+        if self.created_admin_user_ids:
+            self.db.execute(
+                "delete from users where id = any(%s)",
+                self.created_admin_user_ids,
+            )
         super(TestAutomationSegmentTriggerBaselines, self).tearDown()
 
     def unique(self):
@@ -180,6 +192,50 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             "X-Auth-UID": self.user_cookie["uid"],
             "X-Auth-Cookie": self.user_cookie["id"],
         }
+
+    def backend_cid(self):
+        company = self.db.companies.get(self.user_cookie["cid"])
+        return company["cid"]
+
+    def create_admin_cookie(self):
+        backend_cid = self.backend_cid()
+        oldcid = self.db.get_cid()
+        self.db.set_cid(backend_cid)
+        try:
+            admin_uid = self.db.users.add(
+                {
+                    "username": "automation-segment-admin-%s@example.com" % self.unique(),
+                    "fullname": "Automation Segment Admin",
+                    "companyname": "Automation Segment Admin Company",
+                    "admin": True,
+                    "created": datetime.utcnow().isoformat() + "Z",
+                }
+            )
+            cookie_id = self.db.cookies.add(
+                {
+                    "lastused": datetime.utcnow().isoformat() + "Z",
+                    "uid": admin_uid,
+                    "admin": True,
+                }
+            )
+        finally:
+            self.db.set_cid(oldcid)
+        self.created_admin_user_ids.append(admin_uid)
+        self.created_admin_cookie_ids.append(cookie_id)
+        self.admin_cookie = self.db.cookies.get(cookie_id)
+
+    def admin_headers(self):
+        if not self.created_admin_cookie_ids:
+            self.create_admin_cookie()
+        return {
+            "X-Auth-UID": self.admin_cookie["uid"],
+            "X-Auth-Cookie": self.admin_cookie["id"],
+        }
+
+    def admin_impersonation_headers(self):
+        headers = self.admin_headers()
+        headers["X-Auth-Impersonate"] = self.user_cookie["cid"]
+        return headers
 
     def enable_baseline(self):
         os.environ["automation_segment_trigger_baseline_enabled"] = "true"
@@ -1255,6 +1311,49 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.assertEqual(snapshot["running"], True)
         self.assertEqual(snapshot["stale_claim"], True)
         self.assertEqual(snapshot["skipped_reason"], "previous skip")
+
+    def test_segment_trigger_status_visible_to_admin_impersonation_and_scoped(self):
+        self.set_customer_automation_diagnostics(False)
+        segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        other_cid = "%s_impersonation_other_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        other_segment_id = "%s_impersonation_other_segment" % self.test_id
+        self.db.execute(
+            "insert into companies (id, cid, data) values (%s, %s, %s)",
+            other_cid,
+            other_cid,
+            {"admin": False, "name": "Other impersonation account"},
+        )
+        self.db.execute(
+            "insert into segments (id, cid, data) values (%s, %s, %s)",
+            other_segment_id,
+            other_cid,
+            {"name": "Other impersonation segment", "parts": []},
+        )
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            "%s_impersonation_other_automation" % self.test_id,
+            other_cid,
+            {
+                "name": "Other impersonation automation",
+                "status": "published",
+                "published": {
+                    "entry": {"type": "segment_entered", "segment_id": other_segment_id},
+                    "nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit"}],
+                },
+            },
+        )
+
+        result = self.simulate_get(
+            "/api/automation-segment-trigger-status",
+            headers=self.admin_impersonation_headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        segment_ids = [row["segment_id"] for row in result.json["segments"]]
+        self.assertIn(segment["id"], segment_ids)
+        self.assertNotIn(other_segment_id, segment_ids)
 
     def test_segment_trigger_status_includes_multi_and_ignores_draft_unpublished(self):
         self.set_customer_automation_diagnostics(True)
