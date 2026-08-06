@@ -72,6 +72,96 @@ class Customer extends Component {
     this.setState({showModal: name, newcredits: this.props.credits[name]});
   }
 
+  formatAutomationFlag = value => value ? 'Enabled' : 'Disabled'
+
+  renderAutomationOperations = () => {
+    if (this.props.id === 'new') {
+      return null;
+    }
+
+    const operations = this.props.automationOperations;
+    const flags = (operations && operations.flags) || {};
+    const summary = (operations && operations.summary) || {};
+    const statuses = [
+      ['ready', 'Ready'],
+      ['waiting', 'Waiting'],
+      ['held', 'Held'],
+      ['paused_ready', 'Paused ready'],
+      ['paused_waiting', 'Paused waiting'],
+      ['running', 'Running'],
+      ['stale_running', 'Stale running'],
+      ['failed', 'Failed'],
+      ['completed', 'Completed'],
+      ['exited', 'Exited'],
+      ['cancelled', 'Cancelled'],
+      ['total', 'Total'],
+    ];
+
+    return (
+      <EDFormBox>
+        <h3>Automation Operations</h3>
+        <CheckboxLabel
+          id="automation_processing_enabled"
+          label="Enable automation processing for this customer"
+          obj={this.props.data}
+          onChange={this.handleChange}
+          help="Scheduled and batch automation processing will only run when the global feature flag is also enabled."
+          space
+        />
+        <CheckboxLabel
+          id="automation_diagnostics_visible"
+          label="Show automation diagnostics to customer users"
+          obj={this.props.data}
+          onChange={this.handleChange}
+          help="Admin impersonation can view diagnostics regardless of this setting."
+          space
+        />
+        {
+          operations ?
+            <div>
+              <h4>Global Automation Flags</h4>
+              <table className="table table-striped table-bordered">
+                <tbody>
+                  {
+                    _.map(_.keys(flags).sort(), key => (
+                      <tr key={key}>
+                        <th>{key}</th>
+                        <td>{this.formatAutomationFlag(flags[key])}</td>
+                      </tr>
+                    ))
+                  }
+                </tbody>
+              </table>
+              {
+                this.props.data.automation_processing_enabled && !flags.automation_processing_enabled &&
+                  <p className="text-warning">
+                    Customer automation processing is enabled, but the global automation processing flag is disabled.
+                  </p>
+              }
+              <h4>Customer Enrolment Summary</h4>
+              <table className="table table-striped table-bordered">
+                <tbody>
+                  {
+                    _.map(statuses, ([key, label]) => (
+                      <tr key={key}>
+                        <th>{label}</th>
+                        <td>{summary[key] || 0}</td>
+                      </tr>
+                    ))
+                  }
+                </tbody>
+              </table>
+              <p className="help-block">
+                Diagnostic pages are available from the customer portal when diagnostics are visible, or while an admin is impersonating this customer.
+              </p>
+            </div>
+          :
+            <p className="help-block">Loading automation operations status...</p>
+        }
+      </EDFormBox>
+    );
+  }
+
   navbarButtons = () => {
     return (
       <LoaderButton
@@ -279,6 +369,7 @@ class Customer extends Component {
               />
             </EDFormBox>
           }
+          {this.renderAutomationOperations()}
           </EDFormSection>
           <Modal show={this.state.showModal !== null} bsSize="small">
             <Modal.Header>
@@ -329,6 +420,8 @@ export default withLoadSave({
     daylimitpostupgrade: 999999999,
     monthlimitpostupgrade: 999999999,
     skip_list_validation: true,
+    automation_processing_enabled: false,
+    automation_diagnostics_visible: false,
   },
   get: async ({id}) => (await axios.get('/api/companies/' + id)).data,
   post: ({data}) => axios.post('/api/companies', data),
@@ -340,6 +433,11 @@ export default withLoadSave({
       if (id === 'new')
         return null;
       return (await axios.get('/api/companies/' + id + '/credits')).data;
+    },
+    automationOperations: async ({id}) => {
+      if (id === 'new')
+        return null;
+      return (await axios.get('/api/companies/' + id + '/automation-operations')).data;
     },
   },
   extramerge: {

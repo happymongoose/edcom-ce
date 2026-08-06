@@ -3703,6 +3703,51 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertIsNone(company.get("automation_diagnostics_visible"))
         self.assertFalse(automations._customer_automation_processing_enabled(self.db, cid))
 
+    def test_admin_can_read_company_automation_operations(self):
+        cid = self.create_scheduler_candidate_account(
+            status="ready",
+            automation_processing_enabled=None,
+        )
+
+        result = self.simulate_get(
+            "/api/companies/%s/automation-operations" % cid,
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["company"]["id"], cid)
+        self.assertFalse(result.json["company"]["automation_processing_enabled"])
+        self.assertFalse(result.json["company"]["automation_diagnostics_visible"])
+        self.assertEqual(result.json["summary"]["ready"], 1)
+        self.assertEqual(result.json["summary"]["total"], 1)
+        for value in result.json["flags"].values():
+            self.assertIs(type(value), bool)
+
+    def test_customer_cannot_read_company_automation_operations(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+
+        result = self.simulate_get(
+            "/api/companies/%s/automation-operations" % cid,
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 401)
+
+    def test_company_automation_operations_summary_is_scoped(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+        other_cid = self.create_scheduler_candidate_account(status="failed")
+
+        result = self.simulate_get(
+            "/api/companies/%s/automation-operations" % cid,
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["summary"]["ready"], 1)
+        self.assertEqual(result.json["summary"]["failed"], 0)
+        self.assertEqual(result.json["summary"]["total"], 1)
+        self.assertNotEqual(cid, other_cid)
+
     def test_scheduler_feature_flag_off_does_not_dispatch(self):
         os.environ.pop("automation_processing_enabled", None)
         self.set_customer_automation_processing(True)

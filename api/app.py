@@ -2193,6 +2193,33 @@ class Company(CRUDSingle):
         )
 
 
+class CompanyAutomationOperations(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        if not req.context["admin"]:
+            raise falcon.HTTPUnauthorized()
+
+        db = req.context["db"]
+        company = db.companies.get(id)
+        if company is None:
+            raise falcon.HTTPForbidden()
+
+        status = automations._automation_processing_status(db, id)
+        req.context["result"] = {
+            "company": {
+                "id": id,
+                "name": company.get("name") or "",
+                "automation_processing_enabled": company.get("automation_processing_enabled") is True,
+                "automation_diagnostics_visible": company.get("automation_diagnostics_visible") is True,
+            },
+            "flags": {
+                key: value is True
+                for key, value in (status.get("flags") or {}).items()
+            },
+            "summary": status.get("summary") or {},
+        }
+
+
 class CompanyCampaign(object):
 
     def on_get(
@@ -3858,6 +3885,7 @@ app.add_route("/api/pollresthooks/{event}", PollRestHook())
 app.add_route("/api/companylimits", CompanyLimits())
 app.add_route("/api/companies", Companies())
 app.add_route("/api/companies/{id}", Company())
+app.add_route("/api/companies/{id}/automation-operations", CompanyAutomationOperations())
 app.add_route("/api/companies/{id}/users", CompanyUsers())
 app.add_route("/api/companies/{id}/pendinglists", CompanyPendingLists())
 app.add_route(
