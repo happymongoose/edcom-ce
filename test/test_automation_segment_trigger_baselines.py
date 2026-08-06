@@ -23,16 +23,25 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.created_other_cids = []
         self.original_env = {
             "automation_segment_trigger_baseline_enabled": os.environ.get("automation_segment_trigger_baseline_enabled"),
+            "automation_segment_trigger_diff_enabled": os.environ.get("automation_segment_trigger_diff_enabled"),
+            "automation_triggers_enabled": os.environ.get("automation_triggers_enabled"),
         }
         self.original_hashlimit = self.db.single(
             "select hashlimit from contacts.contacts_hashlimit where cid = %s",
             self.user_cookie["cid"],
         )
         os.environ.pop("automation_segment_trigger_baseline_enabled", None)
+        os.environ.pop("automation_segment_trigger_diff_enabled", None)
+        os.environ.pop("automation_triggers_enabled", None)
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
         if self.created_segment_ids:
+            self.db.execute(
+                "delete from automation_trigger_events where cid = %s and data->>'segment_id' = any(%s)",
+                cid,
+                self.created_segment_ids,
+            )
             self.db.execute(
                 "delete from automation_segment_trigger_members where cid = %s and segment_id = any(%s)",
                 cid,
@@ -141,6 +150,12 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
     def enable_baseline(self):
         os.environ["automation_segment_trigger_baseline_enabled"] = "true"
 
+    def enable_diff(self):
+        os.environ["automation_segment_trigger_diff_enabled"] = "true"
+
+    def enable_trigger_processing(self):
+        os.environ["automation_triggers_enabled"] = "true"
+
     def create_contact_list(self, name=None):
         lst = self.user_post(
             "/api/lists",
@@ -191,6 +206,43 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.created_segment_ids.append(segment["id"])
         return segment
 
+    def create_tag_segment(self, tag):
+        segment = self.user_post(
+            "/api/segments",
+            json={
+                "name": "%s_tag_segment_%s" % (self.test_id, self.unique()),
+                "operator": "and",
+                "parts": [{
+                    "type": "Info",
+                    "test": "tag",
+                    "tag": tag,
+                }],
+                "subset": False,
+                "subsettype": "percent",
+                "subsetpct": 10,
+                "subsetnum": 2000,
+            },
+        )
+        self.created_segment_ids.append(segment["id"])
+        return segment
+
+    def add_tag_value(self, contact_id, tag):
+        self.db.execute(
+            f"""insert into contacts."contact_values_{self.user_cookie['cid']}" (contact_id, type, value)
+                values (%s, 'tag', %s)
+                on conflict (contact_id, type, value) do nothing""",
+            contact_id,
+            tag,
+        )
+
+    def remove_tag_value(self, contact_id, tag):
+        self.db.execute(
+            f"""delete from contacts."contact_values_{self.user_cookie['cid']}"
+                where contact_id = %s and type = 'tag' and value = %s""",
+            contact_id,
+            tag,
+        )
+
     def create_automation(self, entry, publish=True, paused=False):
         automation = self.user_post(
             "/api/automations",
@@ -221,6 +273,10 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         return published
 
     def baseline(self, **doc):
+        return self.user_post("/api/automation-segment-trigger-baselines", json=doc)
+
+    def diff(self, **doc):
+        doc["mode"] = "diff"
         return self.user_post("/api/automation-segment-trigger-baselines", json=doc)
 
     def snapshot(self, segment_id):
@@ -264,6 +320,26 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             "select count(*) from automation_trigger_events where cid = %s",
             self.user_cookie["cid"],
         )
+
+    def segment_trigger_events(self, segment_id):
+        return [
+            {
+                "id": row[0],
+                "event_type": row[1],
+                "contact_email": row[2],
+                "data": row[3],
+            }
+            for row in self.db.execute(
+                """
+                select id, event_type, contact_email, data
+                from automation_trigger_events
+                where cid = %s and data->>'segment_id' = %s
+                order by ts, id
+                """,
+                self.user_cookie["cid"],
+                segment_id,
+            )
+        ]
 
     def force_hashlimit(self, list_id, hashlimit):
         self.db.execute(
@@ -518,3 +594,359 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.assertEqual(status, "completed")
         self.assertEqual(hashlimit, 2)
         self.assertTrue(data["baseline_complete"])
+
+    def test_diff_flag_off_does_no_work(self):
+        self.enable_baseline()
+        lst = self.create_contact_list()
+        email, _ = self.add_contact(lst["id"])
+        segment = self.create_segment(prefix=email)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["mode"], "diff")
+        self.assertEqual(result["events_created"], 0)
+
+    def test_diff_requires_completed_baseline(self):
+        self.enable_diff()
+        segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+
+        no_snapshot = self.diff(segment_id=segment["id"])
+        self.assertEqual(no_snapshot["events_created"], 0)
+        self.assertEqual(no_snapshot["skipped"][0]["reason"], "baseline_required")
+
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, data)
+            values (%s, %s, %s, 'idle', 1, null, %s)
+            """,
+            "%s:%s" % (self.user_cookie["cid"], segment["id"]),
+            self.user_cookie["cid"],
+            segment["id"],
+            {"baseline_complete": False, "hashlimit_initialized": True},
+        )
+        incomplete = self.diff(segment_id=segment["id"])
+        self.assertEqual(incomplete["events_created"], 0)
+        self.assertEqual(incomplete["skipped"][0]["reason"], "baseline_incomplete")
+
+    def test_diff_entered_contact_emits_segment_entered_event(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        segment = self.create_segment(prefix=self.test_id)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        email, _ = self.add_contact(lst["id"])
+
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(result["events_created"], 1)
+        self.assertEqual(result["segment_entered_events_created"], 1)
+        events = self.segment_trigger_events(segment["id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "segment_entered")
+        self.assertEqual(events[0]["contact_email"], email)
+        self.assertEqual(events[0]["data"]["source"]["type"], "automation_segment_scanner")
+        self.assertEqual(events[0]["data"]["source"]["mode"], "diff")
+
+    def test_diff_left_contact_emits_segment_left_event(self):
+        self.enable_baseline()
+        self.enable_diff()
+        tag = "%s_left_tag" % self.test_id
+        lst = self.create_contact_list()
+        email, contact_id = self.add_contact(lst["id"])
+        self.add_tag_value(contact_id, tag)
+        segment = self.create_tag_segment(tag)
+        self.create_automation({"type": "segment_left", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        self.remove_tag_value(contact_id, tag)
+
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(result["events_created"], 1)
+        self.assertEqual(result["segment_left_events_created"], 1)
+        events = self.segment_trigger_events(segment["id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "segment_left")
+        self.assertEqual(events[0]["contact_email"], email)
+
+    def test_diff_unconfigured_direction_emits_no_event(self):
+        self.enable_baseline()
+        self.enable_diff()
+        tag = "%s_unconfigured_tag" % self.test_id
+        lst = self.create_contact_list()
+        _, contact_id = self.add_contact(lst["id"])
+        self.add_tag_value(contact_id, tag)
+        segment = self.create_tag_segment(tag)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        self.remove_tag_value(contact_id, tag)
+
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(result["events_created"], 0)
+        self.assertEqual(self.segment_trigger_events(segment["id"]), [])
+
+    def test_repeated_diff_does_not_duplicate_events(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        segment = self.create_segment(prefix=self.test_id)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        self.add_contact(lst["id"])
+
+        first = self.diff(segment_id=segment["id"])
+        second = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(first["events_created"], 1)
+        self.assertEqual(second["events_created"], 0)
+        self.assertEqual(len(self.segment_trigger_events(segment["id"])), 1)
+
+    def test_event_cap_prevents_partial_bucket_processing(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        segment = self.create_segment(prefix=self.test_id)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        self.add_contact(lst["id"])
+        self.add_contact(lst["id"])
+        before_members = self.member_count(segment["id"])
+
+        result = self.diff(segment_id=segment["id"], limit_events=1)
+
+        self.assertTrue(result["event_limit_reached"])
+        self.assertEqual(result["events_created"], 0)
+        self.assertEqual(len(self.segment_trigger_events(segment["id"])), 0)
+        self.assertEqual(self.member_count(segment["id"]), before_members)
+        status, _, last_hashval, _ = self.snapshot(segment["id"])
+        self.assertEqual(status, "idle")
+        self.assertIsNone(last_hashval)
+
+    def test_diff_bucket_progress_resumes_across_calls(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        email, _ = self.add_contact(lst["id"])
+        self.force_hashlimit(lst["id"], 3)
+        segment = self.create_segment(prefix=email)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"], limit_buckets=3)
+
+        first = self.diff(segment_id=segment["id"], limit_buckets=1)
+        second = self.diff(segment_id=segment["id"], limit_buckets=1)
+
+        self.assertEqual(first["buckets_processed"], 1)
+        self.assertEqual(second["buckets_processed"], 1)
+        _, _, last_hashval, data = self.snapshot(segment["id"])
+        self.assertEqual(last_hashval, 1)
+        self.assertTrue(data["baseline_complete"])
+
+    def test_diff_hashlimit_change_requires_rebaseline_and_emits_zero_events(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        email, _ = self.add_contact(lst["id"])
+        segment = self.create_segment(prefix=email)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+
+        self.force_hashlimit(lst["id"], 2)
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(result["events_created"], 0)
+        self.assertEqual(result["skipped"][0]["reason"], "hashlimit_changed_rebaseline_required")
+        self.assertEqual(self.member_count(segment["id"]), 0)
+        status, hashlimit, last_hashval, data = self.snapshot(segment["id"])
+        self.assertEqual(status, "idle")
+        self.assertEqual(hashlimit, 2)
+        self.assertIsNone(last_hashval)
+        self.assertFalse(data["baseline_complete"])
+
+    def test_diff_invalid_segment_skipped_cleanly(self):
+        self.enable_baseline()
+        self.enable_diff()
+        segment = self.create_segment(empty=True)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, data)
+            values (%s, %s, %s, 'completed', 1, null, %s)
+            on conflict (cid, segment_id) do update
+                set status = 'completed', hashlimit = 1, last_hashval = null, data = excluded.data
+            """,
+            "%s:%s" % (self.user_cookie["cid"], segment["id"]),
+            self.user_cookie["cid"],
+            segment["id"],
+            {"baseline_complete": True, "hashlimit_initialized": True},
+        )
+
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(result["events_created"], 0)
+        self.assertEqual(result["skipped"][0]["reason"], "invalid_segment")
+        status, _, _, data = self.snapshot(segment["id"])
+        self.assertEqual(status, "skipped_invalid")
+        self.assertEqual(data["last_error"], "No rules in segment")
+
+    def test_diff_includes_paused_and_ignores_draft_unpublished(self):
+        self.enable_baseline()
+        self.enable_diff()
+        paused_segment = self.create_segment()
+        draft_segment = self.create_segment()
+        unpublished_segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": paused_segment["id"]}, paused=True)
+        self.create_automation({"type": "segment_entered", "segment_id": draft_segment["id"]}, publish=False)
+        automation = self.create_automation({"type": "manual"}, publish=False)
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {"type": "segment_left", "segment_id": unpublished_segment["id"]},
+                "draft": {
+                    "nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit automation"}],
+                },
+            },
+        )
+        self.baseline()
+
+        result = self.diff()
+
+        self.assertEqual(result["segments_seen"], 1)
+        self.assertIsNotNone(self.snapshot(paused_segment["id"]))
+        self.assertIsNone(self.snapshot(draft_segment["id"]))
+        self.assertIsNone(self.snapshot(unpublished_segment["id"]))
+
+    def test_diff_discovers_multi_entry_segment_trigger(self):
+        self.enable_baseline()
+        self.enable_diff()
+        segment = self.create_segment()
+        self.create_automation({
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "%s_tag" % self.test_id},
+                {"type": "segment_entered", "segment_id": segment["id"]},
+            ],
+        })
+        self.baseline(segment_id=segment["id"])
+
+        result = self.diff(segment_id=segment["id"])
+
+        self.assertEqual(result["segments_seen"], 1)
+        self.assertEqual(result["segments_claimed"], 1)
+
+    def test_diff_current_account_scoping(self):
+        self.enable_diff()
+        other_cid = "%s_other_diff_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        other_segment_id = "%s_other_diff_segment" % self.test_id
+        self.db.execute(
+            "insert into segments (id, cid, data) values (%s, %s, %s)",
+            other_segment_id,
+            other_cid,
+            {
+                "name": "Other",
+                "operator": "and",
+                "parts": [{
+                    "type": "Info",
+                    "prop": "Email",
+                    "operator": "contains",
+                    "value": self.test_id,
+                }],
+            },
+        )
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            "%s_other_diff_automation" % self.test_id,
+            other_cid,
+            {
+                "name": "Other",
+                "status": "published",
+                "published": {
+                    "entry": {"type": "segment_entered", "segment_id": other_segment_id},
+                    "nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit"}],
+                },
+            },
+        )
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, data)
+            values (%s, %s, %s, 'completed', 1, null, %s)
+            """,
+            "%s:%s" % (other_cid, other_segment_id),
+            other_cid,
+            other_segment_id,
+            {"baseline_complete": True, "hashlimit_initialized": True},
+        )
+
+        result = self.diff()
+
+        self.assertEqual(result["segments_seen"], 0)
+        self.assertEqual(result["events_created"], 0)
+
+    def test_diff_non_stale_claim_blocks_and_stale_claim_recovers(self):
+        self.enable_baseline()
+        self.enable_diff()
+        segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        self.db.execute(
+            """
+            update automation_segment_trigger_snapshots
+            set status = 'diffing', claimed_at = %s, claim_token = 'existing'
+            where cid = %s and segment_id = %s
+            """,
+            datetime.utcnow(),
+            self.user_cookie["cid"],
+            segment["id"],
+        )
+
+        blocked = self.diff(segment_id=segment["id"])
+        self.assertEqual(blocked["segments_claimed"], 0)
+        self.assertEqual(blocked["skipped"][0]["reason"], "already_diffing")
+
+        self.db.execute(
+            """
+            update automation_segment_trigger_snapshots
+            set status = 'diffing', claimed_at = %s, claim_token = 'stale'
+            where cid = %s and segment_id = %s
+            """,
+            datetime.utcnow() - timedelta(minutes=31),
+            self.user_cookie["cid"],
+            segment["id"],
+        )
+        recovered = self.diff(segment_id=segment["id"])
+        self.assertEqual(recovered["segments_claimed"], 1)
+        _, _, _, data = self.snapshot(segment["id"])
+        self.assertTrue(data["recovered_claim"])
+
+    def test_trigger_processor_enrols_from_diff_event(self):
+        self.enable_baseline()
+        self.enable_diff()
+        self.enable_trigger_processing()
+        lst = self.create_contact_list()
+        segment = self.create_segment(prefix=self.test_id)
+        automation = self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        _, contact_id = self.add_contact(lst["id"])
+
+        self.diff(segment_id=segment["id"])
+        processed = self.user_post("/api/automation-trigger-events/process", json={"limit": 10})
+
+        self.assertEqual(processed["enrolled"], 1)
+        enrolment_count = self.db.single(
+            """
+            select count(*) from automation_enrolments
+            where cid = %s and automation_id = %s and contact_id = %s
+            """,
+            self.user_cookie["cid"],
+            automation["id"],
+            contact_id,
+        )
+        self.assertEqual(enrolment_count, 1)

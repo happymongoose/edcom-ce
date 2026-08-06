@@ -557,6 +557,10 @@ AUTOMATION_TRIGGER_EVENT_SCHEMA = {
 AUTOMATION_SEGMENT_TRIGGER_BASELINE_SCHEMA = {
     "type": "object",
     "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["baseline", "diff"],
+        },
         "segment_id": {
             "type": "string",
             "minLength": 1,
@@ -567,6 +571,10 @@ AUTOMATION_SEGMENT_TRIGGER_BASELINE_SCHEMA = {
             "minimum": 1,
         },
         "limit_buckets": {
+            "type": "integer",
+            "minimum": 1,
+        },
+        "limit_events": {
             "type": "integer",
             "minimum": 1,
         },
@@ -1635,6 +1643,8 @@ AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT = 10
 AUTOMATION_SEGMENT_BASELINE_MAX_SEGMENT_LIMIT = 50
 AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT = 25
 AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT = 100
+AUTOMATION_SEGMENT_DIFF_DEFAULT_EVENT_LIMIT = 100
+AUTOMATION_SEGMENT_DIFF_MAX_EVENT_LIMIT = 500
 TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
 LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
 SEGMENT_TRIGGER_EVENT_TYPES = ("segment_entered", "segment_left")
@@ -4245,6 +4255,15 @@ def _automation_segment_trigger_baseline_enabled() -> bool:
     )
 
 
+def _automation_segment_trigger_diff_enabled() -> bool:
+    return (os.environ.get("automation_segment_trigger_diff_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _automation_trigger_limit(value: object) -> int:
     if value is None:
         return AUTOMATION_TRIGGER_DEFAULT_LIMIT
@@ -4284,6 +4303,15 @@ def _automation_segment_baseline_limit(
             description="%s must be at least 1." % name,
         )
     return min(limit, maximum)
+
+
+def _automation_segment_diff_event_limit(value: object) -> int:
+    return _automation_segment_baseline_limit(
+        value,
+        AUTOMATION_SEGMENT_DIFF_DEFAULT_EVENT_LIMIT,
+        AUTOMATION_SEGMENT_DIFF_MAX_EVENT_LIMIT,
+        "limit_events",
+    )
 
 
 def _automation_trigger_event_list_limit(value: object) -> int:
@@ -4582,12 +4610,27 @@ def _project_automation_trigger_event(row, source_names: Dict[str, str]) -> Json
 def _automation_trigger_source(source: JsonObj | None) -> JsonObj:
     source = source or {}
     ret = {
-        "type": source.get("type") or "manual",
+        "type": str(source.get("type") or "manual")[:64],
     }
-    for key in ("automation_id", "enrolment_id", "node_id", "step_run_id"):
+    for key in (
+        "automation_id",
+        "enrolment_id",
+        "node_id",
+        "step_run_id",
+        "mode",
+        "segment_id",
+        "scan_id",
+    ):
         value = source.get(key)
         if value:
-            ret[key] = value
+            ret[key] = str(value)[:128]
+    for key in ("bucket", "hashlimit"):
+        value = source.get(key)
+        if value is not None:
+            try:
+                ret[key] = int(value)
+            except (TypeError, ValueError):
+                pass
     return ret
 
 
@@ -5156,10 +5199,12 @@ def _claim_segment_trigger_baseline_snapshot(
     segment_id: str,
     claim_token: str,
     now_dt: datetime,
+    mode: str = "baseline",
 ) -> JsonObj | None:
     now = now_dt.isoformat() + "Z"
     stale_before = now_dt - CLAIM_STALE_AFTER
     snapshot_id = "%s:%s" % (cid, segment_id)
+    claim_status = "diffing" if mode == "diff" else "baselining"
     with db.transaction():
         db.execute(
             """
@@ -5193,33 +5238,36 @@ def _claim_segment_trigger_baseline_snapshot(
         _, _, _, status, _, _, claimed_at, data = row
         if claimed_at is not None and getattr(claimed_at, "tzinfo", None) is not None:
             claimed_at = claimed_at.astimezone(tzutc()).replace(tzinfo=None)
-        if status == "baselining" and claimed_at is not None and claimed_at >= stale_before:
+        if status in ("baselining", "diffing") and claimed_at is not None and claimed_at >= stale_before:
             return None
 
         data = data or {}
-        reset_progress = status != "baselining" and data.get("baseline_complete") is True
-        recovered = status == "baselining"
+        reset_progress = mode == "baseline" and status != "baselining" and data.get("baseline_complete") is True
+        recovered = status in ("baselining", "diffing")
         updated = db.row(
             """
             update automation_segment_trigger_snapshots
-            set status = 'baselining',
+            set status = %s,
                 claim_token = %s,
                 claimed_at = %s,
                 last_started_at = %s,
                 last_hashval = case when %s then null else last_hashval end,
                 data = data || jsonb_build_object(
                     'last_claimed_at', %s,
-                    'recovered_claim', %s
+                    'recovered_claim', %s,
+                    'last_claim_mode', %s
                 )
             where cid = %s and segment_id = %s
             returning id, cid, segment_id, status, hashlimit, last_hashval, claimed_at, data
             """,
+            claim_status,
             claim_token,
             now_dt,
             now_dt,
             reset_progress,
             now,
             recovered,
+            mode,
             cid,
             segment_id,
         )
@@ -5385,6 +5433,160 @@ def _store_segment_baseline_bucket_members(
     return {
         "members_seen": len(contacts_for_bucket),
         "members_removed": max(0, deleted or 0),
+    }
+
+
+def _segment_trigger_event_types_for_segment(db: DB, cid: str, segment_id: str) -> set[str]:
+    event_types: set[str] = set()
+    for automation in json_iter(
+        db.execute(
+            """
+            select id, cid, data
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+            """,
+            cid,
+        )
+    ):
+        published = automation.get("published") or {}
+        for trigger in _entry_triggers(published.get("entry") or {"type": "manual"}):
+            trigger_type = trigger.get("type")
+            if trigger_type in SEGMENT_TRIGGER_EVENT_TYPES and (trigger.get("segment_id") or "").strip() == segment_id:
+                event_types.add(trigger_type)
+    return event_types
+
+
+def _store_segment_diff_bucket(
+    db: DB,
+    cid: str,
+    segment_id: str,
+    bucket: int,
+    contacts_for_bucket: List[tuple[int, str]],
+    watched_event_types: set[str],
+    scan_id: str,
+    hashlimit: int,
+    remaining_events: int,
+) -> JsonObj:
+    current = {contact_id: contact_email for contact_id, contact_email in contacts_for_bucket}
+    previous = {
+        contact_id: contact_email
+        for contact_id, contact_email in db.execute(
+            """
+            select contact_id, contact_email
+            from automation_segment_trigger_members
+            where cid = %s and segment_id = %s and bucket = %s
+            """,
+            cid,
+            segment_id,
+            bucket,
+        )
+    }
+
+    entered = sorted(set(current.keys()) - set(previous.keys()))
+    left = sorted(set(previous.keys()) - set(current.keys()))
+    entered_to_emit = entered if "segment_entered" in watched_event_types else []
+    left_to_emit = left if "segment_left" in watched_event_types else []
+    events_needed = len(entered_to_emit) + len(left_to_emit)
+    if events_needed > remaining_events:
+        return {
+            "processed": False,
+            "event_limit_reached": True,
+            "events_needed": events_needed,
+            "events_created": 0,
+            "members_seen": len(current),
+            "members_removed": 0,
+            "entered": len(entered_to_emit),
+            "left": len(left_to_emit),
+        }
+
+    now_dt = datetime.utcnow()
+    source = {
+        "type": "automation_segment_scanner",
+        "mode": "diff",
+        "segment_id": segment_id,
+        "scan_id": scan_id,
+        "bucket": bucket,
+        "hashlimit": hashlimit,
+    }
+    with db.transaction():
+        for contact_id in entered_to_emit:
+            _create_automation_trigger_event(
+                db,
+                cid,
+                "segment_entered",
+                current[contact_id],
+                segment_id=segment_id,
+                source=source,
+                correlation_id=shortuuid.uuid(),
+                depth=0,
+            )
+        for contact_id in left_to_emit:
+            _create_automation_trigger_event(
+                db,
+                cid,
+                "segment_left",
+                previous[contact_id],
+                segment_id=segment_id,
+                source=source,
+                correlation_id=shortuuid.uuid(),
+                depth=0,
+            )
+
+        if current:
+            db.execute(
+                """
+                delete from automation_segment_trigger_members
+                where cid = %s and segment_id = %s and bucket = %s and not (contact_id = any(%s))
+                """,
+                cid,
+                segment_id,
+                bucket,
+                list(current.keys()),
+            )
+        else:
+            db.execute(
+                """
+                delete from automation_segment_trigger_members
+                where cid = %s and segment_id = %s and bucket = %s
+                """,
+                cid,
+                segment_id,
+                bucket,
+            )
+
+        for contact_id, contact_email in contacts_for_bucket:
+            db.execute(
+                """
+                insert into automation_segment_trigger_members
+                    (cid, segment_id, contact_id, contact_email, bucket, first_seen_at, last_seen_at, scan_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s)
+                on conflict (cid, segment_id, contact_id)
+                do update set
+                    contact_email = excluded.contact_email,
+                    bucket = excluded.bucket,
+                    last_seen_at = excluded.last_seen_at,
+                    scan_id = excluded.scan_id
+                """,
+                cid,
+                segment_id,
+                contact_id,
+                contact_email,
+                bucket,
+                now_dt,
+                now_dt,
+                scan_id,
+            )
+
+    return {
+        "processed": True,
+        "event_limit_reached": False,
+        "events_created": events_needed,
+        "segment_entered_events_created": len(entered_to_emit),
+        "segment_left_events_created": len(left_to_emit),
+        "members_seen": len(current),
+        "members_removed": len(left),
     }
 
 
@@ -5584,6 +5786,294 @@ def _baseline_automation_segment_triggers(
                 "last_scan_id": scan_id,
                 "last_bucket_processed": last_hashval,
                 "buckets_processed_last_call": segment_buckets_processed,
+                "updated": _utc_now(),
+                "last_error": None,
+            },
+        )
+
+    return result
+
+
+def _diff_automation_segment_triggers(
+    db: DB,
+    cid: str,
+    segment_id: str | None = None,
+    limit_segments: int = AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT,
+    limit_buckets: int = AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT,
+    limit_events: int = AUTOMATION_SEGMENT_DIFF_DEFAULT_EVENT_LIMIT,
+) -> JsonObj:
+    if not _automation_segment_trigger_diff_enabled():
+        return {
+            "enabled": False,
+            "mode": "diff",
+            "segments_seen": 0,
+            "segments_claimed": 0,
+            "buckets_processed": 0,
+            "members_upserted": 0,
+            "members_removed": 0,
+            "events_created": 0,
+            "segment_entered_events_created": 0,
+            "segment_left_events_created": 0,
+            "event_limit_reached": False,
+            "skipped": [],
+            "errors": [],
+        }
+
+    result: JsonObj = {
+        "enabled": True,
+        "mode": "diff",
+        "segments_seen": 0,
+        "segments_claimed": 0,
+        "buckets_processed": 0,
+        "members_upserted": 0,
+        "members_removed": 0,
+        "events_created": 0,
+        "segment_entered_events_created": 0,
+        "segment_left_events_created": 0,
+        "event_limit_reached": False,
+        "skipped": [],
+        "errors": [],
+    }
+    referenced_segment_ids = _referenced_segment_trigger_ids(db, cid, segment_id)
+    result["segments_seen"] = len(referenced_segment_ids)
+
+    for referenced_segment_id in referenced_segment_ids[:limit_segments]:
+        if result["buckets_processed"] >= limit_buckets or result["event_limit_reached"]:
+            break
+
+        existing_snapshot = db.row(
+            """
+            select status, hashlimit, last_hashval, data
+            from automation_segment_trigger_snapshots
+            where cid = %s and segment_id = %s
+            """,
+            cid,
+            referenced_segment_id,
+        )
+        if existing_snapshot is None:
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "baseline_required",
+                })
+            continue
+        _, _, _, existing_data = existing_snapshot
+        existing_data = existing_data or {}
+        if existing_data.get("baseline_complete") is not True:
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "baseline_incomplete",
+                })
+            continue
+
+        watched_event_types = _segment_trigger_event_types_for_segment(db, cid, referenced_segment_id)
+        if not watched_event_types:
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "no_matching_segment_trigger",
+                })
+            continue
+
+        claim_token = shortuuid.uuid()
+        snapshot = _claim_segment_trigger_baseline_snapshot(
+            db,
+            cid,
+            referenced_segment_id,
+            claim_token,
+            datetime.utcnow(),
+            mode="diff",
+        )
+        if snapshot is None:
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "already_diffing",
+                })
+            continue
+
+        result["segments_claimed"] += 1
+        segment = db.segments.get(referenced_segment_id)
+        if segment is None:
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "skipped_invalid",
+                int(snapshot.get("hashlimit") or 1),
+                snapshot.get("last_hashval"),
+                {
+                    "baseline_complete": False,
+                    "last_error": "Segment not found.",
+                    "updated": _utc_now(),
+                },
+            )
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "segment_not_found",
+                })
+            continue
+
+        try:
+            if not segment.get("parts"):
+                raise ValueError("No rules in segment")
+            nested_segments: Dict[str, JsonObj | None] = {}
+            segment_get_segments(db, segment["parts"], nested_segments)
+            campaignids = segment_get_campaignids(segment, list(nested_segments.values()))
+            hashlimit, listfactors = segment_get_params(db, cid, segment)
+        except Exception as e:
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "skipped_invalid",
+                int(snapshot.get("hashlimit") or 1),
+                snapshot.get("last_hashval"),
+                {
+                    "baseline_complete": False,
+                    "last_error": str(e)[:512],
+                    "updated": _utc_now(),
+                },
+            )
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "invalid_segment",
+                    "description": str(e)[:256],
+                })
+            continue
+
+        snapshot_data = snapshot.get("data") or {}
+        stored_hashlimit = int(snapshot.get("hashlimit") or 1)
+        last_hashval = snapshot.get("last_hashval")
+        if snapshot_data.get("hashlimit_initialized") and stored_hashlimit != hashlimit:
+            with db.transaction():
+                db.execute(
+                    """
+                    delete from automation_segment_trigger_members
+                    where cid = %s and segment_id = %s
+                    """,
+                    cid,
+                    referenced_segment_id,
+                )
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "idle",
+                hashlimit,
+                None,
+                {
+                    "baseline_complete": False,
+                    "hashlimit_initialized": True,
+                    "last_error": None,
+                    "updated": _utc_now(),
+                    "hashlimit_changed_rebaseline_required": True,
+                    "previous_hashlimit": stored_hashlimit,
+                    "hashlimit": hashlimit,
+                },
+            )
+            if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["skipped"].append({
+                    "segment_id": referenced_segment_id,
+                    "reason": "hashlimit_changed_rebaseline_required",
+                    "previous_hashlimit": stored_hashlimit,
+                    "hashlimit": hashlimit,
+                })
+            continue
+
+        start_bucket = 0 if last_hashval is None else int(last_hashval) + 1
+        scan_id = shortuuid.uuid()
+        current_bucket = start_bucket
+        segment_buckets_processed = 0
+        try:
+            while current_bucket < hashlimit and result["buckets_processed"] < limit_buckets:
+                remaining_events = limit_events - int(result["events_created"])
+                bucket_contacts = _evaluate_segment_bucket_contacts(
+                    db,
+                    cid,
+                    segment,
+                    current_bucket,
+                    listfactors,
+                    hashlimit,
+                    campaignids,
+                )
+                bucket_result = _store_segment_diff_bucket(
+                    db,
+                    cid,
+                    referenced_segment_id,
+                    current_bucket,
+                    bucket_contacts,
+                    watched_event_types,
+                    scan_id,
+                    hashlimit,
+                    remaining_events,
+                )
+                if bucket_result.get("event_limit_reached"):
+                    result["event_limit_reached"] = True
+                    if len(result["skipped"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                        result["skipped"].append({
+                            "segment_id": referenced_segment_id,
+                            "bucket": current_bucket,
+                            "reason": "event_limit_reached",
+                            "events_needed": bucket_result.get("events_needed"),
+                            "remaining_events": remaining_events,
+                        })
+                    break
+
+                result["events_created"] += bucket_result["events_created"]
+                result["segment_entered_events_created"] += bucket_result.get("segment_entered_events_created", 0)
+                result["segment_left_events_created"] += bucket_result.get("segment_left_events_created", 0)
+                result["members_upserted"] += bucket_result["members_seen"]
+                result["members_removed"] += bucket_result["members_removed"]
+                result["buckets_processed"] += 1
+                segment_buckets_processed += 1
+                last_hashval = current_bucket
+                current_bucket += 1
+        except Exception as e:
+            _release_segment_trigger_baseline_snapshot(
+                db,
+                cid,
+                referenced_segment_id,
+                claim_token,
+                "idle",
+                hashlimit,
+                last_hashval,
+                {
+                    "baseline_complete": True,
+                    "hashlimit_initialized": True,
+                    "last_error": str(e)[:512],
+                    "updated": _utc_now(),
+                },
+            )
+            if len(result["errors"]) < AUTOMATION_TRIGGER_DETAIL_LIMIT:
+                result["errors"].append({
+                    "segment_id": referenced_segment_id,
+                    "description": str(e)[:256],
+                })
+            continue
+
+        complete = current_bucket >= hashlimit
+        _release_segment_trigger_baseline_snapshot(
+            db,
+            cid,
+            referenced_segment_id,
+            claim_token,
+            "completed" if complete else "idle",
+            hashlimit,
+            None if complete else last_hashval,
+            {
+                "baseline_complete": True,
+                "hashlimit_initialized": True,
+                "last_diff_scan_id": scan_id,
+                "last_diff_bucket_processed": last_hashval,
+                "diff_buckets_processed_last_call": segment_buckets_processed,
+                "last_diff_completed": complete,
                 "updated": _utc_now(),
                 "last_error": None,
             },
@@ -6277,14 +6767,26 @@ class AutomationSegmentTriggerBaselines(object):
             AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT,
             "limit_buckets",
         )
+        mode = doc.get("mode") or "baseline"
 
-        req.context["result"] = _baseline_automation_segment_triggers(
-            db,
-            cid,
-            doc.get("segment_id"),
-            limit_segments,
-            limit_buckets,
-        )
+        if mode == "diff":
+            limit_events = _automation_segment_diff_event_limit(doc.get("limit_events"))
+            req.context["result"] = _diff_automation_segment_triggers(
+                db,
+                cid,
+                doc.get("segment_id"),
+                limit_segments,
+                limit_buckets,
+                limit_events,
+            )
+        else:
+            req.context["result"] = _baseline_automation_segment_triggers(
+                db,
+                cid,
+                doc.get("segment_id"),
+                limit_segments,
+                limit_buckets,
+            )
 
 
 class AutomationEnrolmentRunNext(object):
