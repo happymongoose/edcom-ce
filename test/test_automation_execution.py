@@ -20,6 +20,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.test_id = "automation_execution_%s" % shortuuid.uuid().lower()
         self.created_debug_backend_ids = []
         self.created_route_ids = []
+        self.created_exclusion_items = []
         self.created_scheduler_cids = []
         self.created_admin_user_ids = []
         self.created_admin_cookie_ids = []
@@ -190,6 +191,17 @@ class TestAutomationExecution(test_base.TestBase):
             "%s%%" % self.test_id,
         )
         if self.created_emails:
+            domains = list({email.split("@", 1)[1] for email in self.created_emails if "@" in email})
+            self.db.execute(
+                "delete from unsublogs where cid = %s and email = any(%s)",
+                cid,
+                self.created_emails,
+            )
+            self.db.execute(
+                "delete from exclusions where cid = %s and item = any(%s)",
+                cid,
+                self.created_emails + domains + self.created_exclusion_items,
+            )
             contact_ids = [
                 row[0]
                 for row in self.db.execute(
@@ -221,6 +233,7 @@ class TestAutomationExecution(test_base.TestBase):
                 self.created_emails,
             )
             self.created_emails = []
+            self.created_exclusion_items = []
         if self.created_list_ids:
             self.db.execute(
                 f"""delete from contacts."contact_lists_{cid}" where list_id = any(%s)""",
@@ -255,9 +268,9 @@ class TestAutomationExecution(test_base.TestBase):
         headers["X-Auth-Impersonate"] = self.user_cookie["cid"]
         return headers
 
-    def create_contact(self):
+    def create_contact(self, domain="example.com"):
         suffix = self.unique()
-        email = "automation-exec-%s@example.com" % suffix
+        email = "automation-exec-%s@%s" % (suffix, domain)
         lst = self.user_post("/api/lists", json={"name": "automation_execution_%s" % suffix})
         self.created_list_ids.append(lst["id"])
         self.created_emails.append(email)
@@ -931,6 +944,82 @@ class TestAutomationExecution(test_base.TestBase):
             """,
             automation_id,
         ).fetchall()
+
+    def suppress_contact_prop(self, contact_id, prop):
+        cid = self.user_cookie["cid"]
+        self.db.execute(
+            f"""update contacts."contacts_{cid}"
+            set props = props || %s
+            where contact_id = %s""",
+            {prop: ["true"]},
+            contact_id,
+        )
+
+    def suppress_contact_unsublog(self, email, contact_id, **flags):
+        cid = self.user_cookie["cid"]
+        self.db.execute(
+            """
+            insert into unsublogs (cid, email, rawhash, unsubscribed, complained, bounced)
+            values (%s, %s, %s, %s, %s, %s)
+            on conflict (cid, email) do update set
+                unsubscribed = excluded.unsubscribed,
+                complained = excluded.complained,
+                bounced = excluded.bounced
+            """,
+            cid,
+            email,
+            contact_id,
+            flags.get("unsubscribed", False),
+            flags.get("complained", False),
+            flags.get("bounced", False),
+        )
+
+    def suppress_exclusion(self, item, contact_id=None):
+        cid = self.user_cookie["cid"]
+        exclusion_id = "%s_exclusion" % self.test_id
+        self.created_exclusion_items.append(item)
+        self.db.execute(
+            """
+            insert into exclusions (cid, item, exclusionid, rawhash)
+            values (%s, %s, %s, %s)
+            on conflict (cid, item, exclusionid) do nothing
+            """,
+            cid,
+            item,
+            exclusion_id,
+            contact_id,
+        )
+
+    def assert_suppressed_send_skips_and_advances(
+        self,
+        email,
+        automation,
+        enrolment,
+        expected_reason,
+        expected_status="ready",
+        expected_node_id="node_exit_1",
+    ):
+        result = self.run_next(automation["id"], enrolment["id"])
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["enrolment"]["status"], expected_status)
+        if expected_node_id is not None:
+            self.assertEqual(result.json["enrolment"]["current_node_id"], expected_node_id)
+        self.assert_claim_cleared(result.json["enrolment"])
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["status"], "succeeded")
+        self.assertEqual(step_run["node_type"], "send_email")
+        self.assertEqual(step_run["action"], "send_email")
+        self.assertEqual(step_run["automation_email_id"], automation["execution_email_id"])
+        self.assertEqual(step_run["automation_email_name"], "Execution email")
+        self.assertEqual(step_run["subject"], "Execution subject")
+        self.assertEqual(step_run["recipient_email"], email)
+        self.assertEqual(step_run["sent"], False)
+        self.assertEqual(step_run["suppressed"], True)
+        self.assertEqual(step_run["suppression_reason"], expected_reason)
+        self.assertIsNone(step_run.get("route_id"))
+        self.assertEqual(self.debug_email_logs(automation["id"]), [])
 
     def insert_open_event(
         self,
@@ -1686,6 +1775,90 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_send_email_unsubscribed_contact_skips_send_and_advances(self):
+        email, contact_id = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.suppress_contact_prop(contact_id, "Unsubscribed")
+
+        self.assert_suppressed_send_skips_and_advances(
+            email,
+            automation,
+            enrolment,
+            "unsubscribed",
+        )
+        data = self.enrolment_data(enrolment["id"])
+        self.assertIsNone(data.get("retry_after"))
+        self.assertIsNone(data.get("last_error"))
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_complained_contact_skips_send_and_advances(self):
+        email, contact_id = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.suppress_contact_prop(contact_id, "Complained")
+
+        self.assert_suppressed_send_skips_and_advances(
+            email,
+            automation,
+            enrolment,
+            "complained",
+        )
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_bounced_contact_skips_send_and_advances(self):
+        email, contact_id = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.suppress_contact_unsublog(email, contact_id, bounced=True)
+
+        self.assert_suppressed_send_skips_and_advances(
+            email,
+            automation,
+            enrolment,
+            "bounced",
+        )
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_excluded_email_skips_send_and_advances(self):
+        email, contact_id = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.suppress_exclusion(email, contact_id)
+
+        self.assert_suppressed_send_skips_and_advances(
+            email,
+            automation,
+            enrolment,
+            "excluded_email",
+        )
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_excluded_domain_skips_send_and_advances(self):
+        domain = "%s.example.com" % self.unique()
+        email, _ = self.create_contact(domain=domain)
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        enrolment = self.enrol(automation["id"], email)
+        self.suppress_exclusion(domain)
+
+        self.assert_suppressed_send_skips_and_advances(
+            email,
+            automation,
+            enrolment,
+            "excluded_domain",
+        )
+
+        self.cleanup(automation["id"])
+
     def test_send_email_does_not_execute_next_node_in_same_request(self):
         email, contact_id = self.create_contact()
         self.assign_single_debug_route()
@@ -1722,6 +1895,24 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["enrolment"]["status"], "completed")
         self.assertEqual(result.json["step_run"]["node_type"], "send_email")
         self.assertEqual(len(self.debug_email_logs(automation["id"])), 1)
+
+        self.cleanup(automation["id"])
+
+    def test_suppressed_final_send_email_completes_enrolment(self):
+        email, contact_id = self.create_contact()
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation_with_options(include_exit=False)
+        enrolment = self.enrol(automation["id"], email)
+        self.suppress_contact_prop(contact_id, "Unsubscribed")
+
+        self.assert_suppressed_send_skips_and_advances(
+            email,
+            automation,
+            enrolment,
+            "unsubscribed",
+            expected_status="completed",
+            expected_node_id=None,
+        )
 
         self.cleanup(automation["id"])
 

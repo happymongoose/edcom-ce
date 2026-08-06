@@ -24,6 +24,7 @@ from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
 from .shared.utils import fix_tag
+from .shared.utils import is_true
 from .shared.utils import generate_html, remove_newlines
 from .shared.utils import check_automation_diagnostics
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
@@ -927,6 +928,67 @@ def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
             tag,
         )
     )
+
+
+def _truthy_contact_prop(props: JsonObj, name: str) -> bool:
+    values = props.get(name) or []
+    if not values:
+        return False
+    return is_true(str(values[0]) if values[0] is not None else None)
+
+
+def _automation_send_suppression_reason(
+    db: DB, cid: str, contact_id: int, contact_email: str
+) -> str | None:
+    props = db.single(
+        f"""select props
+        from contacts."contacts_{cid}"
+        where contact_id = %s and lower(email) = %s""",
+        contact_id,
+        contact_email.strip().lower(),
+    )
+    props = props or {}
+    if _truthy_contact_prop(props, "Unsubscribed"):
+        return "unsubscribed"
+    if _truthy_contact_prop(props, "Complained"):
+        return "complained"
+    if _truthy_contact_prop(props, "Bounced"):
+        return "bounced"
+
+    log_reason = db.row(
+        """
+        select unsubscribed, complained, bounced
+        from unsublogs
+        where cid = %s and email = %s
+            and (unsubscribed or complained or bounced)
+        """,
+        cid,
+        contact_email.strip().lower(),
+    )
+    if log_reason is not None:
+        unsubscribed, complained, bounced = log_reason
+        if unsubscribed:
+            return "unsubscribed"
+        if complained:
+            return "complained"
+        if bounced:
+            return "bounced"
+
+    domain = _contact_domain(contact_email)
+    if db.single(
+        "select true from exclusions where cid = %s and item = %s",
+        cid,
+        contact_email.strip().lower(),
+    ):
+        return "excluded_email"
+    if domain and db.single(
+        "select true from exclusions where cid = %s and item = %s",
+        cid,
+        domain,
+    ):
+        return "excluded_domain"
+
+    return None
 
 
 def _contact_list_counter_flags(contact: JsonObj) -> tuple[int, int, int, int]:
@@ -3443,6 +3505,8 @@ class AutomationHistory(object):
                     "recipient_email": step_run.get("recipient_email"),
                     "route_id": step_run.get("route_id"),
                     "sent": step_run.get("sent"),
+                    "suppressed": step_run.get("suppressed"),
+                    "suppression_reason": step_run.get("suppression_reason"),
                     "published_revision": step_run.get("published_revision"),
                     "status": step_run.get("status"),
                     "error": step_run.get("error"),
@@ -4002,70 +4066,78 @@ def _run_next_automation_enrolment(
                     description="The published send_email node references an automation email that was not found.",
                 )
 
-            fromname, fromemail, returnpath, replyto = _automation_email_sender(automation_email)
-
-            route = _automation_execution_route(db, cid)
-
-            imagebucket = os.environ["s3_imagebucket"]
-            oldcid = db.get_cid()
-            db.set_cid(None)
-            try:
-                company = db.companies.get(cid)
-                parentcompany = db.companies.get(company["cid"]) if company else None
-                if parentcompany is not None:
-                    imagebucket = parentcompany.get("s3_imagebucket", imagebucket)
-            finally:
-                db.set_cid(oldcid)
-
-            html, _ = generate_html(db, automation_email, run_id, imagebucket)
             subject = remove_newlines(automation_email["subject"])
-            fromdomain = ""
-            if "@" in returnpath:
-                fromdomain = returnpath.split("@")[-1].strip().lower()
-            elif "@" in fromemail:
-                fromdomain = fromemail.split("@")[-1].strip().lower()
-            fromaddr = email.utils.formataddr((fromname, fromemail))
             recipient_email = enrolment["contact_email"]
+            suppression_reason = _automation_send_suppression_reason(
+                db, cid, enrolment["contact_id"], recipient_email
+            )
+            route_id = None
+            sent = False
+            if suppression_reason is None:
+                fromname, fromemail, returnpath, replyto = _automation_email_sender(automation_email)
 
-            try:
-                send_backend_mail(
-                    db,
-                    cid,
-                    route,
-                    html,
-                    fromaddr,
-                    returnpath,
-                    fromdomain,
-                    replyto,
-                    recipient_email,
-                    recipient_email,
-                    subject,
-                    campid=run_id,
-                    source_type="automation",
-                    source_id=id,
-                    source_ids={
-                        "automation_id": id,
-                        "automation_email_id": automation_email_id,
-                        "enrolment_id": enrolment_id,
-                        "node_id": current_node_id,
-                        "step_run_id": run_id,
-                        "published_revision": automation.get("published_revision"),
-                    },
-                    metadata={
-                        "automation_id": id,
-                        "automation_email_id": automation_email_id,
-                        "enrolment_id": enrolment_id,
-                        "node_id": current_node_id,
-                        "step_run_id": run_id,
-                        "published_revision": automation.get("published_revision"),
-                    },
-                )
-            except Exception as e:
-                log.warning("Error sending automation email: %s", e)
-                raise falcon.HTTPBadRequest(
-                    title="Error sending automation email",
-                    description="Error sending automation email: %s" % e,
-                )
+                route = _automation_execution_route(db, cid)
+                route_id = route["id"]
+
+                imagebucket = os.environ["s3_imagebucket"]
+                oldcid = db.get_cid()
+                db.set_cid(None)
+                try:
+                    company = db.companies.get(cid)
+                    parentcompany = db.companies.get(company["cid"]) if company else None
+                    if parentcompany is not None:
+                        imagebucket = parentcompany.get("s3_imagebucket", imagebucket)
+                finally:
+                    db.set_cid(oldcid)
+
+                html, _ = generate_html(db, automation_email, run_id, imagebucket)
+                fromdomain = ""
+                if "@" in returnpath:
+                    fromdomain = returnpath.split("@")[-1].strip().lower()
+                elif "@" in fromemail:
+                    fromdomain = fromemail.split("@")[-1].strip().lower()
+                fromaddr = email.utils.formataddr((fromname, fromemail))
+
+                try:
+                    send_backend_mail(
+                        db,
+                        cid,
+                        route,
+                        html,
+                        fromaddr,
+                        returnpath,
+                        fromdomain,
+                        replyto,
+                        recipient_email,
+                        recipient_email,
+                        subject,
+                        campid=run_id,
+                        source_type="automation",
+                        source_id=id,
+                        source_ids={
+                            "automation_id": id,
+                            "automation_email_id": automation_email_id,
+                            "enrolment_id": enrolment_id,
+                            "node_id": current_node_id,
+                            "step_run_id": run_id,
+                            "published_revision": automation.get("published_revision"),
+                        },
+                        metadata={
+                            "automation_id": id,
+                            "automation_email_id": automation_email_id,
+                            "enrolment_id": enrolment_id,
+                            "node_id": current_node_id,
+                            "step_run_id": run_id,
+                            "published_revision": automation.get("published_revision"),
+                        },
+                    )
+                    sent = True
+                except Exception as e:
+                    log.warning("Error sending automation email: %s", e)
+                    raise falcon.HTTPBadRequest(
+                        title="Error sending automation email",
+                        description="Error sending automation email: %s" % e,
+                    )
 
             success_data.update(
                 {
@@ -4074,8 +4146,10 @@ def _run_next_automation_enrolment(
                     "automation_email_name": automation_email.get("name"),
                     "subject": subject,
                     "recipient_email": recipient_email,
-                    "route_id": route["id"],
-                    "sent": True,
+                    "route_id": route_id,
+                    "sent": sent,
+                    "suppressed": suppression_reason is not None,
+                    "suppression_reason": suppression_reason,
                 }
             )
 
