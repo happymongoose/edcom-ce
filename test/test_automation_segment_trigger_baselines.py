@@ -1669,20 +1669,15 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.assertEqual(result["dispatched"], 0)
         self.assertEqual(dispatched, [])
 
-    def test_no_cron_registration_for_segment_scan_scheduler(self):
-        api_root = os.path.join(os.path.dirname(__file__), "..", "api")
-        references = []
-        for root, dirs, files in os.walk(api_root):
-            dirs[:] = [
-                d for d in dirs
-                if d not in ("__pycache__", "falcon_swagger_ui")
+    def test_segment_scan_scheduler_cron_registration(self):
+        crontab_path = os.path.join(os.path.dirname(__file__), "..", "config", "crontab")
+        with open(crontab_path) as fp:
+            lines = [
+                line.strip()
+                for line in fp.readlines()
+                if "check_automation_segment_triggers" in line
             ]
-            for filename in files:
-                if not filename.endswith(".py"):
-                    continue
-                path = os.path.join(root, filename)
-                with open(path) as fp:
-                    if "check_automation_segment_triggers" in fp.read():
-                        references.append(os.path.relpath(path, api_root))
 
-        self.assertEqual(references, ["automations.py"])
+        self.assertEqual(lines, [
+            "*/5 * * * * /scripts/cron.py api.automations check_automation_segment_triggers 26",
+        ])
