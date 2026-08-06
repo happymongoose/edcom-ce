@@ -140,6 +140,21 @@ Admin/support impersonation can view automation diagnostics regardless of `autom
 
 Diagnostic endpoints are backend-gated by automation diagnostics visibility. Frontend menu hiding is convenience only.
 
+## Queue Purging And Recovery
+
+Existing broadcast, funnel, and transactional admin queue purge actions delete rows from their queue tables (`campqueue`, `funnelqueue`, and `txnqueue`). Automation does not have a single equivalent queue table: work is represented across enrolments, trigger events, scanner snapshots, claims, retry/backoff metadata, and history tables.
+
+Do not add a broad "Purge automation queue" action. Future admin recovery actions should be narrow and state-preserving, such as:
+
+- Pause all automations for a customer.
+- Clear stale automation execution claims.
+- Cancel selected active enrolments.
+- Cancel pending trigger events.
+- Clear stale trigger/scanner claims.
+- Rebuild a selected segment trigger baseline.
+
+Recovery actions should preserve audit/history where possible. `automation_step_runs`, `automation_email_events`, `debug_email_logs`, and terminal `automation_enrolments` should not be purged except through deliberate retention policies. Any future recovery action must be admin-only, customer-scoped, explicit, and should preferably preview/report what it will change before applying.
+
 ## Safety Rules
 
 - All automation data access and processing is account-scoped.
