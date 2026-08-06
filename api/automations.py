@@ -1627,6 +1627,7 @@ AUTOMATION_PROCESS_MAX_LIMIT = 100
 AUTOMATION_PROCESS_ERROR_LIMIT = 100
 AUTOMATION_PROCESS_ACCOUNT_LIMIT = 50
 CHECK_AUTOMATION_ENROLMENTS_LOCK = 58413921
+CHECK_AUTOMATION_SEGMENT_TRIGGERS_LOCK = 58413922
 AUTOMATION_RETENTION_CLEANUP_LOCK = 98337413
 AUTOMATION_RETENTION_DEBUG_LOG_DAYS = 14
 AUTOMATION_RETENTION_TRIGGER_EVENT_DAYS = 30
@@ -1645,6 +1646,7 @@ AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT = 25
 AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT = 100
 AUTOMATION_SEGMENT_DIFF_DEFAULT_EVENT_LIMIT = 100
 AUTOMATION_SEGMENT_DIFF_MAX_EVENT_LIMIT = 500
+AUTOMATION_SEGMENT_SCAN_ACCOUNT_LIMIT = 25
 TAG_TRIGGER_EVENT_TYPES = ("tag_added", "tag_removed")
 LIST_TRIGGER_EVENT_TYPES = ("list_joined", "list_left")
 SEGMENT_TRIGGER_EVENT_TYPES = ("segment_entered", "segment_left")
@@ -4364,6 +4366,17 @@ def _automation_scheduler_process_limit() -> int:
         return AUTOMATION_PROCESS_DEFAULT_LIMIT
 
 
+def _automation_segment_scan_account_limit() -> int:
+    value = os.environ.get("automation_segment_trigger_account_limit")
+    if value is None:
+        return AUTOMATION_SEGMENT_SCAN_ACCOUNT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return AUTOMATION_SEGMENT_SCAN_ACCOUNT_LIMIT
+    return max(1, min(limit, AUTOMATION_SEGMENT_SCAN_ACCOUNT_LIMIT))
+
+
 def _empty_processing_counts() -> JsonObj:
     return {status: 0 for status in AUTOMATION_PROCESSING_STATUSES}
 
@@ -6199,6 +6212,101 @@ def process_automation_segment_triggers_task(
         return result
 
 
+def check_automation_segment_triggers() -> JsonObj:
+    baseline_enabled = _automation_segment_trigger_baseline_enabled()
+    diff_enabled = _automation_segment_trigger_diff_enabled()
+    if not baseline_enabled and not diff_enabled:
+        log.info("Automation segment trigger scanning is disabled; enable baseline or diff flags to dispatch scans.")
+        return {
+            "enabled": False,
+            "locked": False,
+            "baseline_enabled": False,
+            "diff_enabled": False,
+            "accounts_seen": 0,
+            "dispatched": 0,
+            "baseline_dispatched": 0,
+            "diff_dispatched": 0,
+            "task_ids": [],
+        }
+
+    account_limit = _automation_segment_scan_account_limit()
+    limit_segments = AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT
+    limit_buckets = AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT
+    limit_events = AUTOMATION_SEGMENT_DIFF_DEFAULT_EVENT_LIMIT
+    task_ids: List[str | None] = []
+    baseline_dispatched = 0
+    diff_dispatched = 0
+
+    with open_db() as db:
+        with db.transaction():
+            if not db.single(f"select pg_try_advisory_xact_lock({CHECK_AUTOMATION_SEGMENT_TRIGGERS_LOCK}::bigint)"):
+                log.info("Automation segment trigger scanner scheduler is already running.")
+                return {
+                    "enabled": True,
+                    "locked": True,
+                    "baseline_enabled": baseline_enabled,
+                    "diff_enabled": diff_enabled,
+                    "accounts_seen": 0,
+                    "dispatched": 0,
+                    "baseline_dispatched": 0,
+                    "diff_dispatched": 0,
+                    "task_ids": [],
+                    "account_limit": account_limit,
+                    "limit_segments": limit_segments,
+                    "limit_buckets": limit_buckets,
+                    "limit_events": limit_events,
+                }
+
+            account_modes = _automation_segment_trigger_account_modes(
+                db,
+                account_limit,
+                baseline_enabled,
+                diff_enabled,
+            )
+            log.info(
+                "Dispatching automation segment trigger scans for %s account(s), account_limit=%s, limits=%s.",
+                len(account_modes),
+                account_limit,
+                {
+                    "limit_segments": limit_segments,
+                    "limit_buckets": limit_buckets,
+                    "limit_events": limit_events,
+                },
+            )
+            for cid, mode in account_modes:
+                if mode == "baseline":
+                    baseline_dispatched += 1
+                elif mode == "diff":
+                    diff_dispatched += 1
+                task_ids.append(
+                    run_task(
+                        process_automation_segment_triggers_task,
+                        cid,
+                        mode,
+                        None,
+                        limit_segments,
+                        limit_buckets,
+                        limit_events,
+                    )
+                )
+
+    return {
+        "enabled": True,
+        "locked": False,
+        "baseline_enabled": baseline_enabled,
+        "diff_enabled": diff_enabled,
+        "accounts_seen": len(task_ids),
+        "dispatched": len(task_ids),
+        "baseline_dispatched": baseline_dispatched,
+        "diff_dispatched": diff_dispatched,
+        "task_ids": task_ids,
+        "account_limit": account_limit,
+        "limit_segments": limit_segments,
+        "limit_buckets": limit_buckets,
+        "limit_events": limit_events,
+    }
+
+
 def _eligible_automation_enrolments(
     db: DB,
     cid: str,
@@ -6326,6 +6434,81 @@ def _automation_processing_account_ids(
         if len(cids) >= account_limit:
             break
     return cids
+
+
+def _automation_segment_trigger_account_modes(
+    db: DB,
+    account_limit: int,
+    baseline_enabled: bool,
+    diff_enabled: bool,
+) -> List[tuple[str, str]]:
+    if not baseline_enabled and not diff_enabled:
+        return []
+
+    trigger_sql = """
+        select a.cid, trigger->>'segment_id' as segment_id
+        from automations a
+        cross join lateral (
+            select data->'published'->'entry' as trigger
+            where data->'published'->'entry'->>'type' in ('segment_entered', 'segment_left')
+            union all
+            select trigger
+            from jsonb_array_elements(coalesce(data->'published'->'entry'->'triggers', '[]'::jsonb)) trigger
+            where data->'published'->'entry'->>'type' = 'multi'
+                and trigger->>'type' in ('segment_entered', 'segment_left')
+        ) segment_triggers
+        join companies c on c.id = a.cid
+        where c.data @> %s
+            and c.data->>'automation_processing_enabled' = 'true'
+            and a.data->>'status' in ('published', 'paused')
+            and a.data->'published' is not null
+            and trigger->>'segment_id' is not null
+            and trigger->>'segment_id' <> ''
+    """
+
+    rows = db.execute(
+        """
+        with referenced as (
+            {trigger_sql}
+        ), segment_status as (
+            select
+                r.cid,
+                r.segment_id,
+                s.data as snapshot_data
+            from referenced r
+            left join automation_segment_trigger_snapshots s
+                on s.cid = r.cid and s.segment_id = r.segment_id
+            group by r.cid, r.segment_id, s.data
+        ), account_flags as (
+            select
+                cid,
+                bool_or(snapshot_data is null or snapshot_data->>'baseline_complete' <> 'true') as baseline_needed,
+                bool_or(snapshot_data->>'baseline_complete' = 'true') as diff_ready
+            from segment_status
+            group by cid
+        )
+        select cid,
+            case
+                when %s and baseline_needed then 'baseline'
+                when %s and diff_ready then 'diff'
+                else null
+            end as mode
+        from account_flags
+        where (
+            (%s and baseline_needed)
+            or (%s and diff_ready)
+        )
+        order by cid
+        limit %s
+        """.format(trigger_sql=trigger_sql),
+        {"admin": False},
+        baseline_enabled,
+        diff_enabled,
+        baseline_enabled,
+        diff_enabled,
+        account_limit,
+    )
+    return [(cid, mode) for cid, mode in rows if mode in ("baseline", "diff")]
 
 
 def _automation_retention_cleanup_enabled() -> bool:

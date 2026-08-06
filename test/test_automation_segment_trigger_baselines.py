@@ -1,4 +1,5 @@
 import os
+import psycopg2
 import shortuuid
 from datetime import datetime, timedelta
 
@@ -68,6 +69,10 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             )
             self.db.execute(
                 "delete from segments where cid = any(%s)",
+                self.created_other_cids,
+            )
+            self.db.execute(
+                "delete from companies where id = any(%s)",
                 self.created_other_cids,
             )
         if self.created_automation_ids:
@@ -273,6 +278,79 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             return self.user_post("/api/automations/%s/pause" % automation["id"])
         return published
 
+    def create_scheduler_account(self, entry=None, automation_processing_enabled=True, published=True, paused=False, baseline_complete=None):
+        cid = "%s_scheduler_%s" % (self.test_id, self.unique())
+        segment_id = "%s_segment" % cid
+        automation_id = "%s_automation" % cid
+        self.created_other_cids.append(cid)
+        if entry is None:
+            entry = {"type": "segment_entered", "segment_id": segment_id}
+        elif callable(entry):
+            entry = entry(segment_id)
+        self.db.execute(
+            "insert into companies (id, cid, data) values (%s, %s, %s)",
+            cid,
+            cid,
+            {
+                "admin": False,
+                "name": "Automation segment scheduler test",
+                "automation_processing_enabled": automation_processing_enabled,
+            },
+        )
+        self.db.execute(
+            "insert into segments (id, cid, data) values (%s, %s, %s)",
+            segment_id,
+            cid,
+            {
+                "name": "Scheduler segment",
+                "operator": "and",
+                "parts": [{
+                    "type": "Info",
+                    "prop": "Email",
+                    "operator": "contains",
+                    "value": self.test_id,
+                }],
+            },
+        )
+        status = "draft"
+        data = {
+            "name": "Scheduler automation",
+            "status": status,
+            "entry": entry,
+            "draft": {
+                "nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit"}],
+            },
+        }
+        if published:
+            status = "paused" if paused else "published"
+            data["status"] = status
+            data["published"] = {
+                "entry": entry,
+                "nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit"}],
+            }
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            automation_id,
+            cid,
+            data,
+        )
+        if baseline_complete is not None:
+            self.db.execute(
+                """
+                insert into automation_segment_trigger_snapshots
+                    (id, cid, segment_id, status, hashlimit, last_hashval, data)
+                values (%s, %s, %s, 'completed', 1, null, %s)
+                """,
+                "%s:%s" % (cid, segment_id),
+                cid,
+                segment_id,
+                {
+                    "baseline_complete": baseline_complete,
+                    "hashlimit_initialized": True,
+                },
+            )
+        return cid, segment_id, automation_id
+
     def baseline(self, **doc):
         return self.user_post("/api/automation-segment-trigger-baselines", json=doc)
 
@@ -289,6 +367,29 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             limit_buckets,
             limit_events,
         )
+
+    def run_segment_scheduler_with_task_patch(self):
+        original_run_task = automations.run_task
+        dispatched = []
+
+        def fake_run_task(task, cid, mode, segment_id, limit_segments, limit_buckets, limit_events):
+            dispatched.append({
+                "task": task,
+                "cid": cid,
+                "mode": mode,
+                "segment_id": segment_id,
+                "limit_segments": limit_segments,
+                "limit_buckets": limit_buckets,
+                "limit_events": limit_events,
+            })
+            return "segment-task-%s" % len(dispatched)
+
+        automations.run_task = fake_run_task
+        try:
+            result = automations.check_automation_segment_triggers()
+        finally:
+            automations.run_task = original_run_task
+        return result, dispatched
 
     def snapshot(self, segment_id):
         return self.db.row(
@@ -1058,5 +1159,164 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
         self.assertIsNone(self.snapshot(first_segment["id"]))
         self.assertIsNotNone(self.snapshot(second_segment["id"]))
 
-    def test_no_scheduler_or_cron_registration_for_segment_scan_task(self):
-        self.assertFalse(hasattr(automations, "check_automation_segment_triggers"))
+    def test_segment_scheduler_flags_off_no_dispatch(self):
+        self.create_scheduler_account()
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_segment_scheduler_baseline_flag_dispatches_for_missing_baseline(self):
+        self.enable_baseline()
+        cid, _, _ = self.create_scheduler_account()
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["baseline_dispatched"], 1)
+        self.assertEqual(result["diff_dispatched"], 0)
+        self.assertEqual(dispatched[0]["task"], automations.process_automation_segment_triggers_task)
+        self.assertEqual(dispatched[0]["cid"], cid)
+        self.assertEqual(dispatched[0]["mode"], "baseline")
+        self.assertIsNone(dispatched[0]["segment_id"])
+        self.assertEqual(dispatched[0]["limit_segments"], automations.AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT)
+        self.assertEqual(dispatched[0]["limit_buckets"], automations.AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT)
+        self.assertEqual(dispatched[0]["limit_events"], automations.AUTOMATION_SEGMENT_DIFF_DEFAULT_EVENT_LIMIT)
+
+    def test_segment_scheduler_baseline_flag_dispatches_for_incomplete_baseline(self):
+        self.enable_baseline()
+        cid, _, _ = self.create_scheduler_account(baseline_complete=False)
+
+        _, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["cid"], cid)
+        self.assertEqual(dispatched[0]["mode"], "baseline")
+
+    def test_segment_scheduler_diff_flag_does_not_dispatch_without_completed_baseline(self):
+        self.enable_diff()
+        self.create_scheduler_account()
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_segment_scheduler_diff_flag_dispatches_for_completed_baseline(self):
+        self.enable_diff()
+        cid, _, _ = self.create_scheduler_account(baseline_complete=True)
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(result["baseline_dispatched"], 0)
+        self.assertEqual(result["diff_dispatched"], 1)
+        self.assertEqual(dispatched[0]["cid"], cid)
+        self.assertEqual(dispatched[0]["mode"], "diff")
+
+    def test_segment_scheduler_both_flags_choose_baseline_first(self):
+        self.enable_baseline()
+        self.enable_diff()
+        cid, _, _ = self.create_scheduler_account(baseline_complete=False)
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(result["baseline_dispatched"], 1)
+        self.assertEqual(result["diff_dispatched"], 0)
+        self.assertEqual(dispatched[0]["cid"], cid)
+        self.assertEqual(dispatched[0]["mode"], "baseline")
+
+    def test_segment_scheduler_ignores_customer_processing_disabled(self):
+        self.enable_baseline()
+        self.create_scheduler_account(automation_processing_enabled=False)
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_segment_scheduler_ignores_draft_and_unpublished_but_includes_paused(self):
+        self.enable_baseline()
+        self.create_scheduler_account(published=False)
+        cid, _, _ = self.create_scheduler_account(paused=True)
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(dispatched[0]["cid"], cid)
+
+    def test_segment_scheduler_discovers_multi_entry_trigger(self):
+        self.enable_baseline()
+        cid, _, _ = self.create_scheduler_account(
+            entry=lambda segment_id: {
+                "type": "multi",
+                "triggers": [
+                    {"type": "tag_added", "tag": "%s_tag" % self.test_id},
+                    {"type": "segment_left", "segment_id": segment_id},
+                ],
+            }
+        )
+
+        result, dispatched = self.run_segment_scheduler_with_task_patch()
+
+        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(dispatched[0]["cid"], cid)
+        self.assertEqual(dispatched[0]["mode"], "baseline")
+
+    def test_segment_scheduler_account_cap_enforced(self):
+        self.enable_baseline()
+        original_limit = os.environ.get("automation_segment_trigger_account_limit")
+        os.environ["automation_segment_trigger_account_limit"] = "1"
+        try:
+            self.create_scheduler_account()
+            self.create_scheduler_account()
+            result, dispatched = self.run_segment_scheduler_with_task_patch()
+        finally:
+            if original_limit is None:
+                os.environ.pop("automation_segment_trigger_account_limit", None)
+            else:
+                os.environ["automation_segment_trigger_account_limit"] = original_limit
+
+        self.assertEqual(result["account_limit"], 1)
+        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(len(dispatched), 1)
+
+    def test_segment_scheduler_advisory_lock_prevents_overlap(self):
+        self.enable_baseline()
+        self.create_scheduler_account()
+        lock_conn = psycopg2.connect(os.environ["postgres_conn"])
+        lock_conn.autocommit = False
+        lock_cur = lock_conn.cursor()
+        lock_cur.execute(
+            "select pg_advisory_xact_lock(%s::bigint)",
+            (automations.CHECK_AUTOMATION_SEGMENT_TRIGGERS_LOCK,),
+        )
+        try:
+            result, dispatched = self.run_segment_scheduler_with_task_patch()
+        finally:
+            lock_conn.rollback()
+            lock_cur.close()
+            lock_conn.close()
+
+        self.assertTrue(result["locked"])
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(dispatched, [])
+
+    def test_no_cron_registration_for_segment_scan_scheduler(self):
+        api_root = os.path.join(os.path.dirname(__file__), "..", "api")
+        references = []
+        for root, dirs, files in os.walk(api_root):
+            dirs[:] = [
+                d for d in dirs
+                if d not in ("__pycache__", "falcon_swagger_ui")
+            ]
+            for filename in files:
+                if not filename.endswith(".py"):
+                    continue
+                path = os.path.join(root, filename)
+                with open(path) as fp:
+                    if "check_automation_segment_triggers" in fp.read():
+                        references.append(os.path.relpath(path, api_root))
+
+        self.assertEqual(references, ["automations.py"])
