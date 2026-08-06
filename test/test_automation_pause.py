@@ -11,17 +11,80 @@ class TestAutomationPause(test_base.TestBase):
         super(TestAutomationPause, self).setUp()
         company = self.db.companies.get(self.user_cookie["cid"])
         self.original_automation_diagnostics_visible = company.get("automation_diagnostics_visible")
+        self.created_automation_ids = []
+        self.created_list_ids = []
+        self.created_emails = []
 
     def tearDown(self):
+        cid = self.user_cookie["cid"]
         self.db.execute(
             "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
-            self.user_cookie["cid"],
+            cid,
         )
         if self.original_automation_diagnostics_visible is not None:
             self.db.execute(
                 "update companies set data = data || %s where id = %s",
                 {"automation_diagnostics_visible": self.original_automation_diagnostics_visible},
-                self.user_cookie["cid"],
+                cid,
+            )
+        if self.created_automation_ids:
+            self.db.execute(
+                "delete from automation_step_runs where automation_id = any(%s)",
+                self.created_automation_ids,
+            )
+            self.db.execute(
+                "delete from automation_enrolments where automation_id = any(%s)",
+                self.created_automation_ids,
+            )
+            self.db.execute(
+                "delete from automations where id = any(%s) and cid = %s",
+                self.created_automation_ids,
+                cid,
+            )
+        if self.created_emails:
+            contact_ids = [
+                row[0]
+                for row in self.db.execute(
+                    f"""select contact_id from contacts."contacts_{cid}" where email = any(%s)""",
+                    self.created_emails,
+                )
+            ]
+            if contact_ids:
+                self.db.execute(
+                    "delete from automation_step_runs where cid = %s and contact_id = any(%s)",
+                    cid,
+                    contact_ids,
+                )
+                self.db.execute(
+                    "delete from automation_enrolments where cid = %s and contact_id = any(%s)",
+                    cid,
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_values_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+                self.db.execute(
+                    f"""delete from contacts."contact_lists_{cid}" where contact_id = any(%s)""",
+                    contact_ids,
+                )
+            self.db.execute(
+                f"""delete from contacts."contacts_{cid}" where email = any(%s)""",
+                self.created_emails,
+            )
+        if self.created_list_ids:
+            self.db.execute(
+                f"""delete from contacts."contact_lists_{cid}" where list_id = any(%s)""",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from list_domains where list_id = any(%s)",
+                self.created_list_ids,
+            )
+            self.db.execute(
+                "delete from lists where id = any(%s) and cid = %s",
+                self.created_list_ids,
+                cid,
             )
         super(TestAutomationPause, self).tearDown()
 
@@ -38,6 +101,8 @@ class TestAutomationPause(test_base.TestBase):
         suffix = self.unique()
         email = "automation-pause-%s@example.com" % suffix
         lst = self.user_post("/api/lists", json={"name": "automation_pause_%s" % suffix})
+        self.created_list_ids.append(lst["id"])
+        self.created_emails.append(email)
         self.user_post(
             "/api/lists/%s/feed" % lst["id"],
             json={
@@ -99,6 +164,7 @@ class TestAutomationPause(test_base.TestBase):
             "/api/automations",
             json={"name": "automation_pause_%s" % suffix},
         )
+        self.created_automation_ids.append(automation["id"])
         self.user_patch(
             "/api/automations/%s" % automation["id"],
             json=self.workflow(nodes=nodes),
@@ -147,17 +213,23 @@ class TestAutomationPause(test_base.TestBase):
         return self.user_get("/api/automations/%s/history" % automation_id)
 
     def cleanup(self, *automation_ids):
+        cleanup_ids = list(automation_ids)
         self.db.execute(
             "delete from automation_step_runs where automation_id = any(%s)",
-            list(automation_ids),
+            cleanup_ids,
         )
         self.db.execute(
             "delete from automation_enrolments where automation_id = any(%s)",
-            list(automation_ids),
+            cleanup_ids,
         )
         self.db.set_cid(self.user_cookie["cid"])
         for automation_id in automation_ids:
             self.db.automations.remove(automation_id)
+        self.created_automation_ids = [
+            automation_id
+            for automation_id in self.created_automation_ids
+            if automation_id not in cleanup_ids
+        ]
 
     def test_pause_sets_status_and_pauses_ready_enrolments(self):
         email = self.create_contact()
