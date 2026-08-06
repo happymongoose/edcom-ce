@@ -393,6 +393,13 @@ export default class MenuNavbar extends Component {
                             Automation Processing Status
                           </RouteNavItem>
                         }
+                        {
+                          canViewAutomationDiagnostics(this.props) &&
+                          <RouteNavItem href="/automation-segment-trigger-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Segment Trigger Status
+                          </RouteNavItem>
+                        }
                         <RouteNavItem href="/transactional">
                           <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
                           Transactional

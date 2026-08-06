@@ -96,6 +96,7 @@ import Automation from "./containers/Automation";
 import AutomationEnrolments from "./containers/AutomationEnrolments";
 import AutomationEmail from "./containers/AutomationEmail";
 import AutomationProcessingStatus from "./containers/AutomationProcessingStatus";
+import AutomationSegmentTriggerStatus from "./containers/AutomationSegmentTriggerStatus";
 import AutomationTriggerEvents from "./containers/AutomationTriggerEvents";
 import DebugEmailLogs from "./containers/DebugEmailLogs";
 import Transactional from "./containers/Transactional";
@@ -220,6 +221,7 @@ export default ({ childProps }) => {
     <AppliedRoute path="/automations/:id/enrolments" exact component={AutomationEnrolments} props={childProps} />
     <AppliedRoute path="/automations/:id" exact component={Automation} props={childProps} />
     <AppliedRoute path="/automation-processing-status" exact component={AutomationProcessingStatus} props={childProps} />
+    <AppliedRoute path="/automation-segment-trigger-status" exact component={AutomationSegmentTriggerStatus} props={childProps} />
     <AppliedRoute path="/automation-trigger-events" exact component={AutomationTriggerEvents} props={childProps} />
     <AppliedRoute path="/debug-email-logs" exact component={DebugEmailLogs} props={childProps} />
     <AppliedRoute path="/transactional" exact component={Transactional} props={childProps} />

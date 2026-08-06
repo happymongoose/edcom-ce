@@ -28,6 +28,11 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             "automation_segment_trigger_diff_enabled": os.environ.get("automation_segment_trigger_diff_enabled"),
             "automation_triggers_enabled": os.environ.get("automation_triggers_enabled"),
         }
+        company = self.db.companies.get(self.user_cookie["cid"])
+        self.original_company_automation_settings = {
+            "automation_processing_enabled": company.get("automation_processing_enabled"),
+            "automation_diagnostics_visible": company.get("automation_diagnostics_visible"),
+        }
         self.original_hashlimit = self.db.single(
             "select hashlimit from contacts.contacts_hashlimit where cid = %s",
             self.user_cookie["cid"],
@@ -55,6 +60,10 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
                 self.created_segment_ids,
             )
         if self.created_other_cids:
+            self.db.execute(
+                "delete from automation_trigger_events where cid = any(%s)",
+                self.created_other_cids,
+            )
             self.db.execute(
                 "delete from automation_segment_trigger_members where cid = any(%s)",
                 self.created_other_cids,
@@ -142,6 +151,25 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        self.db.execute(
+            """
+            update companies
+            set data = data - 'automation_processing_enabled' - 'automation_diagnostics_visible'
+            where id = %s
+            """,
+            self.user_cookie["cid"],
+        )
+        company_patch = {
+            key: value
+            for key, value in self.original_company_automation_settings.items()
+            if value is not None
+        }
+        if company_patch:
+            self.db.execute(
+                "update companies set data = data || %s where id = %s",
+                company_patch,
+                self.user_cookie["cid"],
+            )
         super(TestAutomationSegmentTriggerBaselines, self).tearDown()
 
     def unique(self):
@@ -161,6 +189,26 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
 
     def enable_trigger_processing(self):
         os.environ["automation_triggers_enabled"] = "true"
+
+    def set_customer_automation_processing(self, enabled):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_processing_enabled": enabled},
+            self.user_cookie["cid"],
+        )
+
+    def set_customer_automation_diagnostics(self, visible):
+        self.db.execute(
+            "update companies set data = data || %s where id = %s",
+            {"automation_diagnostics_visible": visible},
+            self.user_cookie["cid"],
+        )
+
+    def clear_customer_automation_diagnostics(self):
+        self.db.execute(
+            "update companies set data = data - 'automation_diagnostics_visible' where id = %s",
+            self.user_cookie["cid"],
+        )
 
     def create_contact_list(self, name=None):
         lst = self.user_post(
@@ -452,6 +500,36 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
                 segment_id,
             )
         ]
+
+    def segment_trigger_status(self, limit=None):
+        self.set_customer_automation_diagnostics(True)
+        path = "/api/automation-segment-trigger-status"
+        if limit is not None:
+            path += "?limit=%s" % limit
+        return self.user_get(path)
+
+    def insert_segment_trigger_event(self, segment_id, event_type="segment_entered", contact_id=1, cid=None):
+        cid = cid or self.user_cookie["cid"]
+        event_id = "%s_event_%s" % (self.test_id, self.unique())
+        self.db.execute(
+            """
+            insert into automation_trigger_events
+                (id, cid, contact_id, contact_email, event_type, ts, data)
+            values (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            event_id,
+            cid,
+            contact_id,
+            "%s-event@example.com" % self.test_id,
+            event_type,
+            datetime.utcnow(),
+            {
+                "status": "pending",
+                "segment_id": segment_id,
+                "metadata": {"secret": "not returned"},
+            },
+        )
+        return event_id
 
     def force_hashlimit(self, list_id, hashlimit):
         self.db.execute(
@@ -1062,6 +1140,195 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             contact_id,
         )
         self.assertEqual(enrolment_count, 1)
+
+    def test_segment_trigger_status_hidden_from_customer_by_default(self):
+        self.clear_customer_automation_diagnostics()
+
+        result = self.simulate_get(
+            "/api/automation-segment-trigger-status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 403)
+        self.assertIn("Automation diagnostics are not enabled", result.text)
+
+    def test_segment_trigger_status_projects_missing_and_completed_snapshots(self):
+        self.set_customer_automation_diagnostics(True)
+        self.set_customer_automation_processing(True)
+        self.enable_baseline()
+        self.enable_diff()
+        self.enable_trigger_processing()
+        lst = self.create_contact_list()
+        email, contact_id = self.add_contact(lst["id"])
+        missing_segment = self.create_segment(prefix="missing-%s" % self.test_id)
+        completed_segment = self.create_segment(prefix=email)
+        self.create_automation({"type": "segment_entered", "segment_id": missing_segment["id"]})
+        self.create_automation({"type": "segment_left", "segment_id": completed_segment["id"]}, paused=True)
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, last_started_at, last_completed_at, data)
+            values (%s, %s, %s, 'completed', 3, null, %s, %s, %s)
+            """,
+            "%s:%s" % (self.user_cookie["cid"], completed_segment["id"]),
+            self.user_cookie["cid"],
+            completed_segment["id"],
+            datetime.utcnow() - timedelta(minutes=3),
+            datetime.utcnow() - timedelta(minutes=2),
+            {
+                "baseline_complete": True,
+                "secret": "not returned",
+                "last_error": "bounded visible error",
+            },
+        )
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_members
+                (cid, segment_id, contact_id, contact_email, bucket, first_seen_at, last_seen_at)
+            values (%s, %s, %s, %s, 0, %s, %s)
+            """,
+            self.user_cookie["cid"],
+            completed_segment["id"],
+            contact_id,
+            email,
+            datetime.utcnow(),
+            datetime.utcnow(),
+        )
+        self.insert_segment_trigger_event(completed_segment["id"], "segment_entered", contact_id)
+        self.insert_segment_trigger_event(completed_segment["id"], "segment_left", contact_id)
+
+        result = self.user_get("/api/automation-segment-trigger-status")
+
+        self.assertEqual(result["limit"], 50)
+        self.assertEqual(result["summary"]["referenced_segments"], 2)
+        self.assertEqual(result["summary"]["missing_snapshots"], 1)
+        self.assertEqual(result["summary"]["baseline_complete"], 1)
+        self.assertEqual(result["summary"]["members"], 1)
+        self.assertEqual(result["summary"]["recent_events"]["segment_entered"], 1)
+        self.assertEqual(result["summary"]["recent_events"]["segment_left"], 1)
+        self.assertEqual(result["flags"]["automation_segment_trigger_baseline_enabled"], True)
+        self.assertEqual(result["flags"]["automation_segment_trigger_diff_enabled"], True)
+        self.assertEqual(result["flags"]["automation_triggers_enabled"], True)
+        self.assertEqual(result["flags"]["customer_automation_processing_enabled"], True)
+
+        segments = {row["segment_id"]: row for row in result["segments"]}
+        self.assertEqual(segments[missing_segment["id"]]["snapshot"]["exists"], False)
+        self.assertEqual(segments[missing_segment["id"]]["snapshot"]["status"], "baseline_needed")
+        completed = segments[completed_segment["id"]]
+        self.assertEqual(completed["snapshot"]["exists"], True)
+        self.assertEqual(completed["snapshot"]["status"], "completed")
+        self.assertEqual(completed["snapshot"]["baseline_complete"], True)
+        self.assertEqual(completed["snapshot"]["hashlimit"], 3)
+        self.assertEqual(completed["snapshot"]["member_count"], 1)
+        self.assertEqual(completed["snapshot"]["last_error"], "bounded visible error")
+        self.assertEqual(completed["recent_events"]["segment_entered"], 1)
+        self.assertEqual(completed["recent_events"]["segment_left"], 1)
+        self.assertNotIn("data", completed["snapshot"])
+        self.assertNotIn("secret", completed["snapshot"])
+        self.assertNotIn("metadata", completed)
+
+    def test_segment_trigger_status_projects_stale_claim(self):
+        self.set_customer_automation_diagnostics(True)
+        segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, claimed_at, data)
+            values (%s, %s, %s, 'diffing', 1, 0, %s, %s)
+            """,
+            "%s:%s" % (self.user_cookie["cid"], segment["id"]),
+            self.user_cookie["cid"],
+            segment["id"],
+            datetime.utcnow() - timedelta(minutes=31),
+            {
+                "baseline_complete": True,
+                "skipped_reason": "previous skip",
+            },
+        )
+
+        result = self.user_get("/api/automation-segment-trigger-status")
+
+        self.assertEqual(result["summary"]["running"], 1)
+        self.assertEqual(result["summary"]["stale_claims"], 1)
+        snapshot = result["segments"][0]["snapshot"]
+        self.assertEqual(snapshot["running"], True)
+        self.assertEqual(snapshot["stale_claim"], True)
+        self.assertEqual(snapshot["skipped_reason"], "previous skip")
+
+    def test_segment_trigger_status_includes_multi_and_ignores_draft_unpublished(self):
+        self.set_customer_automation_diagnostics(True)
+        included = self.create_segment()
+        draft_only = self.create_segment()
+        unpublished = self.create_segment()
+        self.create_automation({
+            "type": "multi",
+            "triggers": [
+                {"type": "tag_added", "tag": "%s_tag" % self.test_id},
+                {"type": "segment_left", "segment_id": included["id"]},
+            ],
+        })
+        self.create_automation({"type": "segment_entered", "segment_id": draft_only["id"]}, publish=False)
+        automation = self.create_automation({"type": "manual"}, publish=False)
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json={
+                "entry": {"type": "segment_entered", "segment_id": unpublished["id"]},
+                "draft": {"nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit"}]},
+            },
+        )
+
+        result = self.user_get("/api/automation-segment-trigger-status")
+
+        segment_ids = [row["segment_id"] for row in result["segments"]]
+        self.assertEqual(segment_ids, [included["id"]])
+        self.assertEqual(result["segments"][0]["referenced_by"][0]["trigger_type"], "segment_left")
+
+    def test_segment_trigger_status_is_account_scoped_and_limited(self):
+        self.set_customer_automation_diagnostics(True)
+        first = self.create_segment()
+        second = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": first["id"]})
+        self.create_automation({"type": "segment_left", "segment_id": second["id"]})
+        other_cid = "%s_status_other_cid" % self.test_id
+        self.created_other_cids.append(other_cid)
+        other_segment_id = "%s_status_other_segment" % self.test_id
+        self.db.execute(
+            "insert into companies (id, cid, data) values (%s, %s, %s)",
+            other_cid,
+            other_cid,
+            {"admin": False, "name": "Other status account"},
+        )
+        self.db.execute(
+            "insert into segments (id, cid, data) values (%s, %s, %s)",
+            other_segment_id,
+            other_cid,
+            {"name": "Other status segment", "parts": []},
+        )
+        self.db.execute(
+            "insert into automations (id, cid, data) values (%s, %s, %s)",
+            "%s_status_other_automation" % self.test_id,
+            other_cid,
+            {
+                "name": "Other status automation",
+                "status": "published",
+                "published": {
+                    "entry": {"type": "segment_entered", "segment_id": other_segment_id},
+                    "nodes": [{"id": "node_exit_1", "type": "exit", "label": "Exit"}],
+                },
+            },
+        )
+        self.insert_segment_trigger_event(other_segment_id, "segment_entered", 999, cid=other_cid)
+
+        result = self.user_get("/api/automation-segment-trigger-status?limit=1")
+        capped = self.user_get("/api/automation-segment-trigger-status?limit=999")
+
+        self.assertEqual(result["limit"], 1)
+        self.assertEqual(capped["limit"], 100)
+        self.assertEqual(result["summary"]["referenced_segments"], 2)
+        self.assertEqual(result["summary"]["returned_segments"], 1)
+        self.assertEqual(len(result["segments"]), 1)
+        self.assertNotEqual(result["segments"][0]["segment_id"], other_segment_id)
 
     def test_baseline_task_path(self):
         self.enable_baseline()

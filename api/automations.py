@@ -1640,6 +1640,10 @@ AUTOMATION_TRIGGER_COOLDOWN_MINUTES = 15
 AUTOMATION_TRIGGER_EVENT_LIST_DEFAULT_LIMIT = 50
 AUTOMATION_TRIGGER_EVENT_RESPONSE_DETAIL_LIMIT = 25
 AUTOMATION_TRIGGER_FINISHED_STATUSES = ("processed", "suppressed", "failed", "enrolled")
+AUTOMATION_SEGMENT_TRIGGER_STATUS_DEFAULT_LIMIT = 50
+AUTOMATION_SEGMENT_TRIGGER_STATUS_MAX_LIMIT = 100
+AUTOMATION_SEGMENT_TRIGGER_STATUS_REFERENCE_LIMIT = 10
+AUTOMATION_SEGMENT_TRIGGER_STATUS_EVENT_DAYS = 7
 AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT = 10
 AUTOMATION_SEGMENT_BASELINE_MAX_SEGMENT_LIMIT = 50
 AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT = 25
@@ -4334,6 +4338,24 @@ def _automation_trigger_event_list_limit(value: object) -> int:
     return min(limit, AUTOMATION_TRIGGER_MAX_LIMIT)
 
 
+def _automation_segment_trigger_status_limit(value: object) -> int:
+    if value is None:
+        return AUTOMATION_SEGMENT_TRIGGER_STATUS_DEFAULT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation segment trigger status limit",
+            description="limit must be a positive integer.",
+        )
+    if limit < 1:
+        raise falcon.HTTPBadRequest(
+            title="Invalid automation segment trigger status limit",
+            description="limit must be at least 1.",
+        )
+    return min(limit, AUTOMATION_SEGMENT_TRIGGER_STATUS_MAX_LIMIT)
+
+
 def _automation_trigger_max_depth() -> int:
     try:
         return max(1, int(os.environ.get("automation_trigger_max_depth") or 3))
@@ -4508,6 +4530,248 @@ def _automation_processing_status(db: DB, cid: str) -> JsonObj:
         "recent_failures": failures,
         "stale_running": stale_running,
         "flags": _automation_processing_feature_flags(),
+    }
+
+
+def _automation_segment_trigger_status_flags(db: DB, cid: str) -> JsonObj:
+    return {
+        "automation_segment_trigger_baseline_enabled": _automation_segment_trigger_baseline_enabled(),
+        "automation_segment_trigger_diff_enabled": _automation_segment_trigger_diff_enabled(),
+        "automation_triggers_enabled": _automation_triggers_enabled(),
+        "customer_automation_processing_enabled": _customer_automation_processing_enabled(db, cid),
+    }
+
+
+def _segment_trigger_ref_obj(
+    automation_id: str,
+    automation_name: str | None,
+    automation_status: str | None,
+    trigger_type: str,
+) -> JsonObj:
+    return {
+        "automation_id": automation_id,
+        "automation_name": automation_name or "",
+        "automation_status": automation_status or "",
+        "trigger_type": trigger_type,
+    }
+
+
+def _referenced_segment_trigger_status_rows(db: DB, cid: str) -> Dict[str, JsonObj]:
+    referenced: Dict[str, JsonObj] = {}
+    for automation in json_iter(
+        db.execute(
+            """
+            select id, cid, data
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+            order by data->>'name', id
+            """,
+            cid,
+        )
+    ):
+        published = automation.get("published") or {}
+        for trigger in _entry_triggers(published.get("entry") or {"type": "manual"}):
+            trigger_type = trigger.get("type")
+            if trigger_type not in SEGMENT_TRIGGER_EVENT_TYPES:
+                continue
+            segment_id = (trigger.get("segment_id") or "").strip()
+            if not segment_id:
+                continue
+            if segment_id not in referenced:
+                referenced[segment_id] = {
+                    "segment_id": segment_id,
+                    "segment_name": "",
+                    "referenced_by": [],
+                    "referenced_by_count": 0,
+                }
+            referenced[segment_id]["referenced_by_count"] += 1
+            if len(referenced[segment_id]["referenced_by"]) < AUTOMATION_SEGMENT_TRIGGER_STATUS_REFERENCE_LIMIT:
+                referenced[segment_id]["referenced_by"].append(
+                    _segment_trigger_ref_obj(
+                        automation.get("id"),
+                        automation.get("name"),
+                        automation.get("status"),
+                        trigger_type,
+                    )
+                )
+
+    if referenced:
+        for segment_id, data in db.execute(
+            """
+            select id, data
+            from segments
+            where cid = %s and id = any(%s)
+            """,
+            cid,
+            list(referenced.keys()),
+        ):
+            if segment_id in referenced:
+                referenced[segment_id]["segment_name"] = (data or {}).get("name") or ""
+
+    return referenced
+
+
+def _bounded_snapshot_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        value = value.get("description") or value.get("reason") or value.get("message") or value.get("title") or ""
+    return _bounded_error_text(str(value))
+
+
+def _automation_segment_trigger_status(db: DB, cid: str, limit: int) -> JsonObj:
+    referenced = _referenced_segment_trigger_status_rows(db, cid)
+    segment_ids = sorted(
+        referenced.keys(),
+        key=lambda segment_id: (
+            (referenced[segment_id].get("segment_name") or "").lower(),
+            segment_id,
+        ),
+    )[:limit]
+
+    snapshots: Dict[str, JsonObj] = {}
+    member_counts: Dict[str, int] = {}
+    recent_event_counts: Dict[str, JsonObj] = {}
+    stale_before = datetime.now(tzutc()) - CLAIM_STALE_AFTER
+    event_cutoff = datetime.now(tzutc()) - timedelta(days=AUTOMATION_SEGMENT_TRIGGER_STATUS_EVENT_DAYS)
+
+    if segment_ids:
+        for row in db.execute(
+            """
+            select
+                segment_id,
+                status,
+                hashlimit,
+                last_hashval,
+                last_started_at,
+                last_completed_at,
+                claimed_at,
+                data
+            from automation_segment_trigger_snapshots
+            where cid = %s and segment_id = any(%s)
+            """,
+            cid,
+            segment_ids,
+        ):
+            segment_id, status, hashlimit, last_hashval, last_started_at, last_completed_at, claimed_at, data = row
+            data = data or {}
+            running = status in ("baselining", "diffing")
+            stale_claim = bool(running and claimed_at and claimed_at < stale_before)
+            snapshots[segment_id] = {
+                "exists": True,
+                "status": status or "",
+                "baseline_complete": data.get("baseline_complete") is True,
+                "hashlimit": hashlimit,
+                "last_hashval": last_hashval,
+                "last_started_at": last_started_at.isoformat() if hasattr(last_started_at, "isoformat") else last_started_at,
+                "last_completed_at": last_completed_at.isoformat() if hasattr(last_completed_at, "isoformat") else last_completed_at,
+                "claimed_at": claimed_at.isoformat() if hasattr(claimed_at, "isoformat") else claimed_at,
+                "running": running,
+                "stale_claim": stale_claim,
+                "member_count": 0,
+                "last_error": _bounded_snapshot_text(data.get("last_error")),
+                "skipped_reason": _bounded_snapshot_text(data.get("skipped_reason") or data.get("reason")),
+            }
+
+        member_counts = {
+            segment_id: int(count or 0)
+            for segment_id, count in db.execute(
+                """
+                select segment_id, count(*)::int
+                from automation_segment_trigger_members
+                where cid = %s and segment_id = any(%s)
+                group by segment_id
+                """,
+                cid,
+                segment_ids,
+            )
+        }
+
+        for segment_id, event_type, count in db.execute(
+            """
+            select data->>'segment_id', event_type, count(*)::int
+            from automation_trigger_events
+            where cid = %s
+                and event_type in ('segment_entered', 'segment_left')
+                and data->>'segment_id' = any(%s)
+                and ts >= %s
+            group by data->>'segment_id', event_type
+            """,
+            cid,
+            segment_ids,
+            event_cutoff,
+        ):
+            recent_event_counts.setdefault(segment_id, {
+                "segment_entered": 0,
+                "segment_left": 0,
+            })[event_type] = int(count or 0)
+
+    summary = {
+        "referenced_segments": len(referenced),
+        "returned_segments": len(segment_ids),
+        "missing_snapshots": 0,
+        "baseline_complete": 0,
+        "baseline_incomplete": 0,
+        "running": 0,
+        "stale_claims": 0,
+        "members": 0,
+        "recent_events": {
+            "segment_entered": 0,
+            "segment_left": 0,
+        },
+    }
+    segments = []
+    for segment_id in segment_ids:
+        snapshot = snapshots.get(segment_id) or {
+            "exists": False,
+            "status": "baseline_needed",
+            "baseline_complete": False,
+            "hashlimit": None,
+            "last_hashval": None,
+            "last_started_at": None,
+            "last_completed_at": None,
+            "claimed_at": None,
+            "running": False,
+            "stale_claim": False,
+            "member_count": 0,
+            "last_error": "",
+            "skipped_reason": "",
+        }
+        snapshot["member_count"] = member_counts.get(segment_id, 0)
+        events = recent_event_counts.get(segment_id) or {
+            "segment_entered": 0,
+            "segment_left": 0,
+        }
+
+        if not snapshot["exists"]:
+            summary["missing_snapshots"] += 1
+        elif snapshot["baseline_complete"]:
+            summary["baseline_complete"] += 1
+        else:
+            summary["baseline_incomplete"] += 1
+        if snapshot["running"]:
+            summary["running"] += 1
+        if snapshot["stale_claim"]:
+            summary["stale_claims"] += 1
+        summary["members"] += snapshot["member_count"]
+        summary["recent_events"]["segment_entered"] += events["segment_entered"]
+        summary["recent_events"]["segment_left"] += events["segment_left"]
+
+        segments.append({
+            **referenced[segment_id],
+            "snapshot": snapshot,
+            "recent_events": events,
+        })
+
+    return {
+        "summary": summary,
+        "segments": segments,
+        "flags": _automation_segment_trigger_status_flags(db, cid),
+        "limit": limit,
+        "reference_limit": AUTOMATION_SEGMENT_TRIGGER_STATUS_REFERENCE_LIMIT,
+        "event_window_days": AUTOMATION_SEGMENT_TRIGGER_STATUS_EVENT_DAYS,
     }
 
 
@@ -6948,6 +7212,18 @@ class AutomationProcessingStatus(object):
         db = req.context["db"]
         cid = db.get_cid()
         req.context["result"] = _automation_processing_status(db, cid)
+
+
+class AutomationSegmentTriggerStatus(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req)
+        check_automation_diagnostics(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit = _automation_segment_trigger_status_limit(req.get_param("limit"))
+        req.context["result"] = _automation_segment_trigger_status(db, cid, limit)
 
 
 class AutomationTriggerEvents(object):
