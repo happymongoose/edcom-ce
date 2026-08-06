@@ -509,6 +509,7 @@ class Automation extends Component {
       historyContactSearch: '',
       historyContactPage: 1,
       historyContactSort: 'recent_desc',
+      isRefreshingPreflight: false,
     };
   }
 
@@ -1084,6 +1085,17 @@ class Automation extends Component {
       notify.show(errorMessage(error, 'Unable to delete automation email'), 'error');
     } finally {
       this.setState({deletingEmailId: null});
+    }
+  }
+
+  refreshPreflight = async () => {
+    this.setState({isRefreshingPreflight: true});
+    try {
+      await this.props.reloadExtra();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to refresh email sending readiness'), 'error');
+    } finally {
+      this.setState({isRefreshingPreflight: false});
     }
   }
 
@@ -1678,6 +1690,122 @@ class Automation extends Component {
     );
   }
 
+  renderPreflightMessages(messages, className) {
+    if (!messages || !messages.length) {
+      return null;
+    }
+    return (
+      <ul className={className} style={{marginBottom: 0}}>
+        {_.map(messages, (message, index) =>
+          <li key={message.code + '-' + index}>{message.message}</li>
+        )}
+      </ul>
+    );
+  }
+
+  renderPreflight() {
+    const preflight = this.props.preflightData;
+    if (!preflight) {
+      return (
+        <EDFormBox space>
+          <div className="flex-items space-between">
+            <h4>Email sending readiness</h4>
+            <Button onClick={this.refreshPreflight} disabled={this.state.isRefreshingPreflight}>
+              Refresh
+            </Button>
+          </div>
+          <p className="text-muted">Email sending readiness has not loaded yet.</p>
+        </EDFormBox>
+      );
+    }
+
+    const errors = preflight.errors || [];
+    const warnings = preflight.warnings || [];
+    const info = preflight.info || [];
+    const nodes = preflight.nodes || [];
+    const route = preflight.route || {};
+    let statusText = 'Ready';
+    let statusClass = 'text-success';
+    if (errors.length) {
+      statusText = 'Errors';
+      statusClass = 'text-danger';
+    } else if (warnings.length) {
+      statusText = 'Warnings';
+      statusClass = 'text-warning';
+    }
+
+    return (
+      <EDFormBox space>
+        <div className="flex-items space-between">
+          <h4>
+            Email sending readiness
+            {' '}
+            <span className={statusClass} style={{fontWeight: 'normal'}}>
+              {statusText}
+            </span>
+          </h4>
+          <Button onClick={this.refreshPreflight} disabled={this.state.isRefreshingPreflight}>
+            {this.state.isRefreshingPreflight ? 'Refreshing...' : 'Refresh'}
+          </Button>
+        </div>
+        <p className="text-muted">
+          Checking saved {preflight.mode || 'draft'} send-email configuration.
+        </p>
+        {
+          route.status ?
+            <p>
+              Route: {route.route_name || route.route_id || route.status}
+              {' '}
+              <span className="text-muted">({route.status})</span>
+            </p>
+          :
+            null
+        }
+        {this.renderPreflightMessages(errors, 'text-danger')}
+        {this.renderPreflightMessages(warnings, 'text-warning')}
+        {this.renderPreflightMessages(info, 'text-muted')}
+        {
+          nodes.length ?
+            <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Email</th>
+                  <th>Subject</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              {
+                _.map(nodes, (node, index) => {
+                  const nodeErrors = node.errors || [];
+                  const nodeWarnings = node.warnings || [];
+                  return (
+                    <EDTableRow key={node.node_id || index} index={index}>
+                      <td>{node.step}</td>
+                      <td>{node.email_name || node.automation_email_id || 'Missing email'}</td>
+                      <td>{node.subject || 'No subject'}</td>
+                      <td>
+                        {
+                          nodeErrors.length ?
+                            this.renderPreflightMessages(nodeErrors, 'text-danger')
+                          : nodeWarnings.length ?
+                            this.renderPreflightMessages(nodeWarnings, 'text-warning')
+                          :
+                            <span className="text-success">Ready</span>
+                        }
+                      </td>
+                    </EDTableRow>
+                  );
+                })
+              }
+            </EDTable>
+          :
+            <p className="help-block">This workflow has no send-email nodes.</p>
+        }
+      </EDFormBox>
+    );
+  }
+
   renderStepRuns(enrolment) {
     if (!enrolment.step_runs || !enrolment.step_runs.length) {
       return <p>No step runs recorded for this pass.</p>;
@@ -1985,6 +2113,7 @@ class Automation extends Component {
               />
             </EDFormBox>
             {this.renderEmails()}
+            {this.renderPreflight()}
             <EDFormBox space>
               <div className="flex-items space-between">
                 <h4>Draft Workflow</h4>
@@ -2123,6 +2252,7 @@ export default withLoadSave({
     lists: async () => _.sortBy((await axios.get('/api/lists')).data, l => (l.name || '').toLowerCase()),
     segments: async () => _.sortBy((await axios.get('/api/segments')).data, s => (s.name || '').toLowerCase()),
     enrolmentsData: async ({id}) => (await axios.get('/api/automations/' + id + '/enrolments?summary=true')).data,
+    preflightData: async ({id}) => (await axios.get('/api/automations/' + id + '/preflight?mode=draft')).data,
     historyData: async ({id, user, loggedInImpersonate}) => {
       if (!canViewAutomationDiagnostics({user, loggedInImpersonate})) {
         return {enrolments: [], events: []};

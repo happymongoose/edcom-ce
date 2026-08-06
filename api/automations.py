@@ -28,7 +28,7 @@ from .shared.utils import is_true
 from .shared.utils import generate_html, remove_newlines
 from .shared.utils import check_automation_diagnostics
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
-from .shared.send import check_test_limit, send_backend_mail
+from .shared.send import check_test_limit, send_backend_mail, validate_sender_domains
 from .transactional import add_test_txn_log
 from .shared.segments import (
     Cache,
@@ -1680,6 +1680,283 @@ def _automation_email_sender(email_doc: JsonObj) -> tuple[str, str, str, str]:
     return fromname, fromemail, returnpath, replyto
 
 
+def _automation_preflight_message(severity: str, code: str, message: str) -> JsonObj:
+    return {
+        "severity": severity,
+        "code": code,
+        "message": _bounded_error_text(message),
+    }
+
+
+def _automation_email_has_body(email_doc: JsonObj) -> bool:
+    email_type = email_doc.get("type", "raw")
+    raw = email_doc.get("rawText")
+    parts = email_doc.get("parts") or []
+    if email_type in ("raw", "wysiwyg", "beefree"):
+        return bool(str(raw or "").strip())
+    return bool(str(raw or "").strip()) or bool(parts)
+
+
+def _preflight_email_address(address: str, label: str, required: bool) -> JsonObj | None:
+    value = (address or "").strip()
+    if not value:
+        if required:
+            return _automation_preflight_message(
+                "error",
+                "missing_%s" % label,
+                "%s is required." % label.replace("_", " ").title(),
+            )
+        return None
+    _, parsed = email.utils.parseaddr(value)
+    if "@" not in (parsed or value):
+        return _automation_preflight_message(
+            "error",
+            "invalid_%s" % label,
+            "%s must be a valid email address." % label.replace("_", " ").title(),
+        )
+    return None
+
+
+def _route_policy_ids(route: JsonObj) -> list[str]:
+    published = route.get("published") or {}
+    policy_ids = []
+    for rule in published.get("rules") or route.get("rules") or []:
+        for split in rule.get("splits") or []:
+            policy = split.get("policy") or ""
+            if policy:
+                policy_ids.append(policy)
+    return policy_ids
+
+
+def _automation_preflight_route(db: DB, cid: str) -> JsonObj:
+    result: JsonObj = {
+        "status": "unknown",
+        "route_id": None,
+        "route_name": "",
+        "ready_for_debug": False,
+        "errors": [],
+        "warnings": [],
+    }
+    oldcid = db.get_cid()
+    db.set_cid(None)
+    try:
+        company = db.companies.get(cid)
+        if company is None:
+            result["errors"].append(
+                _automation_preflight_message("error", "missing_account", "Customer account was not found.")
+            )
+            result["status"] = "missing"
+            return result
+
+        published_routes = []
+        for route_id in company.get("routes") or []:
+            route = db.routes.get(route_id)
+            if route is not None and route.get("published") is not None:
+                published_routes.append(route)
+
+        if not published_routes:
+            result["status"] = "missing"
+            result["errors"].append(
+                _automation_preflight_message(
+                    "error",
+                    "no_route",
+                    "Assign exactly one published postal route to this account before sending automation emails.",
+                )
+            )
+            return result
+        if len(published_routes) > 1:
+            result["status"] = "multiple"
+            result["errors"].append(
+                _automation_preflight_message(
+                    "error",
+                    "multiple_routes",
+                    "Automation email execution requires exactly one published postal route for this account.",
+                )
+            )
+            return result
+
+        route = published_routes[0]
+        result["route_id"] = route.get("id")
+        result["route_name"] = route.get("name") or route.get("id") or ""
+        policy_ids = _route_policy_ids(route)
+        if not policy_ids:
+            result["status"] = "drop_all"
+            result["errors"].append(
+                _automation_preflight_message(
+                    "error",
+                    "drop_all_route",
+                    "The assigned postal route has no sending backend. Real automation execution will not send email.",
+                )
+            )
+            return result
+
+        db.set_cid(route["cid"])
+        debug_backend_ids = {backend["id"] for backend in db.debug_email_backends.find()}
+        debug_policy_ids = [policy_id for policy_id in policy_ids if policy_id in debug_backend_ids]
+        if debug_policy_ids and len(debug_policy_ids) == len(policy_ids):
+            result["status"] = "debug_log"
+            result["ready_for_debug"] = True
+            result["warnings"].append(
+                _automation_preflight_message(
+                    "warning",
+                    "debug_route",
+                    "The assigned route uses the debug_log backend. This is suitable for dev testing, not production sending.",
+                )
+            )
+            return result
+        if debug_policy_ids:
+            result["status"] = "mixed_debug"
+            result["warnings"].append(
+                _automation_preflight_message(
+                    "warning",
+                    "mixed_debug_route",
+                    "The assigned route includes a debug_log backend split. Confirm route configuration before production use.",
+                )
+            )
+            return result
+
+        result["status"] = "published_route"
+        return result
+    finally:
+        db.set_cid(oldcid)
+
+
+def _automation_email_preflight(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    node: JsonObj,
+    step: int,
+) -> JsonObj:
+    node_result: JsonObj = {
+        "node_id": node.get("id"),
+        "step": step,
+        "label": node.get("label") or "",
+        "type": node.get("type"),
+        "automation_email_id": node.get("automation_email_id") or "",
+        "email_name": "",
+        "subject": "",
+        "editor_type": "",
+        "errors": [],
+        "warnings": [],
+    }
+    automation_email_id = node.get("automation_email_id")
+    email_doc = _automation_email_obj(
+        db.row(
+            """
+            select id, cid, automation_id, data
+            from automation_emails
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            cid,
+            automation_id,
+            automation_email_id,
+        )
+    )
+    if email_doc is None:
+        node_result["errors"].append(
+            _automation_preflight_message(
+                "error",
+                "missing_email",
+                "Step %s references an automation email that was not found." % step,
+            )
+        )
+        return node_result
+
+    node_result["email_name"] = email_doc.get("name") or ""
+    node_result["subject"] = email_doc.get("subject") or ""
+    node_result["editor_type"] = email_doc.get("type", "raw")
+
+    if not (email_doc.get("fromname") or "").strip():
+        node_result["errors"].append(
+            _automation_preflight_message("error", "missing_fromname", "From Name is required.")
+        )
+    returnpath_error = _preflight_email_address(email_doc.get("returnpath") or "", "returnpath", True)
+    if returnpath_error is not None:
+        node_result["errors"].append(returnpath_error)
+    fromemail_error = _preflight_email_address(email_doc.get("fromemail") or "", "fromemail", False)
+    if fromemail_error is not None:
+        node_result["errors"].append(fromemail_error)
+    replyto_error = _preflight_email_address(email_doc.get("replyto") or "", "replyto", False)
+    if replyto_error is not None:
+        node_result["errors"].append(replyto_error)
+    if not (email_doc.get("subject") or "").strip():
+        node_result["errors"].append(
+            _automation_preflight_message("error", "missing_subject", "Email subject is required.")
+        )
+    if not _automation_email_has_body(email_doc):
+        node_result["errors"].append(
+            _automation_preflight_message("error", "missing_body", "Email body/content is required.")
+        )
+
+    try:
+        validate_sender_domains(
+            db,
+            cid,
+            email_doc.get("fromemail") or email_doc.get("returnpath"),
+            email_doc.get("returnpath"),
+        )
+    except falcon.HTTPError as e:
+        node_result["errors"].append(
+            _automation_preflight_message(
+                "error",
+                "sender_domain_not_verified",
+                e.description or e.title or "Sender domain is not verified.",
+            )
+        )
+
+    return node_result
+
+
+def _automation_send_email_preflight(db: DB, cid: str, automation: JsonObj, mode: str) -> JsonObj:
+    if mode not in ("draft", "published"):
+        raise falcon.HTTPBadRequest(
+            title="Invalid preflight mode",
+            description="mode must be draft or published.",
+        )
+    workflow = automation.get(mode) or {}
+    nodes = workflow.get("nodes") or []
+    send_nodes = [
+        (index, node)
+        for index, node in enumerate(nodes)
+        if node.get("type") == "send_email"
+    ]
+    route = _automation_preflight_route(db, cid) if send_nodes else {}
+    result: JsonObj = {
+        "automation_id": automation.get("id"),
+        "mode": mode,
+        "ready": False,
+        "errors": [],
+        "warnings": [],
+        "info": [
+            _automation_preflight_message(
+                "info",
+                "suppression_behavior",
+                "Suppressed contacts skip send_email successfully and advance without retry/backoff.",
+            )
+        ],
+        "route": route,
+        "nodes": [],
+    }
+    result["errors"].extend(route.get("errors") or [])
+    result["warnings"].extend(route.get("warnings") or [])
+    if not send_nodes:
+        result["info"].append(
+            _automation_preflight_message(
+                "info",
+                "no_send_email_nodes",
+                "This workflow has no send-email nodes.",
+            )
+        )
+    for index, node in send_nodes:
+        node_result = _automation_email_preflight(db, cid, automation["id"], node, index + 1)
+        result["nodes"].append(node_result)
+        result["errors"].extend(node_result["errors"])
+        result["warnings"].extend(node_result["warnings"])
+    result["ready"] = not result["errors"]
+    return result
+
+
 CLAIM_STALE_AFTER = timedelta(minutes=30)
 AUTOMATION_RETRY_BACKOFFS = (timedelta(minutes=5), timedelta(minutes=15), timedelta(minutes=60))
 AUTOMATION_MAX_RETRIES = len(AUTOMATION_RETRY_BACKOFFS)
@@ -2322,6 +2599,20 @@ class AutomationEmailDuplicate(object):
             data,
         )
         req.context["result"] = _get_automation_email(db, cid, id, new_email_id)
+
+
+class AutomationPreflight(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        automation = db.automations.get(id)
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        mode = req.get_param("mode") or "draft"
+        req.context["result"] = _automation_send_email_preflight(db, cid, automation, mode)
 
 
 class AutomationEmailTest(object):

@@ -21,6 +21,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.created_debug_backend_ids = []
         self.created_route_ids = []
         self.created_exclusion_items = []
+        self.created_clientdkim_ids = []
         self.created_scheduler_cids = []
         self.created_admin_user_ids = []
         self.created_admin_cookie_ids = []
@@ -44,6 +45,7 @@ class TestAutomationExecution(test_base.TestBase):
         self.cleanup_scheduler_accounts()
         self.cleanup_admin_cookie()
         self.cleanup_debug_routes()
+        self.cleanup_clientdkim()
         self.cleanup_contacts_and_lists()
         super(TestAutomationExecution, self).tearDown()
 
@@ -182,6 +184,14 @@ class TestAutomationExecution(test_base.TestBase):
                 self.created_route_ids,
             )
             self.created_route_ids = []
+
+    def cleanup_clientdkim(self):
+        if self.created_clientdkim_ids:
+            self.db.execute(
+                "delete from clientdkim where id = any(%s)",
+                self.created_clientdkim_ids,
+            )
+            self.created_clientdkim_ids = []
 
     def cleanup_contacts_and_lists(self):
         cid = self.user_cookie["cid"]
@@ -933,6 +943,25 @@ class TestAutomationExecution(test_base.TestBase):
         route_id = self.create_debug_route()
         self.assign_company_routes([route_id])
         return route_id
+
+    def add_verified_sender_domain(self, domain="example.com"):
+        entry_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into clientdkim (id, cid, data) values (%s, %s, %s)",
+            entry_id,
+            self.user_cookie["cid"],
+            {
+                "name": domain,
+                "verified": True,
+            },
+        )
+        self.created_clientdkim_ids.append(entry_id)
+        return entry_id
+
+    def preflight(self, automation_id, mode="draft"):
+        return self.user_get(
+            "/api/automations/%s/preflight?mode=%s" % (automation_id, mode)
+        )
 
     def debug_email_logs(self, automation_id):
         return self.db.execute(
@@ -1772,6 +1801,161 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(log_data["source_ids"]["published_revision"], automation["published_revision"])
         self.assertEqual(log_data["metadata"]["automation_id"], automation["id"])
         self.assertEqual(log_data["metadata"]["step_run_id"], step_run["id"])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_draft_and_published_use_correct_nodes(self):
+        self.assign_single_debug_route()
+        self.add_verified_sender_domain()
+        automation = self.create_send_email_automation()
+        replacement_email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Draft replacement",
+                "subject": "Draft subject",
+                "rawText": "<p>Draft body</p>",
+                "fromname": "",
+                "returnpath": "automation-sender@example.com",
+            },
+        )
+        self.db.set_cid(self.user_cookie["cid"])
+        draft = automation["draft"].copy()
+        draft["nodes"][0] = draft["nodes"][0].copy()
+        draft["nodes"][0]["automation_email_id"] = replacement_email["id"]
+        self.db.automations.patch(automation["id"], {"draft": draft})
+
+        draft = self.preflight(automation["id"], "draft")
+        published = self.preflight(automation["id"], "published")
+
+        self.assertFalse(draft["ready"])
+        self.assertEqual(draft["nodes"][0]["automation_email_id"], replacement_email["id"])
+        self.assertEqual(draft["nodes"][0]["errors"][0]["code"], "missing_fromname")
+        self.assertTrue(published["ready"])
+        self.assertEqual(published["nodes"][0]["automation_email_id"], automation["execution_email_id"])
+        self.assertEqual(published["route"]["status"], "debug_log")
+        self.assertTrue(published["route"]["ready_for_debug"])
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_missing_email_error(self):
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+        self.db.set_cid(self.user_cookie["cid"])
+        draft = automation["draft"].copy()
+        draft["nodes"][0] = draft["nodes"][0].copy()
+        draft["nodes"][0]["automation_email_id"] = "missing-email-id"
+        self.db.automations.patch(automation["id"], {"draft": draft})
+
+        result = self.preflight(automation["id"], "draft")
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["nodes"][0]["errors"][0]["code"], "missing_email")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_no_send_email_nodes_is_ready_info_state(self):
+        automation = self.create_automation()
+        self.assign_company_routes([])
+
+        result = self.preflight(automation["id"], "published")
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["nodes"], [])
+        self.assertEqual(result["route"], {})
+        self.assertIn("no_send_email_nodes", {info["code"] for info in result["info"]})
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_missing_sender_subject_and_body_errors(self):
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation_with_options(fromname="", returnpath="")
+        self.db.execute(
+            """
+            update automation_emails
+            set data = data || %s
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            {
+                "subject": "",
+                "rawText": "",
+                "parts": [],
+            },
+            self.user_cookie["cid"],
+            automation["id"],
+            automation["execution_email_id"],
+        )
+
+        result = self.preflight(automation["id"], "published")
+        codes = {error["code"] for error in result["nodes"][0]["errors"]}
+
+        self.assertFalse(result["ready"])
+        self.assertTrue({"missing_fromname", "missing_returnpath", "missing_subject", "missing_body"}.issubset(codes))
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_no_route_and_multiple_route_errors(self):
+        self.add_verified_sender_domain()
+        automation = self.create_send_email_automation()
+        self.assign_company_routes([])
+
+        no_route = self.preflight(automation["id"], "published")
+        self.assertFalse(no_route["ready"])
+        self.assertEqual(no_route["route"]["status"], "missing")
+        self.assertEqual(no_route["route"]["errors"][0]["code"], "no_route")
+
+        first_route = self.create_debug_route()
+        second_route = self.create_debug_route()
+        self.assign_company_routes([first_route, second_route])
+        multiple = self.preflight(automation["id"], "published")
+        self.assertFalse(multiple["ready"])
+        self.assertEqual(multiple["route"]["status"], "multiple")
+        self.assertEqual(multiple["route"]["errors"][0]["code"], "multiple_routes")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_drop_all_route_errors(self):
+        self.add_verified_sender_domain()
+        route_id = self.create_drop_all_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["route"]["status"], "drop_all")
+        self.assertEqual(result["route"]["route_id"], route_id)
+        self.assertEqual(result["route"]["errors"][0]["code"], "drop_all_route")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_unverified_sender_domain_errors(self):
+        self.assign_single_debug_route()
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+        codes = {error["code"] for error in result["nodes"][0]["errors"]}
+
+        self.assertFalse(result["ready"])
+        self.assertIn("sender_domain_not_verified", codes)
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_account_scoped(self):
+        automation = self.create_send_email_automation()
+
+        scoped = self.simulate_get(
+            "/api/automations/%s/preflight?mode=published" % automation["id"],
+            headers=self.admin_impersonation_headers(),
+        )
+        self.assertEqual(scoped.status_code, 200)
+        self.assertEqual(scoped.json["automation_id"], automation["id"])
+
+        result = self.simulate_get(
+            "/api/automations/%s/preflight?mode=published" % automation["id"],
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(result.status_code, 401)
 
         self.cleanup(automation["id"])
 
