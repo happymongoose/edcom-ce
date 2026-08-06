@@ -6082,6 +6082,123 @@ def _diff_automation_segment_triggers(
     return result
 
 
+def _segment_trigger_scan_result_summary(result: JsonObj) -> JsonObj:
+    return {
+        key: result.get(key)
+        for key in (
+            "enabled",
+            "mode",
+            "segments_seen",
+            "segments_claimed",
+            "buckets_processed",
+            "members_upserted",
+            "members_removed",
+            "events_created",
+            "segment_entered_events_created",
+            "segment_left_events_created",
+            "event_limit_reached",
+        )
+        if key in result
+    }
+
+
+@tasks.task(priority=HIGH_PRIORITY)
+def process_automation_segment_triggers_task(
+    cid: str,
+    mode: str = "baseline",
+    segment_id: str | None = None,
+    limit_segments: int | None = None,
+    limit_buckets: int | None = None,
+    limit_events: int | None = None,
+) -> JsonObj:
+    mode = (mode or "baseline").strip().lower()
+    if mode not in ("baseline", "diff"):
+        result = {
+            "enabled": False,
+            "mode": mode,
+            "segments_seen": 0,
+            "segments_claimed": 0,
+            "buckets_processed": 0,
+            "members_upserted": 0,
+            "members_removed": 0,
+            "events_created": 0,
+            "skipped": [],
+            "errors": [{
+                "title": "Invalid automation segment trigger scan mode",
+                "description": "mode must be baseline or diff.",
+            }],
+        }
+        log.info("Skipped automation segment trigger scan cid=%s mode=%s result=%s", cid, mode, _segment_trigger_scan_result_summary(result))
+        return result
+
+    with open_db() as db:
+        if not cid or db.single("select id from companies where id = %s", cid) is None:
+            result = {
+                "enabled": False,
+                "mode": mode,
+                "segments_seen": 0,
+                "segments_claimed": 0,
+                "buckets_processed": 0,
+                "members_upserted": 0,
+                "members_removed": 0,
+                "events_created": 0,
+                "skipped": [],
+                "errors": [{
+                    "title": "Customer account not found",
+                    "description": "Automation segment trigger scans require an existing customer account.",
+                }],
+            }
+            log.info("Skipped automation segment trigger scan cid=%s mode=%s result=%s", cid, mode, _segment_trigger_scan_result_summary(result))
+            return result
+
+        db.set_cid(cid)
+        normalized_limit_segments = _automation_segment_baseline_limit(
+            limit_segments,
+            AUTOMATION_SEGMENT_BASELINE_DEFAULT_SEGMENT_LIMIT,
+            AUTOMATION_SEGMENT_BASELINE_MAX_SEGMENT_LIMIT,
+            "limit_segments",
+        )
+        normalized_limit_buckets = _automation_segment_baseline_limit(
+            limit_buckets,
+            AUTOMATION_SEGMENT_BASELINE_DEFAULT_BUCKET_LIMIT,
+            AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT,
+            "limit_buckets",
+        )
+
+        if mode == "diff":
+            normalized_limit_events = _automation_segment_diff_event_limit(limit_events)
+            result = _diff_automation_segment_triggers(
+                db,
+                cid,
+                segment_id,
+                normalized_limit_segments,
+                normalized_limit_buckets,
+                normalized_limit_events,
+            )
+        else:
+            result = _baseline_automation_segment_triggers(
+                db,
+                cid,
+                segment_id,
+                normalized_limit_segments,
+                normalized_limit_buckets,
+            )
+
+        log.info(
+            "Processed automation segment trigger scan cid=%s mode=%s segment_id=%s limits=%s result=%s",
+            cid,
+            mode,
+            segment_id,
+            {
+                "limit_segments": normalized_limit_segments,
+                "limit_buckets": normalized_limit_buckets,
+                "limit_events": _automation_segment_diff_event_limit(limit_events) if mode == "diff" else None,
+            },
+            _segment_trigger_scan_result_summary(result),
+        )
+        return result
+
+
 def _eligible_automation_enrolments(
     db: DB,
     cid: str,

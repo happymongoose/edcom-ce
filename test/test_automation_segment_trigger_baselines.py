@@ -3,6 +3,7 @@ import shortuuid
 from datetime import datetime, timedelta
 
 import test_base
+from api import automations
 from api.migrations import (
     add_automation_segment_trigger_baselines_table,
     add_automation_trigger_events_table,
@@ -278,6 +279,16 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
     def diff(self, **doc):
         doc["mode"] = "diff"
         return self.user_post("/api/automation-segment-trigger-baselines", json=doc)
+
+    def scan_task(self, mode="baseline", segment_id=None, limit_segments=None, limit_buckets=None, limit_events=None):
+        return automations.process_automation_segment_triggers_task(
+            self.user_cookie["cid"],
+            mode,
+            segment_id,
+            limit_segments,
+            limit_buckets,
+            limit_events,
+        )
 
     def snapshot(self, segment_id):
         return self.db.row(
@@ -950,3 +961,102 @@ class TestAutomationSegmentTriggerBaselines(test_base.TestBase):
             contact_id,
         )
         self.assertEqual(enrolment_count, 1)
+
+    def test_baseline_task_path(self):
+        self.enable_baseline()
+        lst = self.create_contact_list()
+        email, _ = self.add_contact(lst["id"])
+        segment = self.create_segment(prefix=email)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+
+        result = self.scan_task("baseline", segment["id"])
+
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["segments_seen"], 1)
+        self.assertEqual(result["segments_claimed"], 1)
+        self.assertEqual(result["events_created"], 0)
+        self.assertEqual(self.member_count(segment["id"]), 1)
+
+    def test_diff_task_path(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        segment = self.create_segment(prefix=self.test_id)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+        self.add_contact(lst["id"])
+
+        result = self.scan_task("diff", segment["id"])
+
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["mode"], "diff")
+        self.assertEqual(result["events_created"], 1)
+        self.assertEqual(len(self.segment_trigger_events(segment["id"])), 1)
+
+    def test_task_respects_baseline_flag_off(self):
+        segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+
+        result = self.scan_task("baseline", segment["id"])
+
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["events_created"], 0)
+        self.assertIsNone(self.snapshot(segment["id"]))
+
+    def test_task_respects_diff_flag_off(self):
+        self.enable_baseline()
+        lst = self.create_contact_list()
+        email, _ = self.add_contact(lst["id"])
+        segment = self.create_segment(prefix=email)
+        self.create_automation({"type": "segment_entered", "segment_id": segment["id"]})
+        self.baseline(segment_id=segment["id"])
+
+        result = self.scan_task("diff", segment["id"])
+
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["events_created"], 0)
+
+    def test_task_normalizes_and_caps_limits(self):
+        self.enable_baseline()
+        self.enable_diff()
+        lst = self.create_contact_list()
+        first_segment = self.create_segment(prefix="%s_one" % self.test_id)
+        second_segment = self.create_segment(prefix="%s_two" % self.test_id)
+        self.create_automation({"type": "segment_entered", "segment_id": first_segment["id"]})
+        self.create_automation({"type": "segment_entered", "segment_id": second_segment["id"]})
+        self.add_contact(lst["id"], "%s_one@example.com" % self.test_id)
+        self.add_contact(lst["id"], "%s_two@example.com" % self.test_id)
+
+        baseline = self.scan_task("baseline", None, 1, 10000)
+        self.assertEqual(baseline["segments_seen"], 2)
+        self.assertEqual(baseline["segments_claimed"], 1)
+
+        segment_id = self.snapshot_segment_ids()[0]
+        self.add_contact(lst["id"], "%s_extra@example.com" % self.test_id)
+        diff = self.scan_task("diff", segment_id, 10, 10000, 10000)
+        self.assertLessEqual(diff["buckets_processed"], automations.AUTOMATION_SEGMENT_BASELINE_MAX_BUCKET_LIMIT)
+        self.assertLessEqual(diff["events_created"], automations.AUTOMATION_SEGMENT_DIFF_MAX_EVENT_LIMIT)
+
+    def test_task_invalid_mode_fails_clearly(self):
+        result = self.scan_task("sideways")
+
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["mode"], "sideways")
+        self.assertEqual(result["events_created"], 0)
+        self.assertEqual(result["errors"][0]["title"], "Invalid automation segment trigger scan mode")
+
+    def test_task_segment_id_scoping(self):
+        self.enable_baseline()
+        first_segment = self.create_segment()
+        second_segment = self.create_segment()
+        self.create_automation({"type": "segment_entered", "segment_id": first_segment["id"]})
+        self.create_automation({"type": "segment_entered", "segment_id": second_segment["id"]})
+
+        result = self.scan_task("baseline", second_segment["id"])
+
+        self.assertEqual(result["segments_seen"], 1)
+        self.assertIsNone(self.snapshot(first_segment["id"]))
+        self.assertIsNotNone(self.snapshot(second_segment["id"]))
+
+    def test_no_scheduler_or_cron_registration_for_segment_scan_task(self):
+        self.assertFalse(hasattr(automations, "check_automation_segment_triggers"))
