@@ -2539,6 +2539,124 @@ class Segment(CRUDSingle):
                 )
 
 
+class SegmentContacts(object):
+
+    def _get_page_param(self, req: falcon.Request, name: str, default: int, maximum: int) -> int:
+        value = req.get_param_as_int(name) or default
+        return max(1, min(value, maximum))
+
+    def _evaluate_contacts(
+        self,
+        db: DB,
+        cid: str,
+        segment: JsonObj,
+        search: str,
+    ) -> List[JsonObj]:
+        segments: Dict[str, JsonObj | None] = {}
+        segment_get_segments(db, segment.get("parts", []), segments)
+        campaignids = segment_get_campaignids(segment, list(segments.values()))
+        hashlimit, listfactors = segment_get_params(db, cid, segment)
+
+        rowset = None
+        if search:
+            rowset = {
+                email
+                for (email,) in db.execute(
+                    f"""
+                    select email
+                    from contacts."contacts_{cid}"
+                    where lower(email) like %s
+                    """,
+                    "%%%s%%" % search,
+                )
+            }
+            if not rowset:
+                return []
+
+        emails = set()
+        cache = Cache()
+        for hashval in range(hashlimit):
+            sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+            rows = get_segment_rows(db, cid, hashval, listfactors, hashlimit, rowset=rowset)
+            segcounts: Dict[str, int] = {}
+            numrows = len(rows)
+            for row in rows:
+                email = row.get("Email", [""])[0]
+                if search and search not in email.lower():
+                    continue
+                if segment_eval_parts(
+                    segment.get("parts", []),
+                    segment.get("operator", "and"),
+                    row,
+                    segcounts,
+                    numrows,
+                    segments,
+                    sentrows,
+                    segment,
+                    hashlimit,
+                    cache,
+                ):
+                    emails.add(email)
+
+        if not emails:
+            return []
+
+        return [
+            {
+                "contact_id": contact_id,
+                "email": email,
+                "added": added.isoformat() + "Z" if hasattr(added, "isoformat") else added,
+            }
+            for contact_id, email, added in db.execute(
+                f"""
+                select contact_id, email, added
+                from contacts."contacts_{cid}"
+                where email = any(%s)
+                order by lower(email), contact_id
+                """,
+                list(emails),
+            )
+        ]
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+
+        segment = db.segments.get(id)
+        if segment is None or segment.get("cid") != cid:
+            raise falcon.HTTPForbidden()
+
+        page = self._get_page_param(req, "page", 1, 1000000)
+        page_size = self._get_page_param(req, "page_size", 50, 100)
+        search = (req.get_param("search") or "").strip().lower()[:255]
+
+        try:
+            contacts = self._evaluate_contacts(db, cid, segment, search)
+        except Exception as exc:
+            raise falcon.HTTPBadRequest(
+                title="Unable to evaluate segment",
+                description=str(exc),
+            )
+
+        total = len(contacts)
+        offset = (page - 1) * page_size
+        req.context["result"] = {
+            "segment": {
+                "id": segment["id"],
+                "name": segment.get("name", segment["id"]),
+                "count": segment.get("count"),
+            },
+            "contacts": contacts[offset:offset + page_size],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "search": search,
+        }
+
+
 class SegmentExport(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:

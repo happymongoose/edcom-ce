@@ -14,6 +14,7 @@ import SearchControl from "../components/SearchControl";
 import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
 import Select2 from "react-select2-wrapper";
+import { automationImpersonatedHref } from "./Automation";
 
 import "react-select2-wrapper/css/select2.css";
 import './Segments.css';
@@ -130,6 +131,14 @@ class Segments extends Component {
       bulkEnrolling: false,
       bulkResult: null,
     });
+  }
+
+  viewContactsClicked = segment => {
+    const href = automationImpersonatedHref(
+      '/segments/' + segment.id + '/contacts',
+      this.props.loggedInImpersonate
+    );
+    window.open(href, '_blank', 'noopener,noreferrer');
   }
 
   closeBulkEnrolmentModal = () => {
@@ -437,6 +446,7 @@ class Segments extends Component {
                           prompt={`Are you sure you wish to delete '${s.name}'?`}
                           onConfirm={this.deleteConfirmClicked.bind(this, s.id)}>
                           <MenuItem onClick={() => this.props.history.push('/segments/edit?id=' + s.id)}>Edit</MenuItem>
+                          <MenuItem onClick={this.viewContactsClicked.bind(this, s)}>View Contacts</MenuItem>
                           <MenuItem onClick={this.tagClicked.bind(this, s.id)}>Tag</MenuItem>
                           <MenuItem onClick={this.untagClicked.bind(this, s.id)}>Untag</MenuItem>
                           <MenuItem onClick={this.addToAutomationClicked.bind(this, s)}>Add to Automation</MenuItem>

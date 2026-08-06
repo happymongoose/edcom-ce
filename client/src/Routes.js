@@ -68,6 +68,7 @@ import ContactsAllTags from "./containers/ContactsAllTags";
 import ContactsRetrieval from "./containers/ContactsRetrieval";
 import Segments from "./containers/Segments";
 import Segment from "./containers/Segment";
+import SegmentContacts from "./containers/SegmentContacts";
 import Suppression from "./containers/Suppression";
 import SuppressionNew from "./containers/SuppressionNew";
 import SuppressionEdit from "./containers/SuppressionEdit";
@@ -193,6 +194,7 @@ export default ({ childProps }) => {
     <AppliedRoute path="/contacts/editcontact" exact component={ContactEdit} props={childProps} />
     <AppliedRoute path="/segments" exact component={Segments} props={childProps} />
     <AppliedRoute path="/segments/edit" exact component={Segment} props={childProps} />
+    <AppliedRoute path="/segments/:id/contacts" exact component={SegmentContacts} props={childProps} />
     <AppliedRoute path="/suppression" exact component={Suppression} props={childProps} />
     <AppliedRoute path="/suppression/new" exact component={SuppressionNew} props={childProps} />
     <AppliedRoute path="/suppression/edit" exact component={SuppressionEdit} props={childProps} />
