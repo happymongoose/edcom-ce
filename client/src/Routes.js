@@ -65,6 +65,7 @@ import ContactsAddUnsubs from "./containers/ContactsAddUnsubs";
 import ContactsFind from "./containers/ContactsFind";
 import ContactsDomains from "./containers/ContactsDomains";
 import ContactsAllTags from "./containers/ContactsAllTags";
+import ContactsAll from "./containers/ContactsAll";
 import ContactsRetrieval from "./containers/ContactsRetrieval";
 import Segments from "./containers/Segments";
 import Segment from "./containers/Segment";
@@ -189,6 +190,7 @@ export default ({ childProps }) => {
     <AppliedRoute path="/contacts/add" exact component={ContactsAdd} props={childProps} />
     <AppliedRoute path="/contacts/addunsubs" exact component={ContactsAddUnsubs} props={childProps} />
     <AppliedRoute path="/contacts/find" exact component={ContactsFind} props={childProps} />
+    <AppliedRoute path="/contacts/all" exact component={ContactsAll} props={childProps} />
     <AppliedRoute path="/contacts/alltags" exact component={ContactsAllTags} props={childProps} />
     <AppliedRoute path="/contacts/retrieval" exact component={ContactsRetrieval} props={childProps} />
     <AppliedRoute path="/contacts/editcontact" exact component={ContactEdit} props={childProps} />

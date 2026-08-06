@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, FormControl, MenuItem, Modal, Nav, NavItem, Tooltip, OverlayTrigger } from "react-bootstrap";
+import { Button, DropdownButton, FormControl, MenuItem, Modal, Nav, NavItem, Tooltip, OverlayTrigger } from "react-bootstrap";
 import { Link } from "react-router-dom";
 import axios from "axios";
 import _ from "underscore";
@@ -208,6 +208,10 @@ class Contacts extends Component {
     this.props.history.push(url);
   }
 
+  viewAllContactsClicked = () => {
+    this.props.history.push('/contacts/all');
+  }
+
   render() {
     let minWidth = '600px';
     let maxWidth = '1200px';
@@ -315,7 +319,13 @@ class Contacts extends Component {
             </Modal.Footer>
           </Modal>
           <TitlePage title="Contact Lists" leftsize={9} rightsize={3} button={
-            <Button bsStyle="primary" onClick={this.createClicked}>Create Contact List</Button>
+            <div className="form-inline">
+              <DropdownButton id="contacts-actions-dropdown" title="Actions" pullRight>
+                <MenuItem onClick={this.viewAllContactsClicked}>View All Contacts</MenuItem>
+              </DropdownButton>
+              {' '}
+              <Button bsStyle="primary" onClick={this.createClicked}>Create Contact List</Button>
+            </div>
           } tabs={
             <EDTabs>
               <Nav className="nav-tabs space15" activeKey="1">

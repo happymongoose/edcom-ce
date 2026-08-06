@@ -138,6 +138,31 @@ class TestSegmentContacts(test_base.TestBase):
         )
         assert result.status_code == 403
 
+    def test_all_contacts_are_paginated_searchable_and_distinct(self):
+        suffix = shortuuid.uuid().lower()
+        first_list = self.create_contact_list()
+        second_list = self.create_contact_list()
+        first_email = "all-contacts-%s-0@example.com" % suffix
+        second_email = "all-contacts-%s-1@example.com" % suffix
+        self.add_contact(first_list["id"], first_email)
+        self.add_contact(first_list["id"], second_email)
+        self.add_contact(second_list["id"], first_email)
+
+        first_page = self.user_get(
+            "/api/contacts?page=1&page_size=1&search=all-contacts-%s" % suffix
+        )
+        assert first_page["total"] == 2
+        assert first_page["total_pages"] == 2
+        assert len(first_page["contacts"]) == 1
+        assert set(first_page["contacts"][0].keys()) == {"contact_id", "email", "added"}
+        assert first_page["contacts"][0]["added"].endswith("Z")
+
+        searched = self.user_get(
+            "/api/contacts?search=%s" % second_email
+        )
+        assert searched["total"] == 1
+        assert searched["contacts"][0]["email"] == second_email
+
     def test_contact_memberships_include_lists_and_matching_segments(self):
         suffix = shortuuid.uuid().lower()
         prefix = "segment-memberships-%s" % suffix

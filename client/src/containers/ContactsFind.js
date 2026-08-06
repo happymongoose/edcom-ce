@@ -532,6 +532,7 @@ export default withLoadSave({
   initial: [],
   extend: ContactsFind,
   extra: {
+    list: async ({id}) => (await axios.get('/api/lists/' + id)).data,
     tags: async() => (await axios.get('/api/recenttags')).data,
   },
 });

@@ -650,6 +650,61 @@ class ContactEmailHistory(object):
         }
 
 
+class ContactsAll(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        page = max(req.get_param_as_int("page") or 1, 1)
+        page_size = max(1, min(req.get_param_as_int("page_size") or 50, 100))
+        search = (req.get_param("search") or "").strip().lower()[:255]
+
+        params = []
+        filters = []
+        if search:
+            filters.append("lower(email) like %s")
+            params.append("%%%s%%" % search)
+        where = ("where " + " and ".join(filters)) if filters else ""
+
+        total = db.single(
+            f"""
+            select count(*)
+            from contacts."contacts_{cid}"
+            {where}
+            """,
+            *params,
+        ) or 0
+
+        rows = [
+            {
+                "contact_id": contact_id,
+                "email": email,
+                "added": datetime.utcfromtimestamp(added).isoformat() + "Z" if added else None,
+            }
+            for contact_id, email, added in db.execute(
+                f"""
+                select contact_id, email, added
+                from contacts."contacts_{cid}"
+                {where}
+                order by lower(email), contact_id
+                limit %s offset %s
+                """,
+                *(params + [page_size, (page - 1) * page_size]),
+            )
+        ]
+
+        req.context["result"] = {
+            "contacts": rows,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "search": search,
+        }
+
+
 class ContactData(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
@@ -2551,6 +2606,7 @@ class SegmentContacts(object):
         cid: str,
         segment: JsonObj,
         search: str,
+        update_count: bool = False,
     ) -> List[JsonObj]:
         segments: Dict[str, JsonObj | None] = {}
         segment_get_segments(db, segment.get("parts", []), segments)
@@ -2599,9 +2655,17 @@ class SegmentContacts(object):
                     emails.add(email)
 
         if not emails:
+            if update_count and segment.get("count") != 0:
+                db.segments.patch(
+                    segment["id"],
+                    {
+                        "count": 0,
+                        "last_update": datetime.utcnow().isoformat() + "Z",
+                    },
+                )
             return []
 
-        return [
+        contacts = [
             {
                 "contact_id": contact_id,
                 "email": email,
@@ -2617,6 +2681,15 @@ class SegmentContacts(object):
                 list(emails),
             )
         ]
+        if update_count and segment.get("count") != len(contacts):
+            db.segments.patch(
+                segment["id"],
+                {
+                    "count": len(contacts),
+                    "last_update": datetime.utcnow().isoformat() + "Z",
+                },
+            )
+        return contacts
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
@@ -2633,7 +2706,7 @@ class SegmentContacts(object):
         search = (req.get_param("search") or "").strip().lower()[:255]
 
         try:
-            contacts = self._evaluate_contacts(db, cid, segment, search)
+            contacts = self._evaluate_contacts(db, cid, segment, search, update_count=True)
         except Exception as exc:
             raise falcon.HTTPBadRequest(
                 title="Unable to evaluate segment",
@@ -2641,14 +2714,6 @@ class SegmentContacts(object):
             )
 
         total = len(contacts)
-        if segment.get("count") != total:
-            db.segments.patch(
-                segment["id"],
-                {
-                    "count": total,
-                    "last_update": datetime.utcnow().isoformat() + "Z",
-                },
-            )
         offset = (page - 1) * page_size
         req.context["result"] = {
             "segment": {
@@ -2675,37 +2740,8 @@ class ContactMemberships(object):
         contact_id: int,
         email: str,
     ) -> bool:
-        hashlimit, listfactors = segment_get_params(db, cid, segment)
-        segments: Dict[str, JsonObj | None] = {}
-        segment_get_segments(db, segment.get("parts", []), segments)
-        campaignids = segment_get_campaignids(segment, list(segments.values()))
-
-        cache = Cache()
-        for hashval in range(hashlimit):
-            sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
-            rows = get_segment_rows(db, cid, hashval, listfactors, hashlimit, rowset={email})
-            if not rows:
-                continue
-
-            segcounts: Dict[str, int] = {}
-            numrows = len(rows)
-            if any(
-                segment_eval_parts(
-                    segment.get("parts", []),
-                    segment.get("operator", "and"),
-                    row,
-                    segcounts,
-                    numrows,
-                    segments,
-                    sentrows,
-                    segment,
-                    hashlimit,
-                    cache,
-                )
-                for row in rows
-            ):
-                return True
-        return False
+        contacts = SegmentContacts()._evaluate_contacts(db, cid, segment, email.lower())
+        return any(contact.get("email", "").lower() == email.lower() for contact in contacts)
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
         check_noadmin(req, True)
