@@ -87,6 +87,22 @@ Manual enrolment remains a permanent supported explicit action regardless of ent
 - Non-retryable configuration/validation failures move the enrolment to `held` with bounded error metadata.
 - `failed` is terminal for `reentry: multiple`, but still blocks `reentry: once`.
 
+### Send Suppression
+
+Automation `send_email` execution checks suppression before calling `send_backend_mail`.
+The MVP suppression sources are:
+
+- Contact props: `Unsubscribed`, `Bounced`, and `Complained`.
+- `unsublogs`: `unsubscribed`, `complained`, and `bounced`.
+- `exclusions`: account-scoped email and domain exclusions.
+
+If the enrolled contact is suppressed, no email is sent and no `debug_email_logs`
+row is created. The `send_email` node is recorded as a successful skipped step
+with `suppressed: true` and a bounded `suppression_reason`, then the enrolment
+advances normally or completes if the send node is final. Retry/backoff is not
+applied because suppression is expected contact state, not a provider/runtime
+failure.
+
 ## Schedulers And Processors
 
 - Automation enrolment processor:
