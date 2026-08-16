@@ -222,6 +222,20 @@ class TestAutomationEmails(test_base.TestBase):
             replyto="reply@example.com",
             returnpath="bounce@example.com",
         )
+        self.db.execute(
+            """
+            update automation_emails
+            set data = data || %s
+            where id = %s and cid = %s
+            """,
+            {
+                "send_log_id": "do-not-copy",
+                "stats": {"sent": 99},
+                "automation_email_id": "do-not-copy",
+            },
+            source["id"],
+            self.user_cookie["cid"],
+        )
 
         copied = self.user_post(
             "/api/automations/%s/emails/from-source" % target["id"],
@@ -244,11 +258,21 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(copied["returnpath"], "bounce@example.com")
         self.assertNotEqual(copied["created"], source["created"])
         self.assertNotEqual(copied["modified"], source["modified"])
+        self.assertNotIn("send_log_id", copied)
+        self.assertNotIn("stats", copied)
 
         fetched = self.user_get(
             "/api/automations/%s/emails/%s" % (target["id"], copied["id"])
         )
         self.assertEqual(fetched["id"], copied["id"])
+
+        type_change = self.simulate_patch(
+            "/api/automations/%s/emails/%s" % (target["id"], copied["id"]),
+            json={"type": "raw"},
+            headers=self.headers(),
+        )
+        self.assertEqual(type_change.status_code, 400)
+        self.assertIn("editor type is fixed", type_change.text)
 
     def test_create_email_from_source_rejects_cross_account_and_unsupported_source(self):
         target = self.create_automation()
