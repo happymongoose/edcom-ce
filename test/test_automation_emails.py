@@ -371,6 +371,9 @@ class TestAutomationEmails(test_base.TestBase):
             route="do-not-copy",
             stats={"sent": 10},
             template="do-not-copy",
+            example=True,
+            test_send_metadata={"to": "test@example.com"},
+            arbitrary_metadata={"nested": "do-not-copy"},
         )
 
         copied = self.user_post(
@@ -396,6 +399,9 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertNotIn("route", copied)
         self.assertNotIn("stats", copied)
         self.assertNotIn("template", copied)
+        self.assertNotIn("example", copied)
+        self.assertNotIn("test_send_metadata", copied)
+        self.assertNotIn("arbitrary_metadata", copied)
 
         type_change = self.simulate_patch(
             "/api/automations/%s/emails/%s" % (target["id"], copied["id"]),
