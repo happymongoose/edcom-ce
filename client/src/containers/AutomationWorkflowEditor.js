@@ -131,7 +131,7 @@ export function automationNodeSummary(node, options) {
     if (!node.automation_email_id) {
       return 'No email selected';
     }
-    return 'Send: ' + (optionName(emailOptions, node.automation_email_id) || 'Selected email not found');
+    return 'Send email: ' + (optionName(emailOptions, node.automation_email_id) || 'Selected email not found');
   }
   if (node.type === 'add_tag') {
     return node.draft_tag ? 'Add tag: ' + node.draft_tag : 'No tag selected';
@@ -678,9 +678,9 @@ class AutomationWorkflowEditor extends Component {
                   marginBottom: '3px',
                 }}
               >
-                Step {index + 1}
+                Step {index + 1} {this.props.renderNodeContactCount(node, {compact: true})}
               </div>
-              <h4 style={{margin: 0}}>
+              <h4 style={{margin: 0, lineHeight: '1.45'}}>
                 <span
                   style={{
                     display: 'inline-block',
@@ -694,6 +694,14 @@ class AutomationWorkflowEditor extends Component {
                   }}
                 >
                   {automationNodeTypeLabel(node.type)}
+                </span>
+                <span
+                  style={{
+                    color: summaryWarning ? '#a94442' : undefined,
+                    fontWeight: summaryWarning ? 600 : undefined,
+                  }}
+                >
+                  {summary}
                 </span>
               </h4>
             </div>
@@ -745,28 +753,13 @@ class AutomationWorkflowEditor extends Component {
               required={true}
             />
           </div>
-          <div style={{flex: '1 1 360px', minWidth: '240px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Summary</div>
-            <p
-              style={{
-                marginBottom: '10px',
-                color: summaryWarning ? '#a94442' : undefined,
-                fontWeight: summaryWarning ? 600 : undefined,
-                lineHeight: '1.45',
-              }}
-            >
-              {summary}
-            </p>
+          <div style={{flex: '1 1 180px', minWidth: '160px', alignSelf: 'flex-end'}}>
             <Button
               bsSize="small"
               onClick={this.toggleNodeDetails.bind(this, node)}
             >
               {expanded ? 'Hide details' : 'Edit details'}
             </Button>
-          </div>
-          <div style={{flex: '0 1 170px', minWidth: '150px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Contacts at step</div>
-            {this.props.renderNodeContactCount(node)}
           </div>
         </div>
         {

@@ -1057,7 +1057,8 @@ class Automation extends Component {
     );
   }
 
-  renderNodeContactCount(node) {
+  renderNodeContactCount(node, options) {
+    const opts = options || {};
     const summary = (this.props.enrolmentsData && this.props.enrolmentsData.summary) || {};
     const data = this.props.data || {};
     const nodes = (data.draft && data.draft.nodes) || [];
@@ -1067,6 +1068,24 @@ class Automation extends Component {
     const href = this.impersonatedHref(
       '/automations/' + this.props.id + '/enrolments?view=active&' + filter.key + '=' + encodeURIComponent(filter.value)
     );
+
+    if (opts.compact) {
+      return (
+        <span style={{textTransform: 'none', fontWeight: 400}}>
+          ({count} {count === 1 ? 'contact' : 'contacts'}
+          {
+            count ?
+              <span>
+                {', '}
+                <a href={href} target="_blank" rel="noopener noreferrer">view</a>
+              </span>
+            :
+              null
+          }
+          )
+        </span>
+      );
+    }
 
     return (
       <div style={{minWidth: '150px'}}>

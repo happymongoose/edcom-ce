@@ -155,7 +155,7 @@ describe('automation enrolment display helpers', () => {
     ];
     const options = {nodes: nodes, emails: emails, lists: lists};
 
-    expect(automationNodeSummary(nodes[0], options)).toBe('Send: Welcome - Hello (HTML)');
+    expect(automationNodeSummary(nodes[0], options)).toBe('Send email: Welcome - Hello (HTML)');
     expect(automationNodeSummary(nodes[1], options)).toBe('Add tag: vip');
     expect(automationNodeSummary(nodes[2], options)).toBe('Remove tag: old');
     expect(automationNodeSummary(nodes[3], options)).toBe('Add to list: Customers (42 contacts)');
@@ -166,7 +166,7 @@ describe('automation enrolment display helpers', () => {
 
   it('summarizes missing workflow references clearly', () => {
     expect(automationNodeSummary({id: 'send', type: 'send_email'}, {})).toBe('No email selected');
-    expect(automationNodeSummary({id: 'send', type: 'send_email', automation_email_id: 'missing'}, {})).toBe('Send: Selected email not found');
+    expect(automationNodeSummary({id: 'send', type: 'send_email', automation_email_id: 'missing'}, {})).toBe('Send email: Selected email not found');
     expect(automationNodeSummary({id: 'list', type: 'add_to_list'}, {})).toBe('No list selected');
     expect(automationNodeSummary({id: 'list', type: 'add_to_list', list_id: 'missing'}, {})).toBe('Add to list: Selected list not found');
     expect(automationNodeSummary({id: 'wait', type: 'wait_duration', duration: {}}, {})).toBe('Wait: Wait duration incomplete');
