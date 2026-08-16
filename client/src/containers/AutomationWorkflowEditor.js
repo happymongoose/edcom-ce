@@ -615,64 +615,100 @@ class AutomationWorkflowEditor extends Component {
 
   renderNodeCard(node, index, nodes) {
     const expanded = !!this.state.expandedNodeIds[node.id];
+    const summary = this.nodeSummary(node);
+    const summaryWarning = summary.indexOf('No ') === 0 ||
+      summary.indexOf('missing') !== -1 ||
+      summary.indexOf('not found') !== -1 ||
+      summary.indexOf('incomplete') !== -1;
     return (
       <div
         key={node.id}
         style={{
-          border: '1px solid #e5e8ef',
-          marginTop: index === 0 ? '18px' : '14px',
+          border: '1px solid #dfe5ef',
+          borderRadius: '6px',
+          marginTop: index === 0 ? '20px' : '14px',
           background: '#fff',
+          boxShadow: '0 1px 2px rgba(18, 32, 58, 0.04)',
+          overflow: 'hidden',
         }}
       >
         <div
           style={{
             display: 'flex',
-            alignItems: 'flex-start',
-            gap: '16px',
-            padding: '16px',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '12px',
+            padding: '14px 16px',
             flexWrap: 'wrap',
+            borderBottom: expanded ? '1px solid #eef1f5' : '0',
+            background: '#fbfcfe',
           }}
         >
-          <div style={{width: '44px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Step</div>
-            <h4 style={{marginTop: '4px'}}>{index + 1}</h4>
-          </div>
-          <div style={{width: '145px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Type</div>
-            <h4 style={{marginTop: '4px', whiteSpace: 'nowrap'}}>
-              {automationNodeTypeLabel(node.type)}
-            </h4>
-          </div>
-          <div style={{width: '210px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Label</div>
-            <FormControl
-              id="label"
-              value={node.label}
-              onChange={this.nodeChange.bind(this, index)}
-              required={true}
-            />
-          </div>
-          <div style={{flex: '1 1 320px', minWidth: '260px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Summary</div>
-            <p style={{marginTop: '7px', marginBottom: '10px'}}>
-              {this.nodeSummary(node)}
-            </p>
-            <Button
-              bsSize="small"
-              onClick={this.toggleNodeDetails.bind(this, node)}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              minWidth: '240px',
+              flex: '1 1 420px',
+            }}
+          >
+            <div
+              style={{
+                width: '38px',
+                height: '38px',
+                borderRadius: '19px',
+                background: '#edf3ff',
+                color: '#3f77ff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontWeight: 700,
+                flex: '0 0 auto',
+              }}
             >
-              {expanded ? 'Hide details' : 'Edit details'}
-            </Button>
+              {index + 1}
+            </div>
+            <div style={{minWidth: 0}}>
+              <div
+                className="text-muted"
+                style={{
+                  fontSize: '11px',
+                  textTransform: 'uppercase',
+                  marginBottom: '3px',
+                }}
+              >
+                Step {index + 1}
+              </div>
+              <h4 style={{margin: 0}}>
+                <span
+                  style={{
+                    display: 'inline-block',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    background: '#eef2f8',
+                    fontSize: '13px',
+                    lineHeight: '18px',
+                    marginRight: '8px',
+                    verticalAlign: 'middle',
+                  }}
+                >
+                  {automationNodeTypeLabel(node.type)}
+                </span>
+              </h4>
+            </div>
           </div>
-          <div style={{width: '150px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Contacts</div>
-            {this.props.renderNodeContactCount(node)}
-          </div>
-          <div style={{width: '235px'}} className="last-cell">
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Actions</div>
-            <div style={{marginTop: '6px'}}>
+          <div
+            className="last-cell"
+            style={{
+              display: 'flex',
+              gap: '6px',
+              flexWrap: 'wrap',
+              justifyContent: 'flex-end',
+              alignItems: 'center',
+            }}
+          >
               {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert', index)}
-              {' '}
               <Button
                 bsSize="small"
                 disabled={index === 0}
@@ -681,7 +717,6 @@ class AutomationWorkflowEditor extends Component {
               >
                 Up
               </Button>
-              {' '}
               <Button
                 bsSize="small"
                 disabled={index === nodes.length - 1}
@@ -690,9 +725,48 @@ class AutomationWorkflowEditor extends Component {
               >
                 Down
               </Button>
-              {' '}
               <Button bsSize="small" onClick={this.deleteNode.bind(this, index)}>Delete</Button>
-            </div>
+          </div>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            gap: '18px',
+            padding: '16px',
+            flexWrap: 'wrap',
+          }}
+        >
+          <div style={{flex: '0 1 280px', minWidth: '220px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Label</div>
+            <FormControl
+              id="label"
+              value={node.label}
+              onChange={this.nodeChange.bind(this, index)}
+              required={true}
+            />
+          </div>
+          <div style={{flex: '1 1 360px', minWidth: '240px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Summary</div>
+            <p
+              style={{
+                marginBottom: '10px',
+                color: summaryWarning ? '#a94442' : undefined,
+                fontWeight: summaryWarning ? 600 : undefined,
+                lineHeight: '1.45',
+              }}
+            >
+              {summary}
+            </p>
+            <Button
+              bsSize="small"
+              onClick={this.toggleNodeDetails.bind(this, node)}
+            >
+              {expanded ? 'Hide details' : 'Edit details'}
+            </Button>
+          </div>
+          <div style={{flex: '0 1 170px', minWidth: '150px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Contacts at step</div>
+            {this.props.renderNodeContactCount(node)}
           </div>
         </div>
         {
