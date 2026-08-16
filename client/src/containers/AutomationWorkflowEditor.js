@@ -91,6 +91,90 @@ export function automationNodeTargetOptions(nodes, node) {
     .value();
 }
 
+function optionName(options, id) {
+  const option = _.findWhere(options || [], {id: id});
+  return option ? option.name : '';
+}
+
+function targetSummary(nodes, node, id) {
+  if (!id) {
+    return 'Target missing';
+  }
+  const option = _.findWhere(automationNodeTargetOptions(nodes, node), {id: id});
+  return option ? option.name : 'Target missing';
+}
+
+function durationSummary(duration) {
+  const parts = [];
+  const days = parseInt((duration || {}).days, 10) || 0;
+  const hours = parseInt((duration || {}).hours, 10) || 0;
+  const minutes = parseInt((duration || {}).minutes, 10) || 0;
+  if (days) {
+    parts.push(days + ' ' + (days === 1 ? 'day' : 'days'));
+  }
+  if (hours) {
+    parts.push(hours + ' ' + (hours === 1 ? 'hour' : 'hours'));
+  }
+  if (minutes) {
+    parts.push(minutes + ' ' + (minutes === 1 ? 'minute' : 'minutes'));
+  }
+  return parts.length ? parts.join(' ') : 'Wait duration incomplete';
+}
+
+export function automationNodeSummary(node, options) {
+  const opts = options || {};
+  const nodes = opts.nodes || [];
+  const emailOptions = automationEmailOptions(opts.emails || []);
+  const listOptions = automationListOptions(opts.lists || []);
+
+  if (node.type === 'send_email') {
+    if (!node.automation_email_id) {
+      return 'No email selected';
+    }
+    return 'Send: ' + (optionName(emailOptions, node.automation_email_id) || 'Selected email not found');
+  }
+  if (node.type === 'add_tag') {
+    return node.draft_tag ? 'Add tag: ' + node.draft_tag : 'No tag selected';
+  }
+  if (node.type === 'remove_tag') {
+    return node.draft_tag ? 'Remove tag: ' + node.draft_tag : 'No tag selected';
+  }
+  if (node.type === 'add_to_list') {
+    if (!node.list_id) {
+      return 'No list selected';
+    }
+    return 'Add to list: ' + (optionName(listOptions, node.list_id) || 'Selected list not found');
+  }
+  if (node.type === 'remove_from_list') {
+    if (!node.list_id) {
+      return 'No list selected';
+    }
+    return 'Remove from list: ' + (optionName(listOptions, node.list_id) || 'Selected list not found');
+  }
+  if (node.type === 'wait_duration') {
+    return 'Wait: ' + durationSummary(node.duration || {});
+  }
+  if (node.type === 'if_has_tag') {
+    return 'If has tag: ' + (node.draft_tag || 'No tag selected') +
+      ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
+      ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
+  }
+  if (node.type === 'if_opened_email') {
+    return 'If opened: ' + (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
+      ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
+      ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
+  }
+  if (node.type === 'if_clicked_email') {
+    return 'If clicked: ' + (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
+      ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
+      ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
+  }
+  if (node.type === 'go_to') {
+    return 'Go to: ' + targetSummary(nodes, node, node.target_node_id);
+  }
+  return 'Exit automation';
+}
+
 export function createAutomationNode(type, options) {
   const opts = options || {};
   const emails = opts.emails || [];
@@ -158,6 +242,9 @@ export function moveAutomationNode(nodes, index, direction) {
 }
 
 class AutomationWorkflowEditor extends Component {
+  state = {
+    expandedNodeIds: {},
+  }
 
   nodeChange = (index, event) => {
     this.props.update({
@@ -215,6 +302,12 @@ class AutomationWorkflowEditor extends Component {
       emails: this.props.emails || [],
       lists: this.props.lists || [],
     });
+    this.setState({
+      expandedNodeIds: {
+        ...this.state.expandedNodeIds,
+        [node.id]: true,
+      },
+    });
     if (afterIndex === undefined || afterIndex === null) {
       this.props.update({
         draft: {
@@ -244,6 +337,15 @@ class AutomationWorkflowEditor extends Component {
     });
   }
 
+  toggleNodeDetails = node => {
+    this.setState({
+      expandedNodeIds: {
+        ...this.state.expandedNodeIds,
+        [node.id]: !this.state.expandedNodeIds[node.id],
+      },
+    });
+  }
+
   moveNode = (index, direction) => {
     this.props.update({
       draft: {
@@ -263,6 +365,14 @@ class AutomationWorkflowEditor extends Component {
 
   nodeTargetOptions(node) {
     return automationNodeTargetOptions(this.props.nodes || [], node);
+  }
+
+  nodeSummary(node) {
+    return automationNodeSummary(node, {
+      nodes: this.props.nodes || [],
+      emails: this.props.emails || [],
+      lists: this.props.lists || [],
+    });
   }
 
   renderNodeConfig(node, index) {
@@ -538,51 +648,72 @@ class AutomationWorkflowEditor extends Component {
               </thead>
               {
                 _.map(nodes, (node, index) =>
-                  <EDTableRow key={node.id} index={index}>
-                    <td>
-                      <h4>{index + 1}</h4>
-                    </td>
-                    <td>
-                      <h4 style={{whiteSpace: 'nowrap'}}>
-                        {automationNodeTypeLabel(node.type)}
-                      </h4>
-                    </td>
-                    <td>
-                      <FormControl
-                        id="label"
-                        value={node.label}
-                        onChange={this.nodeChange.bind(this, index)}
-                        required={true}
-                      />
-                    </td>
-                    <td>
-                      {this.renderNodeConfig(node, index)}
-                    </td>
-                    <td>
-                      {this.props.renderNodeContactCount(node)}
-                    </td>
-                    <td style={{minWidth: '300px'}} className="last-cell">
-                      {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert node after this step', index)}
-                      {' '}
-                      <Button
-                        bsSize="small"
-                        disabled={index === 0}
-                        onClick={this.moveNode.bind(this, index, -1)}
-                      >
-                        Move up
-                      </Button>
-                      {' '}
-                      <Button
-                        bsSize="small"
-                        disabled={index === nodes.length - 1}
-                        onClick={this.moveNode.bind(this, index, 1)}
-                      >
-                        Move down
-                      </Button>
-                      {' '}
-                      <Button onClick={this.deleteNode.bind(this, index)}>Delete</Button>
-                    </td>
-                  </EDTableRow>
+                  {
+                    const expanded = !!this.state.expandedNodeIds[node.id];
+                    return (
+                      <EDTableRow key={node.id} index={index}>
+                        <td>
+                          <h4>{index + 1}</h4>
+                        </td>
+                        <td>
+                          <h4 style={{whiteSpace: 'nowrap'}}>
+                            {automationNodeTypeLabel(node.type)}
+                          </h4>
+                        </td>
+                        <td>
+                          <FormControl
+                            id="label"
+                            value={node.label}
+                            onChange={this.nodeChange.bind(this, index)}
+                            required={true}
+                          />
+                        </td>
+                        <td>
+                          <p style={{marginBottom: expanded ? '8px' : 0}}>
+                            {this.nodeSummary(node)}
+                          </p>
+                          <Button
+                            bsSize="small"
+                            onClick={this.toggleNodeDetails.bind(this, node)}
+                          >
+                            {expanded ? 'Hide details' : 'Edit details'}
+                          </Button>
+                          {
+                            expanded ?
+                              <div style={{marginTop: '10px'}}>
+                                {this.renderNodeConfig(node, index)}
+                              </div>
+                            :
+                              null
+                          }
+                        </td>
+                        <td>
+                          {this.props.renderNodeContactCount(node)}
+                        </td>
+                        <td style={{minWidth: '300px'}} className="last-cell">
+                          {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert node after this step', index)}
+                          {' '}
+                          <Button
+                            bsSize="small"
+                            disabled={index === 0}
+                            onClick={this.moveNode.bind(this, index, -1)}
+                          >
+                            Move up
+                          </Button>
+                          {' '}
+                          <Button
+                            bsSize="small"
+                            disabled={index === nodes.length - 1}
+                            onClick={this.moveNode.bind(this, index, 1)}
+                          >
+                            Move down
+                          </Button>
+                          {' '}
+                          <Button onClick={this.deleteNode.bind(this, index)}>Delete</Button>
+                        </td>
+                      </EDTableRow>
+                    );
+                  }
                 )
               }
             </EDTable>

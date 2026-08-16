@@ -20,6 +20,7 @@ import {
 } from './Automation';
 import {
   appendAutomationNode,
+  automationNodeSummary,
   automationNodeTargetOptions,
   insertAutomationNodeAfter,
   moveAutomationNode,
@@ -138,6 +139,69 @@ describe('automation enrolment display helpers', () => {
 
     expect(target.id).toBe('target');
     expect(target.name).toBe('Step 2 - Target tag (Add tag)');
+  });
+
+  it('summarizes major workflow node types', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const lists = [{id: 'list-1', name: 'Customers', count: 42}];
+    const nodes = [
+      {id: 'send', type: 'send_email', automation_email_id: 'email-1'},
+      {id: 'add-tag', type: 'add_tag', draft_tag: 'vip'},
+      {id: 'remove-tag', type: 'remove_tag', draft_tag: 'old'},
+      {id: 'add-list', type: 'add_to_list', list_id: 'list-1'},
+      {id: 'remove-list', type: 'remove_from_list', list_id: 'list-1'},
+      {id: 'wait', type: 'wait_duration', duration: {days: 1, hours: 2, minutes: 3}},
+      {id: 'exit', type: 'exit'},
+    ];
+    const options = {nodes: nodes, emails: emails, lists: lists};
+
+    expect(automationNodeSummary(nodes[0], options)).toBe('Send: Welcome - Hello (HTML)');
+    expect(automationNodeSummary(nodes[1], options)).toBe('Add tag: vip');
+    expect(automationNodeSummary(nodes[2], options)).toBe('Remove tag: old');
+    expect(automationNodeSummary(nodes[3], options)).toBe('Add to list: Customers (42 contacts)');
+    expect(automationNodeSummary(nodes[4], options)).toBe('Remove from list: Customers (42 contacts)');
+    expect(automationNodeSummary(nodes[5], options)).toBe('Wait: 1 day 2 hours 3 minutes');
+    expect(automationNodeSummary(nodes[6], options)).toBe('Exit automation');
+  });
+
+  it('summarizes missing workflow references clearly', () => {
+    expect(automationNodeSummary({id: 'send', type: 'send_email'}, {})).toBe('No email selected');
+    expect(automationNodeSummary({id: 'send', type: 'send_email', automation_email_id: 'missing'}, {})).toBe('Send: Selected email not found');
+    expect(automationNodeSummary({id: 'list', type: 'add_to_list'}, {})).toBe('No list selected');
+    expect(automationNodeSummary({id: 'list', type: 'add_to_list', list_id: 'missing'}, {})).toBe('Add to list: Selected list not found');
+    expect(automationNodeSummary({id: 'wait', type: 'wait_duration', duration: {}}, {})).toBe('Wait: Wait duration incomplete');
+    expect(automationNodeSummary({id: 'go', type: 'go_to'}, {nodes: []})).toBe('Go to: Target missing');
+  });
+
+  it('summarizes condition targets and updates target step labels after reorder', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target'},
+      {id: 'no', type: 'exit', label: 'No target'},
+    ];
+    const moved = moveAutomationNode(nodes, 2, -1);
+
+    expect(automationNodeSummary(moved[0], {nodes: moved})).toBe(
+      'If has tag: vip | Yes -> Step 2 - Yes target (Add tag) | No -> Step 4 - No target (Exit)'
+    );
+  });
+
+  it('summarizes email engagement conditions', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'beefree'}];
+    const nodes = [
+      {id: 'opened', type: 'if_opened_email', automation_email_id: 'email-1', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'clicked', type: 'if_clicked_email', automation_email_id: 'email-1', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
+      'If opened: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+    );
+    expect(automationNodeSummary(nodes[1], {nodes: nodes, emails: emails})).toBe(
+      'If clicked: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+    );
   });
 
   it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {
