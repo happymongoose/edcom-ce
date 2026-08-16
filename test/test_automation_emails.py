@@ -459,6 +459,9 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertNotIn("rawText", sources[0])
         self.assertNotIn("parts", sources[0])
         self.assertNotIn("bodyStyle", sources[0])
+        self.assertNotIn("messages", sources[0])
+        self.assertNotIn("funnel", sources[0])
+        self.assertNotIn("data", sources[0])
 
     def test_email_copy_sources_exclude_cross_account_sources(self):
         target = self.create_automation()
@@ -560,6 +563,39 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_message_ids.remove(message["id"])
+
+    def test_email_copy_sources_exclude_message_with_unowned_funnel(self):
+        target = self.create_automation()
+        funnel, message = self.create_funnel_message(
+            funnel_overrides={"name": "Unowned linked funnel"},
+            message_overrides={"subject": "Message linked to unowned funnel"},
+        )
+        self.db.execute(
+            "update funnels set cid = %s where id = %s",
+            "other-account-cid",
+            funnel["id"],
+        )
+
+        try:
+            sources = self.user_get(
+                "/api/automations/%s/email-copy-sources?source_filter=funnel_messages"
+                % target["id"]
+            )
+            self.assertNotIn(message["id"], [item["source_id"] for item in sources])
+
+            result = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "funnel_message", "source_id": message["id"]},
+                headers=self.headers(),
+            )
+            self.assertEqual(result.status_code, 403)
+        finally:
+            self.db.execute(
+                "delete from funnels where id = %s and cid = %s",
+                funnel["id"],
+                "other-account-cid",
+            )
+            self.created_funnel_ids.remove(funnel["id"])
 
     def test_create_email_from_automation_email_source_preserves_supported_fields(self):
         target = self.create_automation()
