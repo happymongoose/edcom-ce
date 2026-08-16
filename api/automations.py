@@ -695,7 +695,7 @@ AUTOMATION_EMAIL_FROM_SOURCE_SCHEMA = {
     "properties": {
         "source_type": {
             "type": "string",
-            "enum": ["automation_email"],
+            "enum": ["automation_email", "transactional_template"],
         },
         "source_id": {
             "type": "string",
@@ -1502,6 +1502,16 @@ def _automation_email_copy_data(
         "modified": now,
     }
     return _prepare_automation_email_patch(data)
+
+
+def _transactional_template_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+
+    id, cid, data = row
+    data["id"] = id
+    data["cid"] = cid
+    return data
 
 
 def _node_references_automation_email(node: JsonObj, email_id: str) -> bool:
@@ -2550,71 +2560,117 @@ class AutomationEmailCopySources(object):
         _automation_for_email_route(db, id)
 
         source_filter = req.get_param("source_filter") or "all"
-        if source_filter not in ("this", "other", "all"):
+        if source_filter not in ("this", "other", "all", "transactional_templates"):
             raise falcon.HTTPBadRequest(
                 title="Invalid source filter",
-                description="Source filter must be this, other or all.",
+                description="Source filter must be this, other, all or transactional_templates.",
             )
 
         search = (req.get_param("q") or "").strip().lower()
-        params = [cid]
-        conditions = ["ae.cid = %s"]
-        if source_filter == "this":
-            conditions.append("ae.automation_id = %s")
-            params.append(id)
-        elif source_filter == "other":
-            conditions.append("ae.automation_id <> %s")
-            params.append(id)
-        if search:
-            conditions.append(
-                """
-                (
-                    lower(coalesce(ae.data->>'name', '')) like %s
-                    or lower(coalesce(ae.data->>'subject', '')) like %s
-                    or lower(coalesce(a.data->>'name', '')) like %s
+        sources = []
+        if source_filter in ("this", "other", "all"):
+            params = [cid]
+            conditions = ["ae.cid = %s"]
+            if source_filter == "this":
+                conditions.append("ae.automation_id = %s")
+                params.append(id)
+            elif source_filter == "other":
+                conditions.append("ae.automation_id <> %s")
+                params.append(id)
+            if search:
+                conditions.append(
+                    """
+                    (
+                        lower(coalesce(ae.data->>'name', '')) like %s
+                        or lower(coalesce(ae.data->>'subject', '')) like %s
+                        or lower(coalesce(a.data->>'name', '')) like %s
+                    )
+                    """
                 )
+                term = "%%%s%%" % search
+                params.extend([term, term, term])
+
+            rows = db.execute(
                 """
+                select
+                    ae.id,
+                    ae.automation_id,
+                    ae.data->>'name',
+                    ae.data->>'subject',
+                    coalesce(ae.data->>'type', 'raw'),
+                    ae.data->>'modified',
+                    a.data->>'name'
+                from automation_emails ae
+                join automations a on a.cid = ae.cid and a.id = ae.automation_id
+                where %s
+                order by
+                    case when ae.automation_id = %%s then 0 else 1 end,
+                    lower(coalesce(a.data->>'name', '')),
+                    lower(coalesce(ae.data->>'name', '')),
+                    ae.id
+                limit 100
+                """ % " and ".join(conditions),
+                *(params + [id])
             )
-            term = "%%%s%%" % search
-            params.extend([term, term, term])
 
-        rows = db.execute(
-            """
-            select
-                ae.id,
-                ae.automation_id,
-                ae.data->>'name',
-                ae.data->>'subject',
-                coalesce(ae.data->>'type', 'raw'),
-                ae.data->>'modified',
-                a.data->>'name'
-            from automation_emails ae
-            join automations a on a.cid = ae.cid and a.id = ae.automation_id
-            where %s
-            order by
-                case when ae.automation_id = %%s then 0 else 1 end,
-                lower(coalesce(a.data->>'name', '')),
-                lower(coalesce(ae.data->>'name', '')),
-                ae.id
-            limit 100
-            """ % " and ".join(conditions),
-            *(params + [id])
-        )
+            sources.extend(
+                {
+                    "source_type": "automation_email",
+                    "source_id": row[0],
+                    "source_automation_id": row[1],
+                    "name": row[2] or "Untitled email",
+                    "subject": row[3] or "",
+                    "editor_type": row[4] or "raw",
+                    "modified": row[5],
+                    "source_automation_name": row[6] or row[1],
+                    "source_label": row[6] or row[1],
+                    "same_automation": row[1] == id,
+                }
+                for row in rows
+            )
 
-        req.context["result"] = [
-            {
-                "source_type": "automation_email",
-                "source_id": row[0],
-                "source_automation_id": row[1],
-                "name": row[2] or "Untitled email",
-                "subject": row[3] or "",
-                "editor_type": row[4] or "raw",
-                "modified": row[5],
-                "source_automation_name": row[6] or row[1],
-                "same_automation": row[1] == id,
-            }
-            for row in rows
-        ]
+        if source_filter in ("transactional_templates", "all"):
+            params = [cid]
+            search_query = ""
+            if search:
+                search_query = """
+                    and (
+                        lower(coalesce(data->>'name', '')) like %s
+                        or lower(coalesce(data->>'subject', '')) like %s
+                    )
+                """
+                term = "%%%s%%" % search
+                params.extend([term, term])
+            rows = db.execute(
+                """
+                select
+                    id,
+                    data->>'name',
+                    data->>'subject',
+                    coalesce(data->>'type', 'raw'),
+                    data->>'modified'
+                from txntemplates
+                where cid = %%s %s
+                order by lower(coalesce(data->>'name', '')), id
+                limit 100
+                """ % search_query,
+                *params
+            )
+            sources.extend(
+                {
+                    "source_type": "transactional_template",
+                    "source_id": row[0],
+                    "name": row[1] or "Untitled template",
+                    "subject": row[2] or "",
+                    "editor_type": row[3] or "raw",
+                    "modified": row[4],
+                    "source_label": "Transactional template",
+                    "same_automation": False,
+                }
+                for row in rows
+            )
+
+        req.context["result"] = sources[:100]
 
 
 class AutomationEmailFromSource(object):
@@ -2624,27 +2680,40 @@ class AutomationEmailFromSource(object):
 
         doc = req.context.get("doc") or {}
         _validate_doc(doc, AUTOMATION_EMAIL_FROM_SOURCE_SCHEMA)
-        if doc.get("source_type", "automation_email") != "automation_email":
-            raise falcon.HTTPBadRequest(
-                title="Unsupported source type",
-                description="Only automation email sources are supported.",
-            )
-
         db = req.context["db"]
         cid = db.get_cid()
         _automation_for_email_route(db, id)
 
-        source = _automation_email_obj(
-            db.row(
-                """
-                select id, cid, automation_id, data
-                from automation_emails
-                where cid = %s and id = %s
-                """,
-                cid,
-                doc["source_id"],
+        source_type = doc.get("source_type", "automation_email")
+        if source_type == "automation_email":
+            source = _automation_email_obj(
+                db.row(
+                    """
+                    select id, cid, automation_id, data
+                    from automation_emails
+                    where cid = %s and id = %s
+                    """,
+                    cid,
+                    doc["source_id"],
+                )
             )
-        )
+        elif source_type == "transactional_template":
+            source = _transactional_template_obj(
+                db.row(
+                    """
+                    select id, cid, data
+                    from txntemplates
+                    where cid = %s and id = %s
+                    """,
+                    cid,
+                    doc["source_id"],
+                )
+            )
+        else:
+            raise falcon.HTTPBadRequest(
+                title="Unsupported source type",
+                description="Only automation email and transactional template sources are supported.",
+            )
         if source is None:
             raise falcon.HTTPForbidden()
 

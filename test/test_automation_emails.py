@@ -10,6 +10,7 @@ class TestAutomationEmails(test_base.TestBase):
         super(TestAutomationEmails, self).setUp()
         self.created_automation_ids = []
         self.created_email_ids = []
+        self.created_txn_template_ids = []
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
@@ -28,6 +29,12 @@ class TestAutomationEmails(test_base.TestBase):
             self.db.execute(
                 "delete from automations where id = any(%s) and cid = %s",
                 self.created_automation_ids,
+                cid,
+            )
+        if self.created_txn_template_ids:
+            self.db.execute(
+                "delete from txntemplates where id = any(%s) and cid = %s",
+                self.created_txn_template_ids,
                 cid,
             )
         super(TestAutomationEmails, self).tearDown()
@@ -63,6 +70,28 @@ class TestAutomationEmails(test_base.TestBase):
         )
         self.created_email_ids.append(email["id"])
         return email
+
+    def create_txn_template(self, **overrides):
+        doc = {
+            "name": "Txn template %s" % self.unique(),
+            "subject": "Txn subject",
+            "preheader": "Txn preview",
+            "type": "raw",
+            "rawText": "<p>Transactional</p>",
+            "parts": [],
+            "bodyStyle": {},
+            "fromname": "Txn Sender",
+            "fromemail": "from@example.com",
+            "replyto": "reply@example.com",
+            "returnpath": "bounce@example.com",
+            "tag": "do-not-copy",
+        }
+        doc.update(overrides)
+        template_id = self.db.txntemplates.add(doc)
+        self.created_txn_template_ids.append(template_id)
+        template = self.db.txntemplates.get(template_id)
+        template["id"] = template_id
+        return template
 
     def route_id(self):
         company = self.db.companies.get(self.user_cookie["cid"])
@@ -180,7 +209,34 @@ class TestAutomationEmails(test_base.TestBase):
 
         self.assertEqual([item["source_id"] for item in sources], [wanted["id"]])
         self.assertEqual(result.status_code, 400)
-        self.assertIn("Source filter must be this, other or all", result.text)
+        self.assertIn("Source filter must be this, other, all or transactional_templates", result.text)
+
+    def test_email_copy_sources_list_transactional_templates_metadata_only(self):
+        target = self.create_automation()
+        template = self.create_txn_template(
+            name="Transactional copy source",
+            subject="Transactional needle",
+            type="wysiwyg",
+            rawText="<h1>Hidden body</h1>",
+            parts=[{"type": "text", "value": "hidden"}],
+            bodyStyle={"hidden": True},
+        )
+        self.create_txn_template(name="Ignore me", subject="Haystack")
+
+        sources = self.user_get(
+            "/api/automations/%s/email-copy-sources?source_filter=transactional_templates&q=needle"
+            % target["id"]
+        )
+
+        self.assertEqual([item["source_id"] for item in sources], [template["id"]])
+        self.assertEqual(sources[0]["source_type"], "transactional_template")
+        self.assertEqual(sources[0]["name"], "Transactional copy source")
+        self.assertEqual(sources[0]["subject"], "Transactional needle")
+        self.assertEqual(sources[0]["editor_type"], "wysiwyg")
+        self.assertEqual(sources[0]["source_label"], "Transactional template")
+        self.assertNotIn("rawText", sources[0])
+        self.assertNotIn("parts", sources[0])
+        self.assertNotIn("bodyStyle", sources[0])
 
     def test_email_copy_sources_exclude_cross_account_sources(self):
         target = self.create_automation()
@@ -204,6 +260,29 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_email_ids.remove(other_email["id"])
+
+    def test_email_copy_sources_exclude_cross_account_transactional_templates(self):
+        target = self.create_automation()
+        template = self.create_txn_template(name="Cross account txn source")
+        self.db.execute(
+            "update txntemplates set cid = %s where id = %s",
+            "other-account-cid",
+            template["id"],
+        )
+
+        try:
+            sources = self.user_get(
+                "/api/automations/%s/email-copy-sources?source_filter=transactional_templates"
+                % target["id"]
+            )
+            self.assertNotIn(template["id"], [item["source_id"] for item in sources])
+        finally:
+            self.db.execute(
+                "delete from txntemplates where id = %s and cid = %s",
+                template["id"],
+                "other-account-cid",
+            )
+            self.created_txn_template_ids.remove(template["id"])
 
     def test_create_email_from_automation_email_source_preserves_supported_fields(self):
         target = self.create_automation()
@@ -274,6 +353,57 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(type_change.status_code, 400)
         self.assertIn("editor type is fixed", type_change.text)
 
+    def test_create_email_from_transactional_template_preserves_whitelisted_fields(self):
+        target = self.create_automation()
+        template = self.create_txn_template(
+            name="Transactional source",
+            subject="Transactional subject",
+            preheader="Transactional preheader",
+            type="beefree",
+            rawText='{"html":"<p>Txn</p>","json":{}}',
+            parts=[{"type": "image", "src": "example"}],
+            bodyStyle={"background": "#eee"},
+            fromname="Txn Sender",
+            fromemail="sender@example.com",
+            replyto="reply@example.com",
+            returnpath="bounce@example.com",
+            tag="api-tag",
+            route="do-not-copy",
+            stats={"sent": 10},
+            template="do-not-copy",
+        )
+
+        copied = self.user_post(
+            "/api/automations/%s/emails/from-source" % target["id"],
+            json={"source_type": "transactional_template", "source_id": template["id"]},
+        )
+        self.created_email_ids.append(copied["id"])
+
+        self.assertEqual(copied["automation_id"], target["id"])
+        self.assertEqual(copied["name"], "Copy of Transactional source")
+        self.assertEqual(copied["subject"], "Transactional subject")
+        self.assertEqual(copied["preheader"], "Transactional preheader")
+        self.assertEqual(copied["type"], "beefree")
+        self.assertEqual(copied["rawText"], '{"html":"<p>Txn</p>","json":{}}')
+        self.assertEqual(copied["parts"], [{"type": "image", "src": "example"}])
+        self.assertEqual(copied["bodyStyle"], {"background": "#eee"})
+        self.assertEqual(copied["fromname"], "Txn Sender")
+        self.assertEqual(copied["fromemail"], "sender@example.com")
+        self.assertEqual(copied["replyto"], "reply@example.com")
+        self.assertEqual(copied["returnpath"], "bounce@example.com")
+        self.assertNotEqual(copied["id"], template["id"])
+        self.assertNotIn("tag", copied)
+        self.assertNotIn("route", copied)
+        self.assertNotIn("stats", copied)
+        self.assertNotIn("template", copied)
+
+        type_change = self.simulate_patch(
+            "/api/automations/%s/emails/%s" % (target["id"], copied["id"]),
+            json={"type": "raw"},
+            headers=self.headers(),
+        )
+        self.assertEqual(type_change.status_code, 400)
+
     def test_create_email_from_source_rejects_cross_account_and_unsupported_source(self):
         target = self.create_automation()
         source_automation = self.create_automation()
@@ -305,6 +435,31 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_email_ids.remove(source["id"])
+
+    def test_create_email_from_transactional_template_rejects_cross_account(self):
+        target = self.create_automation()
+        template = self.create_txn_template(name="Other account txn source")
+        self.db.execute(
+            "update txntemplates set cid = %s where id = %s",
+            "other-account-cid",
+            template["id"],
+        )
+
+        try:
+            cross_account = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "transactional_template", "source_id": template["id"]},
+                headers=self.headers(),
+            )
+
+            self.assertEqual(cross_account.status_code, 403)
+        finally:
+            self.db.execute(
+                "delete from txntemplates where id = %s and cid = %s",
+                template["id"],
+                "other-account-cid",
+            )
+            self.created_txn_template_ids.remove(template["id"])
 
     def test_default_email_shape(self):
         automation = self.create_automation()

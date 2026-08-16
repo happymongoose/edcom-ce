@@ -1324,7 +1324,7 @@ class Automation extends Component {
     return (
       <Modal show={this.state.showEmailCopyModal} onHide={this.closeEmailCopyModal} bsSize="large">
         <Modal.Header closeButton>
-          <Modal.Title>Copy existing automation email</Modal.Title>
+          <Modal.Title>Copy existing email</Modal.Title>
         </Modal.Header>
         <Modal.Body>
           <form onSubmit={this.searchEmailCopySources} className="space-bottom">
@@ -1337,11 +1337,12 @@ class Automation extends Component {
               >
                 <option value="this">This automation</option>
                 <option value="other">Other automations</option>
-                <option value="all">All automation emails</option>
+                <option value="all">All copy sources</option>
+                <option value="transactional_templates">Transactional templates</option>
               </FormControl>
               <FormControl
                 type="text"
-                placeholder="Search by name, subject or automation"
+                placeholder="Search by name, subject or source"
                 value={this.state.emailCopySearch}
                 onChange={this.emailCopySearchChange}
                 style={{width: '320px', maxWidth: '100%'}}
@@ -1353,7 +1354,7 @@ class Automation extends Component {
           </form>
           {
             this.state.isLoadingEmailCopySources ?
-              <p className="text-muted">Loading automation emails...</p>
+              <p className="text-muted">Loading email sources...</p>
             : sources.length ?
               <EDTable className="growing-margin-left" minWidth="760px">
                 <thead>
@@ -1361,7 +1362,7 @@ class Automation extends Component {
                     <th>Name</th>
                     <th>Subject</th>
                     <th>Editor</th>
-                    <th>Automation</th>
+                    <th>Source</th>
                     <th>Modified</th>
                     <th></th>
                   </tr>
@@ -1374,7 +1375,7 @@ class Automation extends Component {
                       <td><h4 style={{whiteSpace: 'nowrap'}}>{automationEditorTypeLabel(source.editor_type)}</h4></td>
                       <td>
                         <h4 style={{whiteSpace: 'nowrap'}}>
-                          {source.source_automation_name}
+                          {source.source_label || source.source_automation_name || source.source_type}
                           {source.same_automation ? ' (this automation)' : ''}
                         </h4>
                       </td>
