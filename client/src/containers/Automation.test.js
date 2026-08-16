@@ -22,6 +22,7 @@ import {
   appendAutomationNode,
   automationNodeTargetOptions,
   insertAutomationNodeAfter,
+  moveAutomationNode,
 } from './AutomationWorkflowEditor';
 import { enrolmentQueryParams } from '../utils/automationEnrolments';
 import { canViewAutomationDiagnostics } from '../utils/automationDiagnostics';
@@ -66,6 +67,60 @@ describe('automation enrolment display helpers', () => {
 
     expect(target.id).toBe('target');
     expect(target.name).toBe('Step 3 - Target tag (Add tag)');
+  });
+
+  it('moves workflow nodes up and down while preserving node ids', () => {
+    const nodes = [
+      {id: 'first', type: 'add_tag', label: 'First'},
+      {id: 'second', type: 'wait_duration', label: 'Second'},
+      {id: 'third', type: 'exit', label: 'Third'},
+    ];
+
+    expect(_.pluck(moveAutomationNode(nodes, 1, -1), 'id')).toEqual(['second', 'first', 'third']);
+    expect(_.pluck(moveAutomationNode(nodes, 1, 1), 'id')).toEqual(['first', 'third', 'second']);
+    expect(_.pluck(nodes, 'id')).toEqual(['first', 'second', 'third']);
+  });
+
+  it('does not move the first node up or the last node down', () => {
+    const nodes = [
+      {id: 'first', type: 'add_tag', label: 'First'},
+      {id: 'second', type: 'exit', label: 'Second'},
+    ];
+
+    expect(_.pluck(moveAutomationNode(nodes, 0, -1), 'id')).toEqual(['first', 'second']);
+    expect(_.pluck(moveAutomationNode(nodes, 1, 1), 'id')).toEqual(['first', 'second']);
+  });
+
+  it('moves workflow nodes without rewriting branch or go-to target ids', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'go', type: 'go_to', label: 'Go forward', target_node_id: 'target'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const updated = moveAutomationNode(nodes, 2, -1);
+
+    expect(_.pluck(updated, 'id')).toEqual(['condition', 'target', 'go', 'exit']);
+    expect(updated[0].yes_node_id).toBe('target');
+    expect(updated[0].no_node_id).toBe('exit');
+    expect(updated[2].target_node_id).toBe('target');
+  });
+
+  it('updates target dropdown step labels after moving nodes', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const updated = moveAutomationNode(nodes, 2, -1);
+    const options = automationNodeTargetOptions(updated, updated[0]);
+    const target = _.findWhere(options, {id: 'target'});
+
+    expect(target.id).toBe('target');
+    expect(target.name).toBe('Step 2 - Target tag (Add tag)');
   });
 
   it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {

@@ -145,6 +145,18 @@ export function insertAutomationNodeAfter(nodes, index, type, options) {
   return nextNodes;
 }
 
+export function moveAutomationNode(nodes, index, direction) {
+  const nextNodes = (nodes || []).slice();
+  const targetIndex = index + direction;
+  if (index < 0 || index >= nextNodes.length || targetIndex < 0 || targetIndex >= nextNodes.length) {
+    return nextNodes;
+  }
+  const node = nextNodes[index];
+  nextNodes[index] = nextNodes[targetIndex];
+  nextNodes[targetIndex] = node;
+  return nextNodes;
+}
+
 class AutomationWorkflowEditor extends Component {
 
   nodeChange = (index, event) => {
@@ -227,6 +239,16 @@ class AutomationWorkflowEditor extends Component {
       draft: {
         nodes: {
           $splice: [[index, 1]],
+        },
+      },
+    });
+  }
+
+  moveNode = (index, direction) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          $set: moveAutomationNode(this.props.nodes || [], index, direction),
         },
       },
     });
@@ -539,8 +561,24 @@ class AutomationWorkflowEditor extends Component {
                     <td>
                       {this.props.renderNodeContactCount(node)}
                     </td>
-                    <td style={{minWidth: '180px'}} className="last-cell">
+                    <td style={{minWidth: '300px'}} className="last-cell">
                       {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert node after this step', index)}
+                      {' '}
+                      <Button
+                        bsSize="small"
+                        disabled={index === 0}
+                        onClick={this.moveNode.bind(this, index, -1)}
+                      >
+                        Move up
+                      </Button>
+                      {' '}
+                      <Button
+                        bsSize="small"
+                        disabled={index === nodes.length - 1}
+                        onClick={this.moveNode.bind(this, index, 1)}
+                      >
+                        Move down
+                      </Button>
                       {' '}
                       <Button onClick={this.deleteNode.bind(this, index)}>Delete</Button>
                     </td>
