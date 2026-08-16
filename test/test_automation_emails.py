@@ -128,6 +128,160 @@ class TestAutomationEmails(test_base.TestBase):
         emails = self.user_get("/api/automations/%s/emails" % automation["id"])
         self.assertEqual([item["id"] for item in emails], [email["id"]])
 
+    def test_email_copy_sources_list_same_and_other_automation_sources(self):
+        target = self.create_automation()
+        other = self.create_automation()
+        same_email = self.create_email(
+            target["id"],
+            name="Same source",
+            subject="Same subject",
+        )
+        other_email = self.create_email(
+            other["id"],
+            name="Other source",
+            subject="Other subject",
+        )
+
+        all_sources = self.user_get(
+            "/api/automations/%s/email-copy-sources" % target["id"]
+        )
+        this_sources = self.user_get(
+            "/api/automations/%s/email-copy-sources?source_filter=this" % target["id"]
+        )
+        other_sources = self.user_get(
+            "/api/automations/%s/email-copy-sources?source_filter=other" % target["id"]
+        )
+
+        self.assertIn(same_email["id"], [item["source_id"] for item in all_sources])
+        self.assertIn(other_email["id"], [item["source_id"] for item in all_sources])
+        self.assertEqual([item["source_id"] for item in this_sources], [same_email["id"]])
+        self.assertIn(other_email["id"], [item["source_id"] for item in other_sources])
+        self.assertNotIn(same_email["id"], [item["source_id"] for item in other_sources])
+        self.assertEqual(this_sources[0]["source_type"], "automation_email")
+        self.assertEqual(this_sources[0]["source_automation_id"], target["id"])
+        self.assertEqual(this_sources[0]["source_automation_name"], target["name"])
+        self.assertNotIn("rawText", this_sources[0])
+        self.assertNotIn("parts", this_sources[0])
+        self.assertNotIn("bodyStyle", this_sources[0])
+
+    def test_email_copy_sources_search_and_invalid_filter(self):
+        target = self.create_automation()
+        other = self.create_automation()
+        wanted = self.create_email(other["id"], name="Find this source", subject="Needle")
+        self.create_email(other["id"], name="Ignore this source", subject="Haystack")
+
+        sources = self.user_get(
+            "/api/automations/%s/email-copy-sources?q=needle" % target["id"]
+        )
+        result = self.simulate_get(
+            "/api/automations/%s/email-copy-sources?source_filter=bad" % target["id"],
+            headers=self.headers(),
+        )
+
+        self.assertEqual([item["source_id"] for item in sources], [wanted["id"]])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Source filter must be this, other or all", result.text)
+
+    def test_email_copy_sources_exclude_cross_account_sources(self):
+        target = self.create_automation()
+        other = self.create_automation()
+        other_email = self.create_email(other["id"], name="Cross account source")
+        self.db.execute(
+            "update automation_emails set cid = %s where id = %s",
+            "other-account-cid",
+            other_email["id"],
+        )
+
+        try:
+            sources = self.user_get(
+                "/api/automations/%s/email-copy-sources" % target["id"]
+            )
+            self.assertNotIn(other_email["id"], [item["source_id"] for item in sources])
+        finally:
+            self.db.execute(
+                "delete from automation_emails where id = %s and cid = %s",
+                other_email["id"],
+                "other-account-cid",
+            )
+            self.created_email_ids.remove(other_email["id"])
+
+    def test_create_email_from_automation_email_source_preserves_supported_fields(self):
+        target = self.create_automation()
+        source_automation = self.create_automation()
+        source = self.create_email(
+            source_automation["id"],
+            name="Source email",
+            subject="Source subject",
+            preheader="Source preheader",
+            type="wysiwyg",
+            rawText="<h1>Source body</h1>",
+            parts=[{"type": "text", "value": "hello"}],
+            bodyStyle={"background": "#fff"},
+            fromname="Sender",
+            fromemail="from@example.com",
+            replyto="reply@example.com",
+            returnpath="bounce@example.com",
+        )
+
+        copied = self.user_post(
+            "/api/automations/%s/emails/from-source" % target["id"],
+            json={"source_type": "automation_email", "source_id": source["id"]},
+        )
+        self.created_email_ids.append(copied["id"])
+
+        self.assertNotEqual(copied["id"], source["id"])
+        self.assertEqual(copied["automation_id"], target["id"])
+        self.assertEqual(copied["name"], "Copy of Source email")
+        self.assertEqual(copied["subject"], "Source subject")
+        self.assertEqual(copied["preheader"], "Source preheader")
+        self.assertEqual(copied["type"], "wysiwyg")
+        self.assertEqual(copied["rawText"], "<h1>Source body</h1>")
+        self.assertEqual(copied["parts"], [{"type": "text", "value": "hello"}])
+        self.assertEqual(copied["bodyStyle"], {"background": "#fff"})
+        self.assertEqual(copied["fromname"], "Sender")
+        self.assertEqual(copied["fromemail"], "from@example.com")
+        self.assertEqual(copied["replyto"], "reply@example.com")
+        self.assertEqual(copied["returnpath"], "bounce@example.com")
+        self.assertNotEqual(copied["created"], source["created"])
+        self.assertNotEqual(copied["modified"], source["modified"])
+
+        fetched = self.user_get(
+            "/api/automations/%s/emails/%s" % (target["id"], copied["id"])
+        )
+        self.assertEqual(fetched["id"], copied["id"])
+
+    def test_create_email_from_source_rejects_cross_account_and_unsupported_source(self):
+        target = self.create_automation()
+        source_automation = self.create_automation()
+        source = self.create_email(source_automation["id"], name="Other account source")
+        self.db.execute(
+            "update automation_emails set cid = %s where id = %s",
+            "other-account-cid",
+            source["id"],
+        )
+
+        try:
+            cross_account = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "automation_email", "source_id": source["id"]},
+                headers=self.headers(),
+            )
+            unsupported = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "broadcast", "source_id": source["id"]},
+                headers=self.headers(),
+            )
+
+            self.assertEqual(cross_account.status_code, 403)
+            self.assertEqual(unsupported.status_code, 400)
+        finally:
+            self.db.execute(
+                "delete from automation_emails where id = %s and cid = %s",
+                source["id"],
+                "other-account-cid",
+            )
+            self.created_email_ids.remove(source["id"])
+
     def test_default_email_shape(self):
         automation = self.create_automation()
 

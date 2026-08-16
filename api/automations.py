@@ -688,6 +688,24 @@ AUTOMATION_EMAIL_TEST_SCHEMA = {
     "additionalProperties": False,
 }
 
+
+AUTOMATION_EMAIL_FROM_SOURCE_SCHEMA = {
+    "type": "object",
+    "required": ["source_id"],
+    "properties": {
+        "source_type": {
+            "type": "string",
+            "enum": ["automation_email"],
+        },
+        "source_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
 BULK_DETAIL_LIMIT = 100
 
 
@@ -1413,6 +1431,77 @@ def _get_automation_email(
     for field in ("fromname", "fromemail", "replyto", "returnpath"):
         email[field] = email.get(field) or ""
     return email
+
+
+def _unique_automation_email_name(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    name: str,
+) -> str:
+    base = (name or "Automation email").strip() or "Automation email"
+    candidate = "Copy of %s" % base
+    existing = db.single(
+        """
+        select id
+        from automation_emails
+        where cid = %s and automation_id = %s and data->>'name' = %s
+        limit 1
+        """,
+        cid,
+        automation_id,
+        candidate,
+    )
+    if existing is None:
+        return candidate
+
+    orig, i = get_orig(candidate)
+    while True:
+        candidate = "%s (%s)" % (orig, i)
+        existing = db.single(
+            """
+            select id
+            from automation_emails
+            where cid = %s and automation_id = %s and data->>'name' = %s
+            limit 1
+            """,
+            cid,
+            automation_id,
+            candidate,
+        )
+        if existing is None:
+            return candidate
+        i += 1
+
+
+def _automation_email_copy_data(
+    db: DB,
+    cid: str,
+    target_automation_id: str,
+    source_email: JsonObj,
+) -> JsonObj:
+    now = _utc_now()
+    data = {
+        "name": _unique_automation_email_name(
+            db,
+            cid,
+            target_automation_id,
+            source_email.get("name") or "Automation email",
+        ),
+        "subject": source_email.get("subject") or "Click Here to Edit",
+        "preheader": source_email.get("preheader") or "",
+        "fromname": source_email.get("fromname") or "",
+        "fromemail": source_email.get("fromemail") or "",
+        "replyto": source_email.get("replyto") or "",
+        "returnpath": source_email.get("returnpath") or "",
+        "type": source_email["type"] if "type" in source_email else "raw",
+        "rawText": source_email.get("rawText") or "",
+        "parts": copy.deepcopy(source_email.get("parts") or []),
+        "bodyStyle": copy.deepcopy(source_email.get("bodyStyle") or {}),
+        "created": now,
+        "modified": now,
+    }
+    return _prepare_automation_email_patch(data)
 
 
 def _node_references_automation_email(node: JsonObj, email_id: str) -> bool:
@@ -2434,6 +2523,132 @@ class AutomationEmails(object):
         data = _default_automation_email(doc)
         data = _prepare_automation_email_patch(data)
         data["created"] = data["modified"]
+        email_id = shortuuid.uuid()
+        db.execute(
+            """
+            insert into automation_emails
+                (id, cid, automation_id, data)
+            values (%s, %s, %s, %s)
+            """,
+            email_id,
+            cid,
+            id,
+            data,
+        )
+
+        resp.status = falcon.HTTP_201
+        req.context["result"] = _get_automation_email(db, cid, id, email_id)
+
+
+class AutomationEmailCopySources(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+
+        source_filter = req.get_param("source_filter") or "all"
+        if source_filter not in ("this", "other", "all"):
+            raise falcon.HTTPBadRequest(
+                title="Invalid source filter",
+                description="Source filter must be this, other or all.",
+            )
+
+        search = (req.get_param("q") or "").strip().lower()
+        params = [cid]
+        conditions = ["ae.cid = %s"]
+        if source_filter == "this":
+            conditions.append("ae.automation_id = %s")
+            params.append(id)
+        elif source_filter == "other":
+            conditions.append("ae.automation_id <> %s")
+            params.append(id)
+        if search:
+            conditions.append(
+                """
+                (
+                    lower(coalesce(ae.data->>'name', '')) like %s
+                    or lower(coalesce(ae.data->>'subject', '')) like %s
+                    or lower(coalesce(a.data->>'name', '')) like %s
+                )
+                """
+            )
+            term = "%%%s%%" % search
+            params.extend([term, term, term])
+
+        rows = db.execute(
+            """
+            select
+                ae.id,
+                ae.automation_id,
+                ae.data->>'name',
+                ae.data->>'subject',
+                coalesce(ae.data->>'type', 'raw'),
+                ae.data->>'modified',
+                a.data->>'name'
+            from automation_emails ae
+            join automations a on a.cid = ae.cid and a.id = ae.automation_id
+            where %s
+            order by
+                case when ae.automation_id = %%s then 0 else 1 end,
+                lower(coalesce(a.data->>'name', '')),
+                lower(coalesce(ae.data->>'name', '')),
+                ae.id
+            limit 100
+            """ % " and ".join(conditions),
+            *(params + [id])
+        )
+
+        req.context["result"] = [
+            {
+                "source_type": "automation_email",
+                "source_id": row[0],
+                "source_automation_id": row[1],
+                "name": row[2] or "Untitled email",
+                "subject": row[3] or "",
+                "editor_type": row[4] or "raw",
+                "modified": row[5],
+                "source_automation_name": row[6] or row[1],
+                "same_automation": row[1] == id,
+            }
+            for row in rows
+        ]
+
+
+class AutomationEmailFromSource(object):
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        doc = req.context.get("doc") or {}
+        _validate_doc(doc, AUTOMATION_EMAIL_FROM_SOURCE_SCHEMA)
+        if doc.get("source_type", "automation_email") != "automation_email":
+            raise falcon.HTTPBadRequest(
+                title="Unsupported source type",
+                description="Only automation email sources are supported.",
+            )
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+
+        source = _automation_email_obj(
+            db.row(
+                """
+                select id, cid, automation_id, data
+                from automation_emails
+                where cid = %s and id = %s
+                """,
+                cid,
+                doc["source_id"],
+            )
+        )
+        if source is None:
+            raise falcon.HTTPForbidden()
+
+        data = _automation_email_copy_data(db, cid, id, source)
         email_id = shortuuid.uuid()
         db.execute(
             """

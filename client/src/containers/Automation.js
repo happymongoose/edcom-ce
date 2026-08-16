@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, DropdownButton, FormControl, MenuItem, Panel, PanelGroup } from "react-bootstrap";
+import { Button, DropdownButton, FormControl, MenuItem, Modal, Panel, PanelGroup } from "react-bootstrap";
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
@@ -15,7 +15,7 @@ import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
 import copyText from "../utils/clipboard";
 import { canViewAutomationDiagnostics } from "../utils/automationDiagnostics";
-import AutomationWorkflowEditor, { automationListOptions } from "./AutomationWorkflowEditor";
+import AutomationWorkflowEditor, { automationEditorTypeLabel, automationListOptions } from "./AutomationWorkflowEditor";
 
 import "react-select2-wrapper/css/select2.css";
 
@@ -506,6 +506,12 @@ class Automation extends Component {
       isCreatingEmail: false,
       deletingEmailId: null,
       duplicatingEmailId: null,
+      showEmailCopyModal: false,
+      emailCopySources: [],
+      emailCopyFilter: 'all',
+      emailCopySearch: '',
+      isLoadingEmailCopySources: false,
+      copyingEmailSourceId: null,
       historyContactSearch: '',
       historyContactPage: 1,
       historyContactSort: 'recent_desc',
@@ -902,6 +908,68 @@ class Automation extends Component {
     }
   }
 
+  openEmailCopyModal = async () => {
+    this.setState({
+      showEmailCopyModal: true,
+      emailCopyFilter: 'all',
+      emailCopySearch: '',
+    }, this.loadEmailCopySources);
+  }
+
+  closeEmailCopyModal = () => {
+    if (this.state.copyingEmailSourceId) {
+      return;
+    }
+    this.setState({showEmailCopyModal: false});
+  }
+
+  emailCopyFilterChange = event => {
+    this.setState({emailCopyFilter: event.target.value}, this.loadEmailCopySources);
+  }
+
+  emailCopySearchChange = event => {
+    this.setState({emailCopySearch: event.target.value});
+  }
+
+  searchEmailCopySources = event => {
+    event.preventDefault();
+    this.loadEmailCopySources();
+  }
+
+  loadEmailCopySources = async () => {
+    this.setState({isLoadingEmailCopySources: true});
+    try {
+      const response = await axios.get('/api/automations/' + this.props.id + '/email-copy-sources', {
+        params: {
+          source_filter: this.state.emailCopyFilter,
+          q: this.state.emailCopySearch.trim(),
+        },
+      });
+      this.setState({emailCopySources: response.data});
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to load automation email sources'), 'error');
+    } finally {
+      this.setState({isLoadingEmailCopySources: false});
+    }
+  }
+
+  createEmailFromSource = async source => {
+    this.setState({copyingEmailSourceId: source.source_id});
+    try {
+      const email = (await axios.post('/api/automations/' + this.props.id + '/emails/from-source', {
+        source_type: source.source_type,
+        source_id: source.source_id,
+      })).data;
+      notify.show('Automation email copied', 'success');
+      this.setState({showEmailCopyModal: false});
+      this.props.history.push('/automations/' + this.props.id + '/emails/' + email.id);
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to copy automation email'), 'error');
+    } finally {
+      this.setState({copyingEmailSourceId: null});
+    }
+  }
+
   editEmail = email => {
     this.props.history.push('/automations/' + this.props.id + '/emails/' + email.id);
   }
@@ -1251,9 +1319,99 @@ class Automation extends Component {
     );
   }
 
+  renderEmailCopyModal() {
+    const sources = this.state.emailCopySources || [];
+    return (
+      <Modal show={this.state.showEmailCopyModal} onHide={this.closeEmailCopyModal} bsSize="large">
+        <Modal.Header closeButton>
+          <Modal.Title>Copy existing automation email</Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          <form onSubmit={this.searchEmailCopySources} className="space-bottom">
+            <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
+              <FormControl
+                componentClass="select"
+                value={this.state.emailCopyFilter}
+                onChange={this.emailCopyFilterChange}
+                style={{width: '220px'}}
+              >
+                <option value="this">This automation</option>
+                <option value="other">Other automations</option>
+                <option value="all">All automation emails</option>
+              </FormControl>
+              <FormControl
+                type="text"
+                placeholder="Search by name, subject or automation"
+                value={this.state.emailCopySearch}
+                onChange={this.emailCopySearchChange}
+                style={{width: '320px', maxWidth: '100%'}}
+              />
+              <Button type="submit" disabled={this.state.isLoadingEmailCopySources}>
+                {this.state.isLoadingEmailCopySources ? 'Searching...' : 'Search'}
+              </Button>
+            </div>
+          </form>
+          {
+            this.state.isLoadingEmailCopySources ?
+              <p className="text-muted">Loading automation emails...</p>
+            : sources.length ?
+              <EDTable className="growing-margin-left" minWidth="760px">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Subject</th>
+                    <th>Editor</th>
+                    <th>Automation</th>
+                    <th>Modified</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                {
+                  _.map(sources, (source, index) =>
+                    <EDTableRow key={source.source_id} index={index}>
+                      <td><h4 style={{whiteSpace: 'nowrap'}}>{source.name}</h4></td>
+                      <td><h4 style={{whiteSpace: 'nowrap'}}>{source.subject || 'No subject'}</h4></td>
+                      <td><h4 style={{whiteSpace: 'nowrap'}}>{automationEditorTypeLabel(source.editor_type)}</h4></td>
+                      <td>
+                        <h4 style={{whiteSpace: 'nowrap'}}>
+                          {source.source_automation_name}
+                          {source.same_automation ? ' (this automation)' : ''}
+                        </h4>
+                      </td>
+                      <td>
+                        <h4 style={{whiteSpace: 'nowrap'}}>
+                          {source.modified ? moment(source.modified).format('lll') : ''}
+                        </h4>
+                      </td>
+                      <td className="last-cell">
+                        <Button
+                          bsSize="small"
+                          disabled={!!this.state.copyingEmailSourceId}
+                          onClick={this.createEmailFromSource.bind(this, source)}
+                        >
+                          {this.state.copyingEmailSourceId === source.source_id ? 'Creating...' : 'Create copy'}
+                        </Button>
+                      </td>
+                    </EDTableRow>
+                  )
+                }
+              </EDTable>
+            :
+              <p className="help-block">No automation emails match this search.</p>
+          }
+        </Modal.Body>
+        <Modal.Footer>
+          <Button onClick={this.closeEmailCopyModal} disabled={!!this.state.copyingEmailSourceId}>
+            Close
+          </Button>
+        </Modal.Footer>
+      </Modal>
+    );
+  }
+
   renderEmails() {
     const emails = this.props.emails || [];
-    const busy = this.state.isCreatingEmail || this.state.deletingEmailId || this.state.duplicatingEmailId;
+    const busy = this.state.isCreatingEmail || this.state.deletingEmailId || this.state.duplicatingEmailId || this.state.copyingEmailSourceId;
 
     return (
       <EDFormBox space>
@@ -1268,8 +1426,11 @@ class Automation extends Component {
             <MenuItem onClick={this.createEmail.bind(this, '')}>Legacy editor</MenuItem>
             <MenuItem onClick={this.createEmail.bind(this, 'wysiwyg')}>WYSIWYG editor</MenuItem>
             <MenuItem onClick={this.createEmail.bind(this, 'raw')}>HTML editor</MenuItem>
+            <MenuItem divider />
+            <MenuItem onClick={this.openEmailCopyModal}>Copy existing email...</MenuItem>
           </DropdownButton>
         </div>
+        {this.renderEmailCopyModal()}
         {
           emails.length ?
             <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
