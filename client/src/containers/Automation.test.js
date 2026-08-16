@@ -18,10 +18,56 @@ import {
   entryPayload,
   entryTriggers,
 } from './Automation';
+import {
+  appendAutomationNode,
+  automationNodeTargetOptions,
+  insertAutomationNodeAfter,
+} from './AutomationWorkflowEditor';
 import { enrolmentQueryParams } from '../utils/automationEnrolments';
 import { canViewAutomationDiagnostics } from '../utils/automationDiagnostics';
 
 describe('automation enrolment display helpers', () => {
+  it('appends workflow nodes with a new stable id', () => {
+    const nodes = [
+      {id: 'node-1', type: 'add_tag', label: 'Existing node'},
+    ];
+
+    const updated = appendAutomationNode(nodes, 'wait_duration', {generateId: () => 'new-node'});
+
+    expect(_.pluck(updated, 'id')).toEqual(['node-1', 'new-node']);
+    expect(updated[1].duration).toEqual({days: 0, hours: 0, minutes: 5});
+    expect(nodes).toHaveLength(1);
+  });
+
+  it('inserts workflow nodes after a step without rewriting branch targets', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const updated = insertAutomationNodeAfter(nodes, 0, 'wait_duration', {generateId: () => 'inserted'});
+
+    expect(_.pluck(updated, 'id')).toEqual(['condition', 'inserted', 'target', 'exit']);
+    expect(updated[0].yes_node_id).toBe('target');
+    expect(updated[0].no_node_id).toBe('exit');
+  });
+
+  it('updates target dropdown step labels after insertion while preserving target ids', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+    const updated = insertAutomationNodeAfter(nodes, 0, 'wait_duration', {generateId: () => 'inserted'});
+
+    const options = automationNodeTargetOptions(updated, updated[0]);
+    const target = _.findWhere(options, {id: 'target'});
+
+    expect(target.id).toBe('target');
+    expect(target.name).toBe('Step 3 - Target tag (Add tag)');
+  });
+
   it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {
     expect(canViewAutomationDiagnostics({user: {admin: true}})).toBe(true);
     expect(canViewAutomationDiagnostics({loggedInImpersonate: true, user: {}})).toBe(true);

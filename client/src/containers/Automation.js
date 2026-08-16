@@ -3,7 +3,6 @@ import { Button, DropdownButton, FormControl, MenuItem, Panel, PanelGroup } from
 import axios from "axios";
 import _ from "underscore";
 import moment from "moment";
-import shortid from "shortid";
 import Select2 from "react-select2-wrapper";
 import LoaderButton from "../components/LoaderButton";
 import LoaderPanel from "../components/LoaderPanel";
@@ -16,6 +15,7 @@ import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
 import copyText from "../utils/clipboard";
 import { canViewAutomationDiagnostics } from "../utils/automationDiagnostics";
+import AutomationWorkflowEditor, { automationListOptions } from "./AutomationWorkflowEditor";
 
 import "react-select2-wrapper/css/select2.css";
 
@@ -572,30 +572,6 @@ class Automation extends Component {
     });
   }
 
-  nodeChange = (index, event) => {
-    this.props.update({
-      draft: {
-        nodes: {
-          [index]: {
-            [event.target.id]: {$set: getvalue(event)},
-          },
-        },
-      },
-    });
-  }
-
-  nodeTagChange = (index, event) => {
-    this.props.update({
-      draft: {
-        nodes: {
-          [index]: {
-            draft_tag: {$set: event.params.data.id},
-          },
-        },
-      },
-    });
-  }
-
   entryTypeChange = (index, event) => {
     const type = getvalue(event);
     const lists = this.props.lists || [];
@@ -666,33 +642,6 @@ class Automation extends Component {
     });
   }
 
-  nodeDurationChange = (index, event) => {
-    const value = parseInt(event.target.value, 10);
-    this.props.update({
-      draft: {
-        nodes: {
-          [index]: {
-            duration: {
-              [event.target.id]: {$set: isNaN(value) ? 0 : value},
-            },
-          },
-        },
-      },
-    });
-  }
-
-  nodeTargetChange = (index, event) => {
-    this.props.update({
-      draft: {
-        nodes: {
-          [index]: {
-            [event.target.id]: {$set: getvalue(event)},
-          },
-        },
-      },
-    });
-  }
-
   tagData() {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
@@ -709,54 +658,8 @@ class Automation extends Component {
     }));
   }
 
-  nodeTargetOptions(node) {
-    const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
-    return _.chain(nodes)
-      .map((target, index) => ({
-        target: target,
-        step: index + 1,
-      }))
-      .filter(option => option.target.id !== node.id)
-      .map(option => ({
-        id: option.target.id,
-        name: 'Step ' + option.step + ' - ' +
-          (option.target.label || this.nodeTypeLabel(option.target.type)) +
-          ' (' + this.nodeTypeLabel(option.target.type) + ')',
-      }))
-      .value();
-  }
-
-  editorTypeLabel(type) {
-    if (type === 'beefree') {
-      return 'BeeFree';
-    }
-    if (type === 'wysiwyg') {
-      return 'WYSIWYG';
-    }
-    if (type === 'raw') {
-      return 'HTML';
-    }
-    return 'Legacy';
-  }
-
-  automationEmailOptions() {
-    return _.map(this.props.emails || [], email => ({
-      id: email.id,
-      name: (email.name || 'Untitled email') +
-        ' - ' +
-        (email.subject || 'No subject') +
-        ' (' +
-        this.editorTypeLabel(email.type) +
-        ')',
-    }));
-  }
-
   listOptions() {
-    return _.map(this.props.lists || [], list => ({
-      id: list.id,
-      name: (list.name || 'Untitled list') +
-        (list.count !== undefined && list.count !== null ? ' (' + list.count + ' contacts)' : ''),
-    }));
+    return automationListOptions(this.props.lists || []);
   }
 
   renderEntryTrigger(trigger, index, count) {
@@ -847,65 +750,6 @@ class Automation extends Component {
         }
       </div>
     );
-  }
-
-  addNode = type => {
-    const node = {
-      id: shortid.generate(),
-      type: type,
-      label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
-    };
-
-    if (type === 'add_tag' || type === 'remove_tag') {
-      node.draft_tag = '';
-    }
-    if (type === 'if_has_tag') {
-      node.draft_tag = '';
-      node.yes_node_id = '';
-      node.no_node_id = '';
-    }
-    if (type === 'if_opened_email' || type === 'if_clicked_email') {
-      const emails = this.props.emails || [];
-      node.automation_email_id = emails.length ? emails[0].id : '';
-      node.yes_node_id = '';
-      node.no_node_id = '';
-    }
-    if (type === 'wait_duration') {
-      node.duration = {
-        days: 0,
-        hours: 0,
-        minutes: 5,
-      };
-    }
-    if (type === 'go_to') {
-      node.target_node_id = '';
-    }
-    if (type === 'send_email') {
-      const emails = this.props.emails || [];
-      node.automation_email_id = emails.length ? emails[0].id : '';
-    }
-    if (type === 'add_to_list' || type === 'remove_from_list') {
-      const lists = this.props.lists || [];
-      node.list_id = lists.length ? lists[0].id : '';
-    }
-
-    this.props.update({
-      draft: {
-        nodes: {
-          $push: [node],
-        },
-      },
-    });
-  }
-
-  deleteNode = index => {
-    this.props.update({
-      draft: {
-        nodes: {
-          $splice: [[index, 1]],
-        },
-      },
-    });
   }
 
   save = async () => {
@@ -1294,230 +1138,6 @@ class Automation extends Component {
         />
       </div>
     );
-  }
-
-  renderNodeConfig(node, index) {
-    if (node.type === 'add_tag' || node.type === 'remove_tag' || node.type === 'if_has_tag') {
-      return (
-        <div style={{minWidth: '220px'}}>
-          <Select2
-            data={this.tagData()}
-            value={node.draft_tag || ''}
-            onSelect={this.nodeTagChange.bind(this, index)}
-            style={{width:'100%'}}
-            options={{
-              placeholder: 'Select or create tag',
-              tags: true,
-              createTag: function (params) {
-                const fixed = fixTag(params.term);
-                if (!fixed) {
-                  return null;
-                }
-                return {
-                  id: fixed,
-                  text: fixed,
-                };
-              }
-            }}
-          />
-          <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
-          {
-            node.type === 'if_has_tag' ?
-              <div className="space-top-sm">
-                <SelectLabel
-                  id="yes_node_id"
-                  label="Yes target"
-                  obj={node}
-                  onChange={this.nodeTargetChange.bind(this, index)}
-                  options={this.nodeTargetOptions(node)}
-                  emptyVal="Select target"
-                />
-                <SelectLabel
-                  id="no_node_id"
-                  label="No target"
-                  obj={node}
-                  onChange={this.nodeTargetChange.bind(this, index)}
-                  options={this.nodeTargetOptions(node)}
-                  emptyVal="Select target"
-                />
-              </div>
-            :
-              null
-          }
-        </div>
-      );
-    }
-
-    if (node.type === 'wait_duration') {
-      const duration = node.duration || {};
-      return (
-        <div className="form-inline" style={{minWidth: '280px'}}>
-          <FormControl
-            id="days"
-            type="number"
-            min="0"
-            value={duration.days || 0}
-            onChange={this.nodeDurationChange.bind(this, index)}
-            style={{width: '70px'}}
-          />
-          {' '}days{' '}
-          <FormControl
-            id="hours"
-            type="number"
-            min="0"
-            value={duration.hours || 0}
-            onChange={this.nodeDurationChange.bind(this, index)}
-            style={{width: '70px'}}
-          />
-          {' '}hours{' '}
-          <FormControl
-            id="minutes"
-            type="number"
-            min="0"
-            value={duration.minutes || 0}
-            onChange={this.nodeDurationChange.bind(this, index)}
-            style={{width: '70px'}}
-          />
-          {' '}minutes
-        </div>
-      );
-    }
-
-    if (node.type === 'go_to') {
-      return (
-        <div style={{minWidth: '220px'}}>
-          <SelectLabel
-            id="target_node_id"
-            label="Target"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={this.nodeTargetOptions(node)}
-            emptyVal="Select target"
-          />
-        </div>
-      );
-    }
-
-    if (node.type === 'send_email') {
-      const options = this.automationEmailOptions();
-      if (!options.length) {
-        return (
-          <div style={{minWidth: '260px'}}>
-            <p className="help-block">Create an automation email before configuring this step.</p>
-          </div>
-        );
-      }
-      return (
-        <div style={{minWidth: '320px'}}>
-          <SelectLabel
-            id="automation_email_id"
-            label="Automation email"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={options}
-            emptyVal="Select email"
-          />
-        </div>
-      );
-    }
-
-    if (node.type === 'if_opened_email' || node.type === 'if_clicked_email') {
-      const options = this.automationEmailOptions();
-      if (!options.length) {
-        return (
-          <div style={{minWidth: '260px'}}>
-            <p className="help-block">Create an automation email before configuring this condition.</p>
-          </div>
-        );
-      }
-      return (
-        <div style={{minWidth: '320px'}}>
-          <SelectLabel
-            id="automation_email_id"
-            label="Automation email"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={options}
-            emptyVal="Select email"
-          />
-          <SelectLabel
-            id="yes_node_id"
-            label="Yes target"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={this.nodeTargetOptions(node)}
-            emptyVal="Select target"
-          />
-          <SelectLabel
-            id="no_node_id"
-            label="No target"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={this.nodeTargetOptions(node)}
-            emptyVal="Select target"
-          />
-        </div>
-      );
-    }
-
-    if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
-      const options = this.listOptions();
-      if (!options.length) {
-        return (
-          <div style={{minWidth: '220px'}}>
-            <p className="help-block">Create a contact list before selecting this node.</p>
-          </div>
-        );
-      }
-
-      return (
-        <div style={{minWidth: '220px'}}>
-          <SelectLabel
-            id="list_id"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={options}
-            emptyVal="Select list"
-          />
-        </div>
-      );
-    }
-
-    return null;
-  }
-
-  nodeTypeLabel(type) {
-    if (type === 'add_tag') {
-      return 'Add tag';
-    }
-    if (type === 'remove_tag') {
-      return 'Remove tag';
-    }
-    if (type === 'add_to_list') {
-      return 'Add to list';
-    }
-    if (type === 'remove_from_list') {
-      return 'Remove from list';
-    }
-    if (type === 'wait_duration') {
-      return 'Wait';
-    }
-    if (type === 'if_has_tag') {
-      return 'If has tag';
-    }
-    if (type === 'if_opened_email') {
-      return 'If opened email';
-    }
-    if (type === 'if_clicked_email') {
-      return 'If clicked email';
-    }
-    if (type === 'go_to') {
-      return 'Go to';
-    }
-    if (type === 'send_email') {
-      return 'Send email';
-    }
-    return 'Exit';
   }
 
   renderEnrolments() {
@@ -2114,114 +1734,15 @@ class Automation extends Component {
             </EDFormBox>
             {this.renderEmails()}
             {this.renderPreflight()}
-            <EDFormBox space>
-              <div className="flex-items space-between">
-                <h4>Draft Workflow</h4>
-                <DropdownButton
-                  id="automation-node-create-dropdown"
-                  title="Add Node"
-                >
-                  <MenuItem onClick={this.addNode.bind(this, 'add_tag')}>Add Tag Node</MenuItem>
-                  <MenuItem onClick={this.addNode.bind(this, 'remove_tag')}>Remove Tag Node</MenuItem>
-                  <MenuItem
-                    onClick={this.addNode.bind(this, 'add_to_list')}
-                    disabled={!((this.props.lists || []).length)}
-                  >
-                    Add To List Node
-                  </MenuItem>
-                  <MenuItem
-                    onClick={this.addNode.bind(this, 'remove_from_list')}
-                    disabled={!((this.props.lists || []).length)}
-                  >
-                    Remove From List Node
-                  </MenuItem>
-                  <MenuItem onClick={this.addNode.bind(this, 'wait_duration')}>Wait Duration Node</MenuItem>
-                  <MenuItem onClick={this.addNode.bind(this, 'if_has_tag')}>Condition Node</MenuItem>
-                  <MenuItem
-                    onClick={this.addNode.bind(this, 'if_opened_email')}
-                    disabled={!((this.props.emails || []).length)}
-                  >
-                    If Opened Email Node
-                  </MenuItem>
-                  <MenuItem
-                    onClick={this.addNode.bind(this, 'if_clicked_email')}
-                    disabled={!((this.props.emails || []).length)}
-                  >
-                    If Clicked Email Node
-                  </MenuItem>
-                  <MenuItem onClick={this.addNode.bind(this, 'go_to')}>Go To Node</MenuItem>
-                  <MenuItem
-                    onClick={this.addNode.bind(this, 'send_email')}
-                    disabled={!((this.props.emails || []).length)}
-                  >
-                    Send Email Node
-                  </MenuItem>
-                  <MenuItem onClick={this.addNode.bind(this, 'exit')}>Add Exit Node</MenuItem>
-                </DropdownButton>
-              </div>
-              {
-                (this.props.emails || []).length ?
-                  null
-                :
-                  <p className="help-block">Create an automation email before adding a send email node.</p>
-              }
-              {
-                (this.props.lists || []).length ?
-                  null
-                :
-                  <p className="help-block">Create a contact list before adding list action nodes.</p>
-              }
-              {
-                nodes.length ?
-                  <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
-                    <thead>
-                      <tr>
-                        <th>Order</th>
-                        <th>Type</th>
-                        <th>Label</th>
-                        <th>Configuration</th>
-                        <th>Contacts at step</th>
-                        <th></th>
-                      </tr>
-                    </thead>
-                    {
-                      _.map(nodes, (node, index) =>
-                        <EDTableRow key={node.id} index={index}>
-                          <td>
-                            <h4>{index + 1}</h4>
-                          </td>
-                          <td>
-                            <h4 style={{whiteSpace: 'nowrap'}}>
-                              {this.nodeTypeLabel(node.type)}
-                            </h4>
-                          </td>
-                          <td>
-                            <FormControl
-                              id="label"
-                              value={node.label}
-                              onChange={this.nodeChange.bind(this, index)}
-                              required={true}
-                            />
-                          </td>
-                          <td>
-                            {this.renderNodeConfig(node, index)}
-                          </td>
-                          <td>
-                            {this.renderNodeContactCount(node)}
-                          </td>
-                          <td style={{minWidth: '92px'}} className="last-cell">
-                            <Button onClick={this.deleteNode.bind(this, index)}>Delete</Button>
-                          </td>
-                        </EDTableRow>
-                      )
-                    }
-                  </EDTable>
-                :
-                  <div className="text-center space-top-sm">
-                    <h4>This draft does not have any nodes yet.</h4>
-                  </div>
-              }
-            </EDFormBox>
+            <AutomationWorkflowEditor
+              nodes={nodes}
+              emails={this.props.emails || []}
+              lists={this.props.lists || []}
+              tags={this.props.tags || []}
+              entryTags={entryTagValues(data.entry)}
+              update={this.props.update}
+              renderNodeContactCount={this.renderNodeContactCount.bind(this)}
+            />
             {this.renderEnrolments()}
             {canViewAutomationDiagnostics(this.props) ? this.renderHistory() : null}
           </EDFormSection>
