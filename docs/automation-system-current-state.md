@@ -18,6 +18,7 @@ This note summarizes the automation system as of the current implementation. It 
 
 - Automation CRUD/publish/pause/resume.
 - Automation email CRUD, duplicate, editor route support, and send-test.
+- Automation email copy sources for creating automation emails from existing same-account email content.
 - Manual enrolment for one contact, contact lists, and segments.
 - Manual `run-next` execution for one enrolment.
 - Manual account-scoped automation enrolment processor.
@@ -102,6 +103,34 @@ with `suppressed: true` and a bounded `suppression_reason`, then the enrolment
 advances normally or completes if the send node is final. Retry/backoff is not
 applied because suppression is expected contact state, not a provider/runtime
 failure.
+
+## Automation Email Creation And Copying
+
+Automation emails can be created blank from a selected editor type or copied
+from existing same-account sources. Supported copy sources are:
+
+- Automation emails.
+- Broadcasts/campaigns.
+- Funnel messages from same-account funnels.
+- Transactional templates.
+
+Copying preserves only email authoring fields:
+
+- Editor `type`.
+- `subject`.
+- `preheader`.
+- `rawText`.
+- `parts`.
+- `bodyStyle`.
+- Sender fields: `fromname`, `fromemail`, `replyto`, and `returnpath`.
+
+Copying does not preserve stats, logs, source IDs, send state, targeting, route
+configuration, transactional API identity, funnel progression/timing, or
+arbitrary source metadata. Listing/search responses for copy sources are
+metadata-only and do not expose body/design/raw JSON fields. Ownership checks
+are current-account scoped; funnel message sources require both the message and
+the referenced funnel to belong to the current account, and the message must be
+present in `funnels.data.messages[]`.
 
 ## Schedulers And Processors
 
@@ -195,6 +224,6 @@ Recovery actions should preserve audit/history where possible. `automation_step_
 - Public API automation enrolment.
 - Contact automation status/progress table on contact edit.
 - Email history expansion to broadcast and funnel sends after reliable timestamped metadata exists.
-- Creating automation emails from existing emails/templates.
+- Additional copy sources if a broader reusable template library is introduced.
 - Segment scanner retention strategy for snapshot/member tables.
 - Operational alerting for stale claims, repeated failures, and segment scanner errors.
