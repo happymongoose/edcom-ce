@@ -107,6 +107,23 @@ describe('automation enrolment display helpers', () => {
     expect(updated[2].target_node_id).toBe('target');
   });
 
+  it('moves workflow nodes without rewriting email list tag or wait configuration', () => {
+    const nodes = [
+      {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},
+      {id: 'list', type: 'add_to_list', label: 'List', list_id: 'list-1'},
+      {id: 'tag', type: 'add_tag', label: 'Tag', draft_tag: 'vip'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait', duration: {days: 1, hours: 2, minutes: 3}},
+    ];
+
+    const updated = moveAutomationNode(nodes, 3, -1);
+
+    expect(_.pluck(updated, 'id')).toEqual(['send', 'list', 'wait', 'tag']);
+    expect(updated[0].automation_email_id).toBe('email-1');
+    expect(updated[1].list_id).toBe('list-1');
+    expect(updated[2].duration).toEqual({days: 1, hours: 2, minutes: 3});
+    expect(updated[3].draft_tag).toBe('vip');
+  });
+
   it('updates target dropdown step labels after moving nodes', () => {
     const nodes = [
       {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
