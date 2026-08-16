@@ -565,6 +565,23 @@ class AutomationWorkflowEditor extends Component {
     return null;
   }
 
+  renderNodeDetails(node, index) {
+    return (
+      <div>
+        <div style={{maxWidth: '320px', marginBottom: '14px'}}>
+          <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Label</div>
+          <FormControl
+            id="label"
+            value={node.label}
+            onChange={this.nodeChange.bind(this, index)}
+            required={true}
+          />
+        </div>
+        {this.renderNodeConfig(node, index)}
+      </div>
+    );
+  }
+
   renderAddNodeDropdown(id, title, afterIndex) {
     const hasEmails = (this.props.emails || []).length;
     const hasLists = (this.props.lists || []).length;
@@ -684,21 +701,13 @@ class AutomationWorkflowEditor extends Component {
                 <span
                   style={{
                     display: 'inline-block',
-                    padding: '3px 8px',
+                    padding: '4px 9px',
                     borderRadius: '4px',
-                    background: '#eef2f8',
-                    fontSize: '13px',
-                    lineHeight: '18px',
-                    marginRight: '8px',
-                    verticalAlign: 'middle',
-                  }}
-                >
-                  {automationNodeTypeLabel(node.type)}
-                </span>
-                <span
-                  style={{
+                    background: summaryWarning ? '#f8eeee' : '#eef2f8',
                     color: summaryWarning ? '#a94442' : undefined,
-                    fontWeight: summaryWarning ? 600 : undefined,
+                    fontWeight: 600,
+                    fontSize: '13px',
+                    lineHeight: '20px',
                   }}
                 >
                   {summary}
@@ -734,32 +743,12 @@ class AutomationWorkflowEditor extends Component {
                 Down
               </Button>
               <Button bsSize="small" onClick={this.deleteNode.bind(this, index)}>Delete</Button>
-          </div>
-        </div>
-        <div
-          style={{
-            display: 'flex',
-            gap: '18px',
-            padding: '16px',
-            flexWrap: 'wrap',
-          }}
-        >
-          <div style={{flex: '0 1 280px', minWidth: '220px'}}>
-            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Label</div>
-            <FormControl
-              id="label"
-              value={node.label}
-              onChange={this.nodeChange.bind(this, index)}
-              required={true}
-            />
-          </div>
-          <div style={{flex: '1 1 180px', minWidth: '160px', alignSelf: 'flex-end'}}>
-            <Button
-              bsSize="small"
-              onClick={this.toggleNodeDetails.bind(this, node)}
-            >
-              {expanded ? 'Hide details' : 'Edit details'}
-            </Button>
+              <Button
+                bsSize="small"
+                onClick={this.toggleNodeDetails.bind(this, node)}
+              >
+                {expanded ? 'Hide details' : 'Edit details'}
+              </Button>
           </div>
         </div>
         {
@@ -771,7 +760,7 @@ class AutomationWorkflowEditor extends Component {
                 background: '#fbfcfe',
               }}
             >
-              {this.renderNodeConfig(node, index)}
+              {this.renderNodeDetails(node, index)}
             </div>
           :
             null
