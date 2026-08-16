@@ -4,7 +4,7 @@ import _ from "underscore";
 import shortid from "shortid";
 import Select2 from "react-select2-wrapper";
 import { SelectLabel } from "../components/FormControls";
-import { EDFormBox, EDTable, EDTableRow } from "../components/EDDOM";
+import { EDFormBox } from "../components/EDDOM";
 import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
 
@@ -613,6 +613,106 @@ class AutomationWorkflowEditor extends Component {
     );
   }
 
+  renderNodeCard(node, index, nodes) {
+    const expanded = !!this.state.expandedNodeIds[node.id];
+    return (
+      <div
+        key={node.id}
+        style={{
+          border: '1px solid #e5e8ef',
+          marginTop: index === 0 ? '18px' : '14px',
+          background: '#fff',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: '16px',
+            padding: '16px',
+            flexWrap: 'wrap',
+          }}
+        >
+          <div style={{width: '44px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Step</div>
+            <h4 style={{marginTop: '4px'}}>{index + 1}</h4>
+          </div>
+          <div style={{width: '145px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Type</div>
+            <h4 style={{marginTop: '4px', whiteSpace: 'nowrap'}}>
+              {automationNodeTypeLabel(node.type)}
+            </h4>
+          </div>
+          <div style={{width: '210px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Label</div>
+            <FormControl
+              id="label"
+              value={node.label}
+              onChange={this.nodeChange.bind(this, index)}
+              required={true}
+            />
+          </div>
+          <div style={{flex: '1 1 320px', minWidth: '260px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Summary</div>
+            <p style={{marginTop: '7px', marginBottom: '10px'}}>
+              {this.nodeSummary(node)}
+            </p>
+            <Button
+              bsSize="small"
+              onClick={this.toggleNodeDetails.bind(this, node)}
+            >
+              {expanded ? 'Hide details' : 'Edit details'}
+            </Button>
+          </div>
+          <div style={{width: '150px'}}>
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Contacts</div>
+            {this.props.renderNodeContactCount(node)}
+          </div>
+          <div style={{width: '235px'}} className="last-cell">
+            <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase'}}>Actions</div>
+            <div style={{marginTop: '6px'}}>
+              {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert', index)}
+              {' '}
+              <Button
+                bsSize="small"
+                disabled={index === 0}
+                onClick={this.moveNode.bind(this, index, -1)}
+                title="Move up"
+              >
+                Up
+              </Button>
+              {' '}
+              <Button
+                bsSize="small"
+                disabled={index === nodes.length - 1}
+                onClick={this.moveNode.bind(this, index, 1)}
+                title="Move down"
+              >
+                Down
+              </Button>
+              {' '}
+              <Button bsSize="small" onClick={this.deleteNode.bind(this, index)}>Delete</Button>
+            </div>
+          </div>
+        </div>
+        {
+          expanded ?
+            <div
+              style={{
+                borderTop: '1px solid #eef1f5',
+                padding: '16px',
+                background: '#fbfcfe',
+              }}
+            >
+              {this.renderNodeConfig(node, index)}
+            </div>
+          :
+            null
+        }
+      </div>
+    );
+  }
+
   render() {
     const nodes = this.props.nodes || [];
     return (
@@ -635,90 +735,9 @@ class AutomationWorkflowEditor extends Component {
         }
         {
           nodes.length ?
-            <EDTable className="growing-margin-left" minWidth="1100px">
-              <thead>
-                <tr>
-                  <th style={{width: '70px'}}>Order</th>
-                  <th style={{width: '150px'}}>Type</th>
-                  <th style={{width: '180px'}}>Label</th>
-                  <th>Configuration</th>
-                  <th style={{width: '150px'}}>Contacts at step</th>
-                  <th></th>
-                </tr>
-              </thead>
-              {
-                _.map(nodes, (node, index) =>
-                  {
-                    const expanded = !!this.state.expandedNodeIds[node.id];
-                    return (
-                      <EDTableRow key={node.id} index={index}>
-                        <td>
-                          <h4>{index + 1}</h4>
-                        </td>
-                        <td>
-                          <h4 style={{whiteSpace: 'nowrap'}}>
-                            {automationNodeTypeLabel(node.type)}
-                          </h4>
-                        </td>
-                        <td>
-                          <FormControl
-                            id="label"
-                            value={node.label}
-                            onChange={this.nodeChange.bind(this, index)}
-                            required={true}
-                          />
-                        </td>
-                        <td>
-                          <p style={{marginBottom: expanded ? '8px' : 0}}>
-                            {this.nodeSummary(node)}
-                          </p>
-                          <Button
-                            bsSize="small"
-                            onClick={this.toggleNodeDetails.bind(this, node)}
-                          >
-                            {expanded ? 'Hide details' : 'Edit details'}
-                          </Button>
-                          {
-                            expanded ?
-                              <div style={{marginTop: '10px'}}>
-                                {this.renderNodeConfig(node, index)}
-                              </div>
-                            :
-                              null
-                          }
-                        </td>
-                        <td>
-                          {this.props.renderNodeContactCount(node)}
-                        </td>
-                        <td style={{minWidth: '210px'}} className="last-cell">
-                          {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert', index)}
-                          {' '}
-                          <Button
-                            bsSize="small"
-                            disabled={index === 0}
-                            onClick={this.moveNode.bind(this, index, -1)}
-                            title="Move up"
-                          >
-                            Up
-                          </Button>
-                          {' '}
-                          <Button
-                            bsSize="small"
-                            disabled={index === nodes.length - 1}
-                            onClick={this.moveNode.bind(this, index, 1)}
-                            title="Move down"
-                          >
-                            Down
-                          </Button>
-                          {' '}
-                          <Button bsSize="small" onClick={this.deleteNode.bind(this, index)}>Delete</Button>
-                        </td>
-                      </EDTableRow>
-                    );
-                  }
-                )
-              }
-            </EDTable>
+            <div>
+              {_.map(nodes, (node, index) => this.renderNodeCard(node, index, nodes))}
+            </div>
           :
             <div className="text-center space-top-sm">
               <h4>This draft does not have any nodes yet.</h4>
