@@ -11,6 +11,7 @@ class TestAutomationEmails(test_base.TestBase):
         self.created_automation_ids = []
         self.created_email_ids = []
         self.created_txn_template_ids = []
+        self.created_campaign_ids = []
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
@@ -35,6 +36,12 @@ class TestAutomationEmails(test_base.TestBase):
             self.db.execute(
                 "delete from txntemplates where id = any(%s) and cid = %s",
                 self.created_txn_template_ids,
+                cid,
+            )
+        if self.created_campaign_ids:
+            self.db.execute(
+                "delete from campaigns where id = any(%s) and cid = %s",
+                self.created_campaign_ids,
                 cid,
             )
         super(TestAutomationEmails, self).tearDown()
@@ -87,11 +94,51 @@ class TestAutomationEmails(test_base.TestBase):
             "tag": "do-not-copy",
         }
         doc.update(overrides)
-        template_id = self.db.txntemplates.add(doc)
+        template_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into txntemplates (id, cid, data) values (%s, %s, %s)",
+            template_id,
+            self.user_cookie["cid"],
+            doc,
+        )
         self.created_txn_template_ids.append(template_id)
         template = self.db.txntemplates.get(template_id)
         template["id"] = template_id
         return template
+
+    def create_campaign(self, **overrides):
+        doc = {
+            "name": "Broadcast %s" % self.unique(),
+            "subject": "Broadcast subject",
+            "preheader": "Broadcast preview",
+            "type": "raw",
+            "rawText": "<p>Broadcast</p>",
+            "parts": [],
+            "bodyStyle": {},
+            "fromname": "Broadcast Sender",
+            "fromemail": "from@example.com",
+            "replyto": "reply@example.com",
+            "returnpath": "bounce@example.com",
+            "when": "draft",
+            "lists": [],
+            "segments": [],
+            "tags": [],
+            "supplists": [],
+            "suppsegs": [],
+            "supptags": [],
+        }
+        doc.update(overrides)
+        campaign_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into campaigns (id, cid, data) values (%s, %s, %s)",
+            campaign_id,
+            self.user_cookie["cid"],
+            doc,
+        )
+        self.created_campaign_ids.append(campaign_id)
+        campaign = self.db.campaigns.get(campaign_id)
+        campaign["id"] = campaign_id
+        return campaign
 
     def route_id(self):
         company = self.db.companies.get(self.user_cookie["cid"])
@@ -209,7 +256,10 @@ class TestAutomationEmails(test_base.TestBase):
 
         self.assertEqual([item["source_id"] for item in sources], [wanted["id"]])
         self.assertEqual(result.status_code, 400)
-        self.assertIn("Source filter must be this, other, all or transactional_templates", result.text)
+        self.assertIn(
+            "Source filter must be this, other, all, transactional_templates or broadcasts",
+            result.text,
+        )
 
     def test_email_copy_sources_list_transactional_templates_metadata_only(self):
         target = self.create_automation()
@@ -237,6 +287,45 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertNotIn("rawText", sources[0])
         self.assertNotIn("parts", sources[0])
         self.assertNotIn("bodyStyle", sources[0])
+
+    def test_email_copy_sources_list_broadcasts_metadata_only(self):
+        target = self.create_automation()
+        draft = self.create_campaign(
+            name="Draft broadcast source",
+            subject="Draft broadcast needle",
+            type="wysiwyg",
+            rawText="<h1>Hidden draft body</h1>",
+            parts=[{"type": "text", "value": "hidden"}],
+            bodyStyle={"hidden": True},
+        )
+        sent = self.create_campaign(
+            name="Sent broadcast source",
+            subject="Sent broadcast needle",
+            sent_at="2026-08-16T12:00:00Z",
+        )
+        self.create_campaign(
+            name="Hidden broadcast source",
+            subject="Hidden broadcast needle",
+            hidden=True,
+        )
+
+        sources = self.user_get(
+            "/api/automations/%s/email-copy-sources?source_filter=broadcasts&q=broadcast%%20needle"
+            % target["id"]
+        )
+        source_ids = [item["source_id"] for item in sources]
+
+        self.assertIn(draft["id"], source_ids)
+        self.assertIn(sent["id"], source_ids)
+        self.assertNotIn("rawText", sources[0])
+        self.assertNotIn("parts", sources[0])
+        self.assertNotIn("bodyStyle", sources[0])
+        draft_source = [item for item in sources if item["source_id"] == draft["id"]][0]
+        sent_source = [item for item in sources if item["source_id"] == sent["id"]][0]
+        self.assertEqual(draft_source["source_type"], "broadcast")
+        self.assertEqual(draft_source["source_label"], "Broadcast")
+        self.assertEqual(draft_source["status"], "draft")
+        self.assertEqual(sent_source["status"], "sent")
 
     def test_email_copy_sources_exclude_cross_account_sources(self):
         target = self.create_automation()
@@ -283,6 +372,29 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_txn_template_ids.remove(template["id"])
+
+    def test_email_copy_sources_exclude_cross_account_broadcasts(self):
+        target = self.create_automation()
+        campaign = self.create_campaign(name="Cross account broadcast source")
+        self.db.execute(
+            "update campaigns set cid = %s where id = %s",
+            "other-account-cid",
+            campaign["id"],
+        )
+
+        try:
+            sources = self.user_get(
+                "/api/automations/%s/email-copy-sources?source_filter=broadcasts"
+                % target["id"]
+            )
+            self.assertNotIn(campaign["id"], [item["source_id"] for item in sources])
+        finally:
+            self.db.execute(
+                "delete from campaigns where id = %s and cid = %s",
+                campaign["id"],
+                "other-account-cid",
+            )
+            self.created_campaign_ids.remove(campaign["id"])
 
     def test_create_email_from_automation_email_source_preserves_supported_fields(self):
         target = self.create_automation()
@@ -410,6 +522,125 @@ class TestAutomationEmails(test_base.TestBase):
         )
         self.assertEqual(type_change.status_code, 400)
 
+    def test_create_email_from_broadcast_preserves_whitelisted_fields(self):
+        target = self.create_automation()
+        campaign = self.create_campaign(
+            name="Broadcast source",
+            subject="Broadcast source subject",
+            preheader="Broadcast source preheader",
+            type="wysiwyg",
+            rawText="<h1>Broadcast body</h1>",
+            parts=[{"type": "text", "value": "body"}],
+            bodyStyle={"background": "#abc"},
+            fromname="Broadcast Sender",
+            fromemail="sender@example.com",
+            replyto="reply@example.com",
+            returnpath="bounce@example.com",
+            lists=["do-not-copy"],
+            segments=["do-not-copy"],
+            tags=["do-not-copy"],
+            supplists=["do-not-copy"],
+            suppsegs=["do-not-copy"],
+            supptags=["do-not-copy"],
+            when="schedule",
+            scheduled_for="2026-08-16T12:00:00Z",
+            sent_at="2026-08-16T12:30:00Z",
+            started=True,
+            finished_at="2026-08-16T12:35:00Z",
+            canceled=True,
+            route="do-not-copy",
+            delivered=10,
+            send=10,
+            soft=1,
+            hard=1,
+            opened=2,
+            clicked=3,
+            bounced=1,
+            complained=1,
+            unsubscribed=1,
+            resendsubject="do-not-copy",
+            resendpreheader="do-not-copy",
+            linkurls=["https://example.com"],
+            linkclicks=[1],
+            image="do-not-copy",
+            archive_key="do-not-copy",
+            openaddtags=["do-not-copy"],
+            openremtags=["do-not-copy"],
+            clickaddtags=["do-not-copy"],
+            clickremtags=["do-not-copy"],
+            sendaddtags=["do-not-copy"],
+            sendremtags=["do-not-copy"],
+            disableopens=True,
+            arbitrary_metadata={"nested": "do-not-copy"},
+        )
+
+        copied = self.user_post(
+            "/api/automations/%s/emails/from-source" % target["id"],
+            json={"source_type": "broadcast", "source_id": campaign["id"]},
+        )
+        self.created_email_ids.append(copied["id"])
+
+        self.assertEqual(copied["automation_id"], target["id"])
+        self.assertEqual(copied["name"], "Copy of Broadcast source")
+        self.assertEqual(copied["subject"], "Broadcast source subject")
+        self.assertEqual(copied["preheader"], "Broadcast source preheader")
+        self.assertEqual(copied["type"], "wysiwyg")
+        self.assertEqual(copied["rawText"], "<h1>Broadcast body</h1>")
+        self.assertEqual(copied["parts"], [{"type": "text", "value": "body"}])
+        self.assertEqual(copied["bodyStyle"], {"background": "#abc"})
+        self.assertEqual(copied["fromname"], "Broadcast Sender")
+        self.assertEqual(copied["fromemail"], "sender@example.com")
+        self.assertEqual(copied["replyto"], "reply@example.com")
+        self.assertEqual(copied["returnpath"], "bounce@example.com")
+        self.assertNotEqual(copied["id"], campaign["id"])
+
+        for field in (
+            "lists",
+            "segments",
+            "tags",
+            "supplists",
+            "suppsegs",
+            "supptags",
+            "when",
+            "scheduled_for",
+            "sent_at",
+            "started",
+            "finished_at",
+            "canceled",
+            "route",
+            "delivered",
+            "send",
+            "soft",
+            "hard",
+            "opened",
+            "clicked",
+            "bounced",
+            "complained",
+            "unsubscribed",
+            "resendsubject",
+            "resendpreheader",
+            "linkurls",
+            "linkclicks",
+            "image",
+            "archive_key",
+            "openaddtags",
+            "openremtags",
+            "clickaddtags",
+            "clickremtags",
+            "sendaddtags",
+            "sendremtags",
+            "disableopens",
+            "arbitrary_metadata",
+        ):
+            self.assertNotIn(field, copied)
+
+        type_change = self.simulate_patch(
+            "/api/automations/%s/emails/%s" % (target["id"], copied["id"]),
+            json={"type": "raw"},
+            headers=self.headers(),
+        )
+        self.assertEqual(type_change.status_code, 400)
+
     def test_create_email_from_source_rejects_cross_account_and_unsupported_source(self):
         target = self.create_automation()
         source_automation = self.create_automation()
@@ -428,7 +659,7 @@ class TestAutomationEmails(test_base.TestBase):
             )
             unsupported = self.simulate_post(
                 "/api/automations/%s/emails/from-source" % target["id"],
-                json={"source_type": "broadcast", "source_id": source["id"]},
+                json={"source_type": "funnel_message", "source_id": source["id"]},
                 headers=self.headers(),
             )
 
@@ -466,6 +697,31 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_txn_template_ids.remove(template["id"])
+
+    def test_create_email_from_broadcast_rejects_cross_account(self):
+        target = self.create_automation()
+        campaign = self.create_campaign(name="Other account broadcast source")
+        self.db.execute(
+            "update campaigns set cid = %s where id = %s",
+            "other-account-cid",
+            campaign["id"],
+        )
+
+        try:
+            cross_account = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "broadcast", "source_id": campaign["id"]},
+                headers=self.headers(),
+            )
+
+            self.assertEqual(cross_account.status_code, 403)
+        finally:
+            self.db.execute(
+                "delete from campaigns where id = %s and cid = %s",
+                campaign["id"],
+                "other-account-cid",
+            )
+            self.created_campaign_ids.remove(campaign["id"])
 
     def test_default_email_shape(self):
         automation = self.create_automation()

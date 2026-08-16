@@ -1339,6 +1339,7 @@ class Automation extends Component {
                 <option value="other">Other automations</option>
                 <option value="all">All copy sources</option>
                 <option value="transactional_templates">Transactional templates</option>
+                <option value="broadcasts">Broadcasts</option>
               </FormControl>
               <FormControl
                 type="text"

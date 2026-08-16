@@ -695,7 +695,7 @@ AUTOMATION_EMAIL_FROM_SOURCE_SCHEMA = {
     "properties": {
         "source_type": {
             "type": "string",
-            "enum": ["automation_email", "transactional_template"],
+            "enum": ["automation_email", "transactional_template", "broadcast"],
         },
         "source_id": {
             "type": "string",
@@ -1505,6 +1505,16 @@ def _automation_email_copy_data(
 
 
 def _transactional_template_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+
+    id, cid, data = row
+    data["id"] = id
+    data["cid"] = cid
+    return data
+
+
+def _broadcast_source_obj(row) -> JsonObj | None:
     if row is None:
         return None
 
@@ -2560,10 +2570,16 @@ class AutomationEmailCopySources(object):
         _automation_for_email_route(db, id)
 
         source_filter = req.get_param("source_filter") or "all"
-        if source_filter not in ("this", "other", "all", "transactional_templates"):
+        if source_filter not in (
+            "this",
+            "other",
+            "all",
+            "transactional_templates",
+            "broadcasts",
+        ):
             raise falcon.HTTPBadRequest(
                 title="Invalid source filter",
-                description="Source filter must be this, other, all or transactional_templates.",
+                description="Source filter must be this, other, all, transactional_templates or broadcasts.",
             )
 
         search = (req.get_param("q") or "").strip().lower()
@@ -2670,6 +2686,56 @@ class AutomationEmailCopySources(object):
                 for row in rows
             )
 
+        if source_filter in ("broadcasts", "all"):
+            params = [cid]
+            search_query = ""
+            if search:
+                search_query = """
+                    and (
+                        lower(coalesce(data->>'name', '')) like %s
+                        or lower(coalesce(data->>'subject', '')) like %s
+                    )
+                """
+                term = "%%%s%%" % search
+                params.extend([term, term])
+            rows = db.execute(
+                """
+                select
+                    id,
+                    data->>'name',
+                    data->>'subject',
+                    coalesce(data->>'type', 'raw'),
+                    data->>'modified',
+                    data->>'sent_at'
+                from campaigns
+                where cid = %%s
+                    and data->>'hidden' is null
+                    %s
+                order by
+                    case when data->>'sent_at' is null then 0 else 1 end,
+                    coalesce(data->>'sent_at', data->>'modified') desc nulls last,
+                    lower(coalesce(data->>'name', '')),
+                    id
+                limit 100
+                """ % search_query,
+                *params
+            )
+            sources.extend(
+                {
+                    "source_type": "broadcast",
+                    "source_id": row[0],
+                    "name": row[1] or "Untitled broadcast",
+                    "subject": row[2] or "",
+                    "editor_type": row[3] or "raw",
+                    "modified": row[4],
+                    "sent_at": row[5],
+                    "status": "sent" if row[5] else "draft",
+                    "source_label": "Broadcast",
+                    "same_automation": False,
+                }
+                for row in rows
+            )
+
         req.context["result"] = sources[:100]
 
 
@@ -2709,10 +2775,22 @@ class AutomationEmailFromSource(object):
                     doc["source_id"],
                 )
             )
+        elif source_type == "broadcast":
+            source = _broadcast_source_obj(
+                db.row(
+                    """
+                    select id, cid, data
+                    from campaigns
+                    where cid = %s and id = %s
+                    """,
+                    cid,
+                    doc["source_id"],
+                )
+            )
         else:
             raise falcon.HTTPBadRequest(
                 title="Unsupported source type",
-                description="Only automation email and transactional template sources are supported.",
+                description="Only automation email, transactional template and broadcast sources are supported.",
             )
         if source is None:
             raise falcon.HTTPForbidden()
