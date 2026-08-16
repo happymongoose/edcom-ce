@@ -695,7 +695,12 @@ AUTOMATION_EMAIL_FROM_SOURCE_SCHEMA = {
     "properties": {
         "source_type": {
             "type": "string",
-            "enum": ["automation_email", "transactional_template", "broadcast"],
+            "enum": [
+                "automation_email",
+                "transactional_template",
+                "broadcast",
+                "funnel_message",
+            ],
         },
         "source_id": {
             "type": "string",
@@ -1522,6 +1527,34 @@ def _broadcast_source_obj(row) -> JsonObj | None:
     data["id"] = id
     data["cid"] = cid
     return data
+
+
+def _funnel_message_source_obj(row) -> JsonObj | None:
+    if row is None:
+        return None
+
+    message_id, cid, message_data, funnel_id, funnel_data = row
+    message_data["id"] = message_id
+    message_data["cid"] = cid
+    message_data["source_funnel_id"] = funnel_id
+    message_data["source_funnel_name"] = funnel_data.get("name") or funnel_id
+    funnel_meta = None
+    for item in funnel_data.get("messages") or []:
+        if item.get("id") == message_id:
+            funnel_meta = item
+            break
+    if funnel_meta is None:
+        raise falcon.HTTPBadRequest(
+            title="Invalid funnel message source",
+            description="The selected funnel message is not referenced by its funnel metadata.",
+        )
+    message_data["name"] = "%s: %s" % (
+        message_data["source_funnel_name"],
+        message_data.get("subject") or "Untitled message",
+    )
+    for field in ("fromname", "returnpath", "fromemail", "replyto"):
+        message_data[field] = funnel_meta.get(field) or ""
+    return message_data
 
 
 def _node_references_automation_email(node: JsonObj, email_id: str) -> bool:
@@ -2576,10 +2609,11 @@ class AutomationEmailCopySources(object):
             "all",
             "transactional_templates",
             "broadcasts",
+            "funnel_messages",
         ):
             raise falcon.HTTPBadRequest(
                 title="Invalid source filter",
-                description="Source filter must be this, other, all, transactional_templates or broadcasts.",
+                description="Source filter must be this, other, all, transactional_templates, broadcasts or funnel_messages.",
             )
 
         search = (req.get_param("q") or "").strip().lower()
@@ -2736,6 +2770,64 @@ class AutomationEmailCopySources(object):
                 for row in rows
             )
 
+        if source_filter in ("funnel_messages", "all"):
+            params = [cid]
+            search_query = ""
+            if search:
+                search_query = """
+                    and (
+                        lower(coalesce(m.data->>'subject', '')) like %s
+                        or lower(coalesce(f.data->>'name', '')) like %s
+                    )
+                """
+                term = "%%%s%%" % search
+                params.extend([term, term])
+            rows = db.execute(
+                """
+                select
+                    m.id,
+                    m.data->>'subject',
+                    coalesce(m.data->>'type', 'raw'),
+                    m.data->>'modified',
+                    f.id,
+                    f.data->>'name',
+                    match_meta.meta->>'whennum',
+                    match_meta.meta->>'whentype'
+                from messages m
+                join funnels f on f.cid = m.cid and f.id = m.data->>'funnel'
+                join lateral jsonb_array_elements(coalesce(f.data->'messages', '[]'::jsonb)) match_meta(meta)
+                    on match_meta.meta->>'id' = m.id
+                where m.cid = %%s %s
+                order by
+                    lower(coalesce(f.data->>'name', '')),
+                    nullif(match_meta.meta->>'whennum', '')::int nulls first,
+                    lower(coalesce(m.data->>'subject', '')),
+                    m.id
+                limit 100
+                """ % search_query,
+                *params
+            )
+            sources.extend(
+                {
+                    "source_type": "funnel_message",
+                    "source_id": row[0],
+                    "name": "%s: %s" % (row[5] or row[4], row[1] or "Untitled message"),
+                    "subject": row[1] or "",
+                    "editor_type": row[2] or "raw",
+                    "modified": row[3],
+                    "source_funnel_id": row[4],
+                    "source_funnel_name": row[5] or row[4],
+                    "source_label": "Funnel: %s" % (row[5] or row[4]),
+                    "sequence_label": (
+                        "After %s %s" % (row[6], row[7])
+                        if row[6] and row[7]
+                        else "First message"
+                    ),
+                    "same_automation": False,
+                }
+                for row in rows
+            )
+
         req.context["result"] = sources[:100]
 
 
@@ -2787,10 +2879,23 @@ class AutomationEmailFromSource(object):
                     doc["source_id"],
                 )
             )
+        elif source_type == "funnel_message":
+            source = _funnel_message_source_obj(
+                db.row(
+                    """
+                    select m.id, m.cid, m.data, f.id, f.data
+                    from messages m
+                    join funnels f on f.cid = m.cid and f.id = m.data->>'funnel'
+                    where m.cid = %s and m.id = %s
+                    """,
+                    cid,
+                    doc["source_id"],
+                )
+            )
         else:
             raise falcon.HTTPBadRequest(
                 title="Unsupported source type",
-                description="Only automation email, transactional template and broadcast sources are supported.",
+                description="Only automation email, transactional template, broadcast and funnel message sources are supported.",
             )
         if source is None:
             raise falcon.HTTPForbidden()

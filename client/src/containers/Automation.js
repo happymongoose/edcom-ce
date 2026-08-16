@@ -1340,6 +1340,7 @@ class Automation extends Component {
                 <option value="all">All copy sources</option>
                 <option value="transactional_templates">Transactional templates</option>
                 <option value="broadcasts">Broadcasts</option>
+                <option value="funnel_messages">Funnel messages</option>
               </FormControl>
               <FormControl
                 type="text"

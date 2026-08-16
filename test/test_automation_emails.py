@@ -12,6 +12,8 @@ class TestAutomationEmails(test_base.TestBase):
         self.created_email_ids = []
         self.created_txn_template_ids = []
         self.created_campaign_ids = []
+        self.created_funnel_ids = []
+        self.created_message_ids = []
 
     def tearDown(self):
         cid = self.user_cookie["cid"]
@@ -42,6 +44,18 @@ class TestAutomationEmails(test_base.TestBase):
             self.db.execute(
                 "delete from campaigns where id = any(%s) and cid = %s",
                 self.created_campaign_ids,
+                cid,
+            )
+        if self.created_message_ids:
+            self.db.execute(
+                "delete from messages where id = any(%s) and cid = %s",
+                self.created_message_ids,
+                cid,
+            )
+        if self.created_funnel_ids:
+            self.db.execute(
+                "delete from funnels where id = any(%s) and cid = %s",
+                self.created_funnel_ids,
                 cid,
             )
         super(TestAutomationEmails, self).tearDown()
@@ -139,6 +153,90 @@ class TestAutomationEmails(test_base.TestBase):
         campaign = self.db.campaigns.get(campaign_id)
         campaign["id"] = campaign_id
         return campaign
+
+    def create_funnel_message(self, funnel_overrides=None, message_overrides=None, meta_overrides=None):
+        message_id = shortuuid.uuid()
+        funnel_doc = {
+            "name": "Funnel %s" % self.unique(),
+            "type": "tags",
+            "active": True,
+            "messages": [
+                {
+                    "id": message_id,
+                    "whennum": 1,
+                    "whentype": "days",
+                    "whentime": "",
+                    "fromname": "Funnel Sender",
+                    "returnpath": "bounce@example.com",
+                    "fromemail": "from@example.com",
+                    "replyto": "reply@example.com",
+                    "msgroute": "do-not-copy",
+                }
+            ],
+        }
+        if meta_overrides is not None:
+            funnel_doc["messages"][0].update(meta_overrides)
+        if funnel_overrides:
+            funnel_doc.update(funnel_overrides)
+        funnel_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into funnels (id, cid, data) values (%s, %s, %s)",
+            funnel_id,
+            self.user_cookie["cid"],
+            funnel_doc,
+        )
+        self.created_funnel_ids.append(funnel_id)
+
+        message_doc = {
+            "funnel": funnel_id,
+            "subject": "Funnel subject",
+            "preheader": "Funnel preview",
+            "type": "raw",
+            "rawText": "<p>Funnel</p>",
+            "parts": [],
+            "bodyStyle": {},
+            "modified": "2026-08-16T12:00:00Z",
+            "delivered": 10,
+            "send": 10,
+            "soft": 1,
+            "hard": 1,
+            "opened": 2,
+            "clicked": 3,
+            "opened_all": 4,
+            "clicked_all": 5,
+            "unsubscribed": 1,
+            "complained": 1,
+            "bounced": 1,
+            "linkurls": ["https://example.com"],
+            "linkclicks": [1],
+            "openaddtags": ["do-not-copy"],
+            "openremtags": ["do-not-copy"],
+            "clickaddtags": ["do-not-copy"],
+            "clickremtags": ["do-not-copy"],
+            "sendaddtags": ["do-not-copy"],
+            "sendremtags": ["do-not-copy"],
+            "supplists": ["do-not-copy"],
+            "supptags": ["do-not-copy"],
+            "suppsegs": ["do-not-copy"],
+            "who": "all",
+            "days": [True, True, True, True, True, True, True],
+            "dayoffset": 0,
+            "arbitrary_metadata": {"nested": "do-not-copy"},
+        }
+        if message_overrides:
+            message_doc.update(message_overrides)
+        self.db.execute(
+            "insert into messages (id, cid, data) values (%s, %s, %s)",
+            message_id,
+            self.user_cookie["cid"],
+            message_doc,
+        )
+        self.created_message_ids.append(message_id)
+        message = self.db.messages.get(message_id)
+        message["id"] = message_id
+        funnel = self.db.funnels.get(funnel_id)
+        funnel["id"] = funnel_id
+        return funnel, message
 
     def route_id(self):
         company = self.db.companies.get(self.user_cookie["cid"])
@@ -257,7 +355,7 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual([item["source_id"] for item in sources], [wanted["id"]])
         self.assertEqual(result.status_code, 400)
         self.assertIn(
-            "Source filter must be this, other, all, transactional_templates or broadcasts",
+            "Source filter must be this, other, all, transactional_templates, broadcasts or funnel_messages",
             result.text,
         )
 
@@ -327,6 +425,41 @@ class TestAutomationEmails(test_base.TestBase):
         self.assertEqual(draft_source["status"], "draft")
         self.assertEqual(sent_source["status"], "sent")
 
+    def test_email_copy_sources_list_funnel_messages_metadata_only(self):
+        target = self.create_automation()
+        funnel, message = self.create_funnel_message(
+            funnel_overrides={"name": "Welcome funnel needle"},
+            message_overrides={
+                "subject": "Funnel message needle",
+                "type": "wysiwyg",
+                "rawText": "<h1>Hidden funnel body</h1>",
+                "parts": [{"type": "text", "value": "hidden"}],
+                "bodyStyle": {"hidden": True},
+            },
+        )
+        self.create_funnel_message(
+            funnel_overrides={"name": "Ignore funnel"},
+            message_overrides={"subject": "Haystack"},
+        )
+
+        sources = self.user_get(
+            "/api/automations/%s/email-copy-sources?source_filter=funnel_messages&q=needle"
+            % target["id"]
+        )
+
+        self.assertEqual([item["source_id"] for item in sources], [message["id"]])
+        self.assertEqual(sources[0]["source_type"], "funnel_message")
+        self.assertEqual(sources[0]["name"], "Welcome funnel needle: Funnel message needle")
+        self.assertEqual(sources[0]["subject"], "Funnel message needle")
+        self.assertEqual(sources[0]["editor_type"], "wysiwyg")
+        self.assertEqual(sources[0]["source_funnel_id"], funnel["id"])
+        self.assertEqual(sources[0]["source_funnel_name"], "Welcome funnel needle")
+        self.assertEqual(sources[0]["source_label"], "Funnel: Welcome funnel needle")
+        self.assertEqual(sources[0]["sequence_label"], "After 1 days")
+        self.assertNotIn("rawText", sources[0])
+        self.assertNotIn("parts", sources[0])
+        self.assertNotIn("bodyStyle", sources[0])
+
     def test_email_copy_sources_exclude_cross_account_sources(self):
         target = self.create_automation()
         other = self.create_automation()
@@ -395,6 +528,38 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_campaign_ids.remove(campaign["id"])
+
+    def test_email_copy_sources_exclude_cross_account_and_inconsistent_funnel_messages(self):
+        target = self.create_automation()
+        funnel, message = self.create_funnel_message(
+            funnel_overrides={"name": "Cross account funnel source"},
+            message_overrides={"subject": "Cross account funnel message"},
+        )
+        inconsistent_funnel, inconsistent = self.create_funnel_message(
+            funnel_overrides={"name": "Inconsistent funnel source", "messages": []},
+            message_overrides={"subject": "Inconsistent funnel message"},
+        )
+        self.db.execute(
+            "update messages set cid = %s where id = %s",
+            "other-account-cid",
+            message["id"],
+        )
+
+        try:
+            sources = self.user_get(
+                "/api/automations/%s/email-copy-sources?source_filter=funnel_messages"
+                % target["id"]
+            )
+            source_ids = [item["source_id"] for item in sources]
+            self.assertNotIn(message["id"], source_ids)
+            self.assertNotIn(inconsistent["id"], source_ids)
+        finally:
+            self.db.execute(
+                "delete from messages where id = %s and cid = %s",
+                message["id"],
+                "other-account-cid",
+            )
+            self.created_message_ids.remove(message["id"])
 
     def test_create_email_from_automation_email_source_preserves_supported_fields(self):
         target = self.create_automation()
@@ -641,6 +806,130 @@ class TestAutomationEmails(test_base.TestBase):
         )
         self.assertEqual(type_change.status_code, 400)
 
+    def test_create_email_from_funnel_message_preserves_whitelisted_fields_and_sender_metadata(self):
+        target = self.create_automation()
+        funnel, message = self.create_funnel_message(
+            funnel_overrides={
+                "name": "Copy funnel",
+                "route": "do-not-copy",
+                "tags": ["do-not-copy"],
+                "exittags": ["do-not-copy"],
+                "count": 99,
+            },
+            message_overrides={
+                "subject": "Funnel copy subject",
+                "preheader": "Funnel copy preheader",
+                "type": "beefree",
+                "rawText": '{"html":"<p>Funnel</p>","json":{}}',
+                "parts": [{"type": "image", "src": "example"}],
+                "bodyStyle": {"background": "#ddd"},
+            },
+            meta_overrides={
+                "fromname": "Meta Sender",
+                "returnpath": "meta-bounce@example.com",
+                "fromemail": "meta-from@example.com",
+                "replyto": "meta-reply@example.com",
+                "whennum": 3,
+                "whentype": "hours",
+                "unpublished": True,
+                "msgroute": "do-not-copy",
+                "arbitrary_meta": "do-not-copy",
+            },
+        )
+
+        copied = self.user_post(
+            "/api/automations/%s/emails/from-source" % target["id"],
+            json={"source_type": "funnel_message", "source_id": message["id"]},
+        )
+        self.created_email_ids.append(copied["id"])
+
+        self.assertEqual(copied["automation_id"], target["id"])
+        self.assertEqual(copied["name"], "Copy of Copy funnel: Funnel copy subject")
+        self.assertEqual(copied["subject"], "Funnel copy subject")
+        self.assertEqual(copied["preheader"], "Funnel copy preheader")
+        self.assertEqual(copied["type"], "beefree")
+        self.assertEqual(copied["rawText"], '{"html":"<p>Funnel</p>","json":{}}')
+        self.assertEqual(copied["parts"], [{"type": "image", "src": "example"}])
+        self.assertEqual(copied["bodyStyle"], {"background": "#ddd"})
+        self.assertEqual(copied["fromname"], "Meta Sender")
+        self.assertEqual(copied["returnpath"], "meta-bounce@example.com")
+        self.assertEqual(copied["fromemail"], "meta-from@example.com")
+        self.assertEqual(copied["replyto"], "meta-reply@example.com")
+
+        for field in (
+            "funnel",
+            "initialize",
+            "days",
+            "dayoffset",
+            "who",
+            "supplists",
+            "supptags",
+            "suppsegs",
+            "openaddtags",
+            "openremtags",
+            "clickaddtags",
+            "clickremtags",
+            "sendaddtags",
+            "sendremtags",
+            "delivered",
+            "send",
+            "soft",
+            "hard",
+            "opened",
+            "clicked",
+            "opened_all",
+            "clicked_all",
+            "unsubscribed",
+            "complained",
+            "bounced",
+            "linkurls",
+            "linkclicks",
+            "arbitrary_metadata",
+            "source_funnel_id",
+            "source_funnel_name",
+            "whennum",
+            "whentype",
+            "unpublished",
+            "msgroute",
+            "arbitrary_meta",
+            "route",
+            "tags",
+            "exittags",
+            "count",
+        ):
+            self.assertNotIn(field, copied)
+
+        type_change = self.simulate_patch(
+            "/api/automations/%s/emails/%s" % (target["id"], copied["id"]),
+            json={"type": "raw"},
+            headers=self.headers(),
+        )
+        self.assertEqual(type_change.status_code, 400)
+
+    def test_create_email_from_funnel_message_missing_sender_metadata_uses_empty_strings(self):
+        target = self.create_automation()
+        _, message = self.create_funnel_message(
+            funnel_overrides={"name": "No sender funnel"},
+            message_overrides={"subject": "No sender message"},
+            meta_overrides={
+                "fromname": "",
+                "returnpath": "",
+                "fromemail": "",
+                "replyto": "",
+            },
+        )
+
+        copied = self.user_post(
+            "/api/automations/%s/emails/from-source" % target["id"],
+            json={"source_type": "funnel_message", "source_id": message["id"]},
+        )
+        self.created_email_ids.append(copied["id"])
+
+        self.assertEqual(copied["fromname"], "")
+        self.assertEqual(copied["returnpath"], "")
+        self.assertEqual(copied["fromemail"], "")
+        self.assertEqual(copied["replyto"], "")
+
     def test_create_email_from_source_rejects_cross_account_and_unsupported_source(self):
         target = self.create_automation()
         source_automation = self.create_automation()
@@ -659,7 +948,7 @@ class TestAutomationEmails(test_base.TestBase):
             )
             unsupported = self.simulate_post(
                 "/api/automations/%s/emails/from-source" % target["id"],
-                json={"source_type": "funnel_message", "source_id": source["id"]},
+                json={"source_type": "form_template", "source_id": source["id"]},
                 headers=self.headers(),
             )
 
@@ -722,6 +1011,45 @@ class TestAutomationEmails(test_base.TestBase):
                 "other-account-cid",
             )
             self.created_campaign_ids.remove(campaign["id"])
+
+    def test_create_email_from_funnel_message_rejects_cross_account_and_inconsistent_sources(self):
+        target = self.create_automation()
+        _, cross_account = self.create_funnel_message(
+            funnel_overrides={"name": "Other account funnel source"},
+            message_overrides={"subject": "Other account funnel message"},
+        )
+        _, inconsistent = self.create_funnel_message(
+            funnel_overrides={"name": "Broken funnel source", "messages": []},
+            message_overrides={"subject": "Broken funnel message"},
+        )
+        self.db.execute(
+            "update messages set cid = %s where id = %s",
+            "other-account-cid",
+            cross_account["id"],
+        )
+
+        try:
+            cross_result = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "funnel_message", "source_id": cross_account["id"]},
+                headers=self.headers(),
+            )
+            inconsistent_result = self.simulate_post(
+                "/api/automations/%s/emails/from-source" % target["id"],
+                json={"source_type": "funnel_message", "source_id": inconsistent["id"]},
+                headers=self.headers(),
+            )
+
+            self.assertEqual(cross_result.status_code, 403)
+            self.assertEqual(inconsistent_result.status_code, 400)
+            self.assertIn("not referenced by its funnel metadata", inconsistent_result.text)
+        finally:
+            self.db.execute(
+                "delete from messages where id = %s and cid = %s",
+                cross_account["id"],
+                "other-account-cid",
+            )
+            self.created_message_ids.remove(cross_account["id"])
 
     def test_default_email_shape(self):
         automation = self.create_automation()
