@@ -635,14 +635,14 @@ class AutomationWorkflowEditor extends Component {
         }
         {
           nodes.length ?
-            <EDTable className="growing-margin-left" minWidth="600px" maxWidth="1024px">
+            <EDTable className="growing-margin-left" minWidth="1100px">
               <thead>
                 <tr>
-                  <th>Order</th>
-                  <th>Type</th>
-                  <th>Label</th>
+                  <th style={{width: '70px'}}>Order</th>
+                  <th style={{width: '150px'}}>Type</th>
+                  <th style={{width: '180px'}}>Label</th>
                   <th>Configuration</th>
-                  <th>Contacts at step</th>
+                  <th style={{width: '150px'}}>Contacts at step</th>
                   <th></th>
                 </tr>
               </thead>
@@ -690,26 +690,28 @@ class AutomationWorkflowEditor extends Component {
                         <td>
                           {this.props.renderNodeContactCount(node)}
                         </td>
-                        <td style={{minWidth: '300px'}} className="last-cell">
-                          {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert node after this step', index)}
+                        <td style={{minWidth: '210px'}} className="last-cell">
+                          {this.renderAddNodeDropdown('automation-node-insert-dropdown-' + node.id, 'Insert', index)}
                           {' '}
                           <Button
                             bsSize="small"
                             disabled={index === 0}
                             onClick={this.moveNode.bind(this, index, -1)}
+                            title="Move up"
                           >
-                            Move up
+                            Up
                           </Button>
                           {' '}
                           <Button
                             bsSize="small"
                             disabled={index === nodes.length - 1}
                             onClick={this.moveNode.bind(this, index, 1)}
+                            title="Move down"
                           >
-                            Move down
+                            Down
                           </Button>
                           {' '}
-                          <Button onClick={this.deleteNode.bind(this, index)}>Delete</Button>
+                          <Button bsSize="small" onClick={this.deleteNode.bind(this, index)}>Delete</Button>
                         </td>
                       </EDTableRow>
                     );
