@@ -4,13 +4,16 @@ import email.utils
 import json
 import logging
 import os
+import re
 import shortuuid
 import traceback
 import dateutil.parser
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
+from html import unescape as html_unescape
 from jsonschema import validate
 from typing import Dict, List
+from urllib.parse import urlsplit, urlunsplit
 
 from .shared import config as _  # noqa: F401
 from .shared import contacts
@@ -42,6 +45,31 @@ from .shared.segments import (
 )
 
 log = logging.getLogger(__name__)
+
+URL_SCHEME_RE = re.compile(r"^[a-zA-Z]+:")
+
+
+def _normalize_automation_click_url(url: str | None) -> str:
+    value = html_unescape(str(url or "").strip())
+    if not value:
+        return ""
+    if not URL_SCHEME_RE.search(value) and not value.startswith("{{"):
+        value = "http://%s" % value
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value.lower()
+    if not parts.scheme or value.startswith("{{"):
+        return value
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path,
+            parts.query,
+            parts.fragment,
+        )
+    )
 
 
 NODE_ID_SCHEMA = {
@@ -287,6 +315,14 @@ EMAIL_ENGAGEMENT_CONDITION_NODE_SCHEMA = {
         "no_node_id": {
             "type": "string",
             "maxLength": 64,
+        },
+        "click_match": {
+            "type": "string",
+            "enum": ["any", "url"],
+        },
+        "link_url": {
+            "type": "string",
+            "maxLength": 2048,
         },
     },
     "additionalProperties": False,
@@ -1290,6 +1326,10 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
                 _validation_error("%s no target must exist in the draft workflow." % node_label)
             if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
                 _validation_error("%s nodes cannot target themselves." % node_label)
+            if node.get("type") == "if_clicked_email":
+                click_match = node.get("click_match") or "any"
+                if click_match == "url" and not _normalize_automation_click_url(node.get("link_url")):
+                    _validation_error("If clicked email URL conditions must have a link URL.")
         if node.get("type") == "go_to":
             target_node_id = node.get("target_node_id")
             if not target_node_id:
@@ -4745,27 +4785,53 @@ def _run_next_automation_enrolment(
                 )
 
             event_type = "open" if node_type == "if_opened_email" else "click"
-            result = bool(
-                db.single(
+            click_match = node.get("click_match") or "any"
+            normalized_link_url = ""
+            if node_type == "if_clicked_email" and click_match == "url":
+                normalized_link_url = _normalize_automation_click_url(node.get("link_url"))
+                rows = db.execute(
                     """
-                    select true
+                    select data->>'link_url'
                     from automation_email_events
                     where cid = %s
                         and automation_id = %s
                         and enrolment_id = %s
                         and contact_id = %s
                         and automation_email_id = %s
-                        and event_type = %s
-                    limit 1
+                        and event_type = 'click'
                     """,
                     cid,
                     id,
                     enrolment_id,
                     enrolment["contact_id"],
                     automation_email_id,
-                    event_type,
+                ).fetchall()
+                result = any(
+                    _normalize_automation_click_url(row[0]) == normalized_link_url
+                    for row in rows
                 )
-            )
+            else:
+                result = bool(
+                    db.single(
+                        """
+                        select true
+                        from automation_email_events
+                        where cid = %s
+                            and automation_id = %s
+                            and enrolment_id = %s
+                            and contact_id = %s
+                            and automation_email_id = %s
+                            and event_type = %s
+                        limit 1
+                        """,
+                        cid,
+                        id,
+                        enrolment_id,
+                        enrolment["contact_id"],
+                        automation_email_id,
+                        event_type,
+                    )
+                )
             branch = "yes" if result else "no"
             target_node_id = node.get("yes_node_id") if result else node.get("no_node_id")
             if _node_by_id(nodes, target_node_id) is None:
@@ -4787,6 +4853,11 @@ def _run_next_automation_enrolment(
                     "published_revision": automation.get("published_revision"),
                 }
             )
+            if node_type == "if_clicked_email":
+                success_data["click_match"] = click_match
+                if click_match == "url":
+                    success_data["link_url"] = node.get("link_url") or ""
+                    success_data["normalized_link_url"] = normalized_link_url
             enrolment_update = {
                 "status": "ready",
                 "current_node_id": target_node_id,

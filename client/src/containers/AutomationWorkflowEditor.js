@@ -165,7 +165,10 @@ export function automationNodeSummary(node, options) {
       ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
   }
   if (node.type === 'if_clicked_email') {
-    return 'If clicked: ' + (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
+    const clickSummary = (node.click_match || 'any') === 'url' ?
+      'specific URL: ' + (node.link_url || 'No URL entered') :
+      'any link';
+    return 'If clicked ' + clickSummary + ': ' + (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
       ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
       ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
   }
@@ -198,6 +201,10 @@ export function createAutomationNode(type, options) {
     node.automation_email_id = emails.length ? emails[0].id : '';
     node.yes_node_id = '';
     node.no_node_id = '';
+    if (type === 'if_clicked_email') {
+      node.click_match = 'any';
+      node.link_url = '';
+    }
   }
   if (type === 'wait_duration') {
     node.duration = {
@@ -519,6 +526,39 @@ class AutomationWorkflowEditor extends Component {
             options={options}
             emptyVal="Select email"
           />
+          {
+            node.type === 'if_clicked_email' ?
+              <div>
+                <label className="control-label" htmlFor="click_match">Click match</label>
+                <FormControl
+                  id="click_match"
+                  componentClass="select"
+                  value={node.click_match || 'any'}
+                  onChange={this.nodeTargetChange.bind(this, index)}
+                >
+                  <option value="any">Any link</option>
+                  <option value="url">Specific URL</option>
+                </FormControl>
+                {
+                  (node.click_match || 'any') === 'url' ?
+                    <div className="space-top-sm">
+                      <label className="control-label" htmlFor="link_url">URL</label>
+                      <FormControl
+                        id="link_url"
+                        type="text"
+                        value={node.link_url || ''}
+                        onChange={this.nodeTargetChange.bind(this, index)}
+                        placeholder="https://example.com/page"
+                      />
+                      <span className="help-block">This matches captured clicks for the selected automation email URL.</span>
+                    </div>
+                  :
+                    null
+                }
+              </div>
+            :
+              null
+          }
           <SelectLabel
             id="yes_node_id"
             label="Yes target"

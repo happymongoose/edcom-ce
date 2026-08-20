@@ -41,6 +41,17 @@ describe('automation enrolment display helpers', () => {
     expect(nodes).toHaveLength(1);
   });
 
+  it('creates clicked-email condition nodes as any-link by default', () => {
+    const updated = appendAutomationNode([], 'if_clicked_email', {
+      generateId: () => 'clicked-node',
+      emails: [{id: 'email-1'}],
+    });
+
+    expect(updated[0].click_match).toBe('any');
+    expect(updated[0].link_url).toBe('');
+    expect(updated[0].automation_email_id).toBe('email-1');
+  });
+
   it('inserts workflow nodes after a step without rewriting branch targets', () => {
     const nodes = [
       {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
@@ -200,7 +211,28 @@ describe('automation enrolment display helpers', () => {
       'If opened: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
     );
     expect(automationNodeSummary(nodes[1], {nodes: nodes, emails: emails})).toBe(
-      'If clicked: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+      'If clicked any link: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+    );
+  });
+
+  it('summarizes specific-url clicked email conditions', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const nodes = [
+      {
+        id: 'clicked',
+        type: 'if_clicked_email',
+        automation_email_id: 'email-1',
+        click_match: 'url',
+        link_url: 'https://example.com/offer',
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
+      'If clicked specific URL: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
     );
   });
 

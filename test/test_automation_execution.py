@@ -442,6 +442,9 @@ class TestAutomationExecution(test_base.TestBase):
         ).json
 
     def create_email_engagement_condition_automation(self, node_type="if_opened_email"):
+        return self.create_email_engagement_condition_automation_with_options(node_type)
+
+    def create_email_engagement_condition_automation_with_options(self, node_type="if_opened_email", node_overrides=None):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -476,6 +479,8 @@ class TestAutomationExecution(test_base.TestBase):
                 "label": "Exit automation",
             },
         ]
+        if node_overrides:
+            nodes[0].update(node_overrides)
         self.user_patch(
             "/api/automations/%s" % automation["id"],
             json=self.workflow(nodes=nodes),
@@ -1062,6 +1067,7 @@ class TestAutomationExecution(test_base.TestBase):
         event_contact_id=None,
         event_automation_email_id=None,
         event_type="open",
+        event_data=None,
     ):
         event_id = shortuuid.uuid()
         self.db.execute(
@@ -1092,7 +1098,7 @@ class TestAutomationExecution(test_base.TestBase):
             "node_send_email_1",
             "send-step-%s" % event_id,
             event_type,
-            {"test_id": self.test_id},
+            event_data or {"test_id": self.test_id},
         )
         return event_id
 
@@ -2962,6 +2968,247 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["step_run"]["result"], False)
         self.assertEqual(result.json["step_run"]["branch"], "no")
         self.assertEqual(result.json["step_run"]["target_node_id"], "node_exit_1")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_specific_url_true_branch_when_matching_click_exists(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            {
+                "click_match": "url",
+                "link_url": "https://example.com/offer",
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
+            event_data={"link_url": "https://example.com/offer", "test_id": self.test_id},
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["result"], True)
+        self.assertEqual(result.json["step_run"]["branch"], "yes")
+        self.assertEqual(result.json["step_run"]["click_match"], "url")
+        self.assertEqual(result.json["step_run"]["link_url"], "https://example.com/offer")
+        self.assertEqual(result.json["step_run"]["normalized_link_url"], "https://example.com/offer")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_specific_url_false_branch_for_different_url(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            {
+                "click_match": "url",
+                "link_url": "https://example.com/offer",
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
+            event_data={"link_url": "https://example.com/other", "test_id": self.test_id},
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+        self.assertEqual(result.json["step_run"]["branch"], "no")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_specific_url_normalizes_bare_domain_and_host_case(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            {
+                "click_match": "url",
+                "link_url": "Example.com/Offer",
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
+            event_data={"link_url": "http://example.com/Offer", "test_id": self.test_id},
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["result"], True)
+        self.assertEqual(result.json["step_run"]["normalized_link_url"], "http://example.com/Offer")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_specific_url_open_event_does_not_count(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            {
+                "click_match": "url",
+                "link_url": "https://example.com/offer",
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_data={"link_url": "https://example.com/offer", "test_id": self.test_id},
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_specific_url_ignores_other_scopes(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            {
+                "click_match": "url",
+                "link_url": "https://example.com/offer",
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        for overrides in (
+            {"event_enrolment_id": "other-enrolment-%s" % self.unique()},
+            {"event_automation_email_id": "other-email-%s" % self.unique()},
+            {"event_contact_id": contact_id + 100000},
+            {"event_cid": "other-account-%s" % self.unique()},
+        ):
+            self.insert_open_event(
+                automation["id"],
+                enrolment["id"],
+                contact_id,
+                email,
+                automation["engagement_email_id"],
+                event_type="click",
+                event_data={"link_url": "https://example.com/offer", "test_id": self.test_id},
+                **overrides
+            )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_specific_url_publish_validation(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_click_url_validation_%s" % self.unique()},
+        )
+        email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Click validation email",
+                "subject": "Click validation subject",
+                "rawText": "<p>Hello</p>",
+            },
+        )
+        nodes = [
+            {
+                "id": "node_email_condition_1",
+                "type": "if_clicked_email",
+                "label": "If clicked email",
+                "automation_email_id": email["id"],
+                "click_match": "url",
+                "link_url": "",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add engaged branch tag",
+                "draft_tag": "engaged-branch",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("must have a link URL", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_unknown_click_match_is_rejected(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_click_match_validation_%s" % self.unique()},
+        )
+        email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Click match validation email",
+                "subject": "Click match validation subject",
+                "rawText": "<p>Hello</p>",
+            },
+        )
+        nodes = [
+            {
+                "id": "node_email_condition_1",
+                "type": "if_clicked_email",
+                "label": "If clicked email",
+                "automation_email_id": email["id"],
+                "click_match": "something_else",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add engaged branch tag",
+                "draft_tag": "engaged-branch",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        result = self.simulate_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
 
         self.cleanup(automation["id"])
 
