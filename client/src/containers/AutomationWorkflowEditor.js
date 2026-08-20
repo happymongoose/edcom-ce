@@ -1,4 +1,5 @@
 import React, { Component } from "react";
+import axios from "axios";
 import { Button, DropdownButton, FormControl, MenuItem } from "react-bootstrap";
 import _ from "underscore";
 import shortid from "shortid";
@@ -65,6 +66,13 @@ export function automationEmailOptions(emails) {
       automationEditorTypeLabel(email.type) +
       ')',
   }));
+}
+
+export function automationClickMatchValue(node) {
+  if ((node || {}).click_match === 'url') {
+    return 'url_exact';
+  }
+  return (node || {}).click_match || 'any';
 }
 
 export function automationListOptions(lists) {
@@ -165,9 +173,13 @@ export function automationNodeSummary(node, options) {
       ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
   }
   if (node.type === 'if_clicked_email') {
-    const clickSummary = (node.click_match || 'any') === 'url' ?
-      'specific URL: ' + (node.link_url || 'No URL entered') :
-      'any link';
+    const clickMatch = automationClickMatchValue(node);
+    let clickSummary = 'any link';
+    if (clickMatch === 'url_exact') {
+      clickSummary = 'exact URL: ' + (node.link_url || 'No URL entered');
+    } else if (clickMatch === 'url_prefix') {
+      clickSummary = 'URL starts with: ' + (node.link_url || 'No URL entered');
+    }
     return 'If clicked ' + clickSummary + ': ' + (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
       ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
       ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
@@ -251,6 +263,78 @@ export function moveAutomationNode(nodes, index, direction) {
 class AutomationWorkflowEditor extends Component {
   state = {
     expandedNodeIds: {},
+    emailLinksById: {},
+    emailLinksLoading: {},
+    emailLinksError: {},
+  }
+
+  componentDidMount() {
+    this.loadVisibleClickedEmailLinks();
+  }
+
+  componentDidUpdate() {
+    this.loadVisibleClickedEmailLinks();
+  }
+
+  loadVisibleClickedEmailLinks() {
+    _.each(this.props.nodes || [], node => {
+      if (
+        this.state.expandedNodeIds[node.id] &&
+        node.type === 'if_clicked_email' &&
+        automationClickMatchValue(node) !== 'any' &&
+        node.automation_email_id
+      ) {
+        this.loadAutomationEmailLinks(node.automation_email_id);
+      }
+    });
+  }
+
+  loadAutomationEmailLinks(emailId) {
+    if (!this.props.automationId || !emailId) {
+      return;
+    }
+    if (
+      this.state.emailLinksById[emailId] ||
+      this.state.emailLinksLoading[emailId] ||
+      this.state.emailLinksError[emailId]
+    ) {
+      return;
+    }
+    this.setState({
+      emailLinksLoading: {
+        ...this.state.emailLinksLoading,
+        [emailId]: true,
+      },
+      emailLinksError: {
+        ...this.state.emailLinksError,
+        [emailId]: '',
+      },
+    });
+    axios.get('/api/automations/' + this.props.automationId + '/emails/' + emailId + '/links')
+      .then(response => {
+        this.setState({
+          emailLinksById: {
+            ...this.state.emailLinksById,
+            [emailId]: response.data.links || [],
+          },
+          emailLinksLoading: {
+            ...this.state.emailLinksLoading,
+            [emailId]: false,
+          },
+        });
+      })
+      .catch(() => {
+        this.setState({
+          emailLinksLoading: {
+            ...this.state.emailLinksLoading,
+            [emailId]: false,
+          },
+          emailLinksError: {
+            ...this.state.emailLinksError,
+            [emailId]: 'Could not load discovered links. Enter the URL manually.',
+          },
+        });
+      });
   }
 
   nodeChange = (index, event) => {
@@ -509,6 +593,11 @@ class AutomationWorkflowEditor extends Component {
 
     if (node.type === 'if_opened_email' || node.type === 'if_clicked_email') {
       const options = automationEmailOptions(this.props.emails || []);
+      const clickMatch = automationClickMatchValue(node);
+      const discoveredLinks = node.automation_email_id ?
+        (this.state.emailLinksById[node.automation_email_id] || []) :
+        [];
+      const selectedDiscoveredLink = _.find(discoveredLinks, link => link.normalized_url === (node.link_url || ''));
       if (!options.length) {
         return (
           <div style={{minWidth: '260px'}}>
@@ -533,15 +622,58 @@ class AutomationWorkflowEditor extends Component {
                 <FormControl
                   id="click_match"
                   componentClass="select"
-                  value={node.click_match || 'any'}
+                  value={clickMatch}
                   onChange={this.nodeTargetChange.bind(this, index)}
                 >
                   <option value="any">Any link</option>
-                  <option value="url">Specific URL</option>
+                  <option value="url_exact">Specific URL</option>
+                  <option value="url_prefix">URL starts with</option>
                 </FormControl>
                 {
-                  (node.click_match || 'any') === 'url' ?
+                  clickMatch !== 'any' ?
                     <div className="space-top-sm">
+                      <label className="control-label" htmlFor="discovered_link_url">Discovered links</label>
+                      {
+                        node.automation_email_id && this.state.emailLinksLoading[node.automation_email_id] ?
+                          <p className="help-block">Loading discovered links...</p>
+                        :
+                          null
+                      }
+                      {
+                        node.automation_email_id && this.state.emailLinksError[node.automation_email_id] ?
+                          <p className="help-block text-danger">{this.state.emailLinksError[node.automation_email_id]}</p>
+                        :
+                          null
+                      }
+                      <FormControl
+                        id="discovered_link_url"
+                        componentClass="select"
+                        value={selectedDiscoveredLink ? node.link_url || '' : ''}
+                        onChange={event => {
+                          if (event.target.value) {
+                            this.nodeTargetChange(index, {
+                              target: {id: 'link_url', value: event.target.value},
+                            });
+                          }
+                        }}
+                        disabled={!discoveredLinks.length}
+                      >
+                        <option value="">
+                          {discoveredLinks.length ? 'Select discovered URL' : 'No links discovered'}
+                        </option>
+                        {
+                          _.map(discoveredLinks, link => (
+                            <option key={link.normalized_url + '-' + link.tracked} value={link.normalized_url}>
+                              {link.display_url || link.normalized_url}
+                              {link.occurrence_count > 1 ? ' (' + link.occurrence_count + ')' : ''}
+                              {link.tracked === false ? ' - untracked' : ''}
+                            </option>
+                          ))
+                        }
+                      </FormControl>
+                      <span className="help-block">
+                        Discovered links are extracted from saved email content. Enter the URL manually if a link is missing.
+                      </span>
                       <label className="control-label" htmlFor="link_url">URL</label>
                       <FormControl
                         id="link_url"
@@ -550,7 +682,13 @@ class AutomationWorkflowEditor extends Component {
                         onChange={this.nodeTargetChange.bind(this, index)}
                         placeholder="https://example.com/page"
                       />
-                      <span className="help-block">This matches captured clicks for the selected automation email URL.</span>
+                      <span className="help-block">
+                        {
+                          clickMatch === 'url_prefix' ?
+                            'URL starts with matches the same URL plus query strings or hash fragments, such as ?utm= or #section.' :
+                            'Specific URL matches the normalized clicked URL exactly.'
+                        }
+                      </span>
                     </div>
                   :
                     null

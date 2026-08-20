@@ -11,6 +11,7 @@ import dateutil.parser
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
 from html import unescape as html_unescape
+from html.parser import HTMLParser
 from jsonschema import validate
 from typing import Dict, List
 from urllib.parse import urlsplit, urlunsplit
@@ -70,6 +71,101 @@ def _normalize_automation_click_url(url: str | None) -> str:
             parts.fragment,
         )
     )
+
+
+def _automation_click_match_mode(value: str | None) -> str:
+    if value == "url":
+        return "url_exact"
+    return value or "any"
+
+
+def _automation_click_url_prefix_match(clicked_url: str | None, configured_url: str | None) -> bool:
+    clicked = _normalize_automation_click_url(clicked_url)
+    configured = _normalize_automation_click_url(configured_url)
+    if not clicked or not configured:
+        return False
+    if clicked == configured:
+        return True
+    if not clicked.startswith(configured):
+        return False
+    # Keep prefix matching conservative: a page URL matches query/hash variants,
+    # while /somepage does not unexpectedly match /somepage-other.
+    if "?" in configured or "#" in configured or configured.endswith(("/", "&", "=")):
+        return True
+    return clicked[len(configured):len(configured) + 1] in ("?", "#")
+
+
+class _AutomationEmailLinkParser(HTMLParser):
+
+    def __init__(self):
+        super(_AutomationEmailLinkParser, self).__init__(convert_charrefs=True)
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if (tag or "").lower() != "a":
+            return
+        for key, value in attrs:
+            if (key or "").lower() == "href":
+                self.links.append(value or "")
+                return
+
+
+def _automation_email_html_fragments(email_doc: JsonObj) -> List[str]:
+    fragments = []
+    raw_text = email_doc.get("rawText")
+    if isinstance(raw_text, str):
+        raw_value = raw_text.strip()
+        if raw_value:
+            if (email_doc.get("type") or "raw") == "beefree":
+                try:
+                    raw_doc = json.loads(raw_value)
+                    html = raw_doc.get("html") if isinstance(raw_doc, dict) else None
+                    if isinstance(html, str):
+                        fragments.append(html)
+                    else:
+                        fragments.append(raw_value)
+                except (TypeError, ValueError):
+                    fragments.append(raw_value)
+            else:
+                fragments.append(raw_value)
+    parts = email_doc.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            for field in ("html", "content", "value", "text"):
+                value = part.get(field)
+                if isinstance(value, str) and value.strip():
+                    fragments.append(value)
+    return fragments
+
+
+def _automation_email_discovered_links(email_doc: JsonObj) -> List[JsonObj]:
+    grouped = {}
+    order = []
+    for fragment in _automation_email_html_fragments(email_doc):
+        parser = _AutomationEmailLinkParser()
+        try:
+            parser.feed(fragment)
+        except Exception:
+            continue
+        for href in parser.links:
+            original = html_unescape(str(href or "").strip())
+            normalized = _normalize_automation_click_url(original)
+            if not original or not normalized:
+                continue
+            tracked = "notrack" not in original.lower()
+            key = (normalized, tracked)
+            if key not in grouped:
+                grouped[key] = {
+                    "normalized_url": normalized,
+                    "display_url": original,
+                    "occurrence_count": 0,
+                    "tracked": tracked,
+                }
+                order.append(key)
+            grouped[key]["occurrence_count"] += 1
+    return [grouped[key] for key in order][:100]
 
 
 NODE_ID_SCHEMA = {
@@ -318,7 +414,7 @@ EMAIL_ENGAGEMENT_CONDITION_NODE_SCHEMA = {
         },
         "click_match": {
             "type": "string",
-            "enum": ["any", "url"],
+            "enum": ["any", "url", "url_exact", "url_prefix"],
         },
         "link_url": {
             "type": "string",
@@ -1327,8 +1423,8 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
             if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
                 _validation_error("%s nodes cannot target themselves." % node_label)
             if node.get("type") == "if_clicked_email":
-                click_match = node.get("click_match") or "any"
-                if click_match == "url" and not _normalize_automation_click_url(node.get("link_url")):
+                click_match = _automation_click_match_mode(node.get("click_match"))
+                if click_match in ("url_exact", "url_prefix") and not _normalize_automation_click_url(node.get("link_url")):
                     _validation_error("If clicked email URL conditions must have a link URL.")
         if node.get("type") == "go_to":
             target_node_id = node.get("target_node_id")
@@ -2956,6 +3052,42 @@ class AutomationEmailFromSource(object):
 
         resp.status = falcon.HTTP_201
         req.context["result"] = _get_automation_email(db, cid, id, email_id)
+
+
+class AutomationEmailLinks(object):
+
+    def on_get(
+        self,
+        req: falcon.Request,
+        resp: falcon.Response,
+        id: str,
+        email_id: str,
+    ) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        _automation_for_email_route(db, id)
+        email = _automation_email_obj(
+            db.row(
+                """
+                select id, cid, automation_id, data
+                from automation_emails
+                where cid = %s and automation_id = %s and id = %s
+                """,
+                cid,
+                id,
+                email_id,
+            )
+        )
+        if email is None:
+            raise falcon.HTTPNotFound()
+
+        req.context["result"] = {
+            "automation_id": id,
+            "automation_email_id": email_id,
+            "links": _automation_email_discovered_links(email),
+        }
 
 
 class AutomationEmail(object):
@@ -4785,9 +4917,11 @@ def _run_next_automation_enrolment(
                 )
 
             event_type = "open" if node_type == "if_opened_email" else "click"
-            click_match = node.get("click_match") or "any"
+            raw_click_match = node.get("click_match") or "any"
+            click_match = _automation_click_match_mode(raw_click_match)
             normalized_link_url = ""
-            if node_type == "if_clicked_email" and click_match == "url":
+            matched_link_url = ""
+            if node_type == "if_clicked_email" and click_match in ("url_exact", "url_prefix"):
                 normalized_link_url = _normalize_automation_click_url(node.get("link_url"))
                 rows = db.execute(
                     """
@@ -4806,10 +4940,19 @@ def _run_next_automation_enrolment(
                     enrolment["contact_id"],
                     automation_email_id,
                 ).fetchall()
-                result = any(
-                    _normalize_automation_click_url(row[0]) == normalized_link_url
-                    for row in rows
-                )
+                result = False
+                for row in rows:
+                    normalized_row_url = _normalize_automation_click_url(row[0])
+                    if (
+                        click_match == "url_exact"
+                        and normalized_row_url == normalized_link_url
+                    ) or (
+                        click_match == "url_prefix"
+                        and _automation_click_url_prefix_match(row[0], node.get("link_url"))
+                    ):
+                        result = True
+                        matched_link_url = row[0] or ""
+                        break
             else:
                 result = bool(
                     db.single(
@@ -4854,10 +4997,13 @@ def _run_next_automation_enrolment(
                 }
             )
             if node_type == "if_clicked_email":
-                success_data["click_match"] = click_match
-                if click_match == "url":
+                success_data["click_match"] = raw_click_match
+                success_data["effective_click_match"] = click_match
+                if click_match in ("url_exact", "url_prefix"):
                     success_data["link_url"] = node.get("link_url") or ""
                     success_data["normalized_link_url"] = normalized_link_url
+                    if matched_link_url:
+                        success_data["matched_link_url"] = matched_link_url
             enrolment_update = {
                 "status": "ready",
                 "current_node_id": target_node_id,

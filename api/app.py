@@ -3989,6 +3989,7 @@ app.add_route("/api/automations/{id}/email-copy-sources", automations.Automation
 app.add_route("/api/automations/{id}/emails/from-source", automations.AutomationEmailFromSource())
 app.add_route("/api/automations/{id}/emails/{email_id}/duplicate", automations.AutomationEmailDuplicate())
 app.add_route("/api/automations/{id}/emails/{email_id}/test", automations.AutomationEmailTest())
+app.add_route("/api/automations/{id}/emails/{email_id}/links", automations.AutomationEmailLinks())
 app.add_route("/api/automations/{id}/emails/{email_id}", automations.AutomationEmail())
 app.add_route("/api/automations/{id}/preflight", automations.AutomationPreflight())
 app.add_route("/api/automations/{id}/publish", automations.AutomationPublish())

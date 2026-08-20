@@ -20,6 +20,7 @@ import {
 } from './Automation';
 import {
   appendAutomationNode,
+  automationClickMatchValue,
   automationNodeSummary,
   automationNodeTargetOptions,
   insertAutomationNodeAfter,
@@ -232,7 +233,35 @@ describe('automation enrolment display helpers', () => {
     ];
 
     expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
-      'If clicked specific URL: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
+      'If clicked exact URL: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
+    );
+  });
+
+  it('treats legacy clicked-email url match as exact URL mode', () => {
+    expect(automationClickMatchValue({click_match: 'url'})).toBe('url_exact');
+    expect(automationClickMatchValue({click_match: 'url_exact'})).toBe('url_exact');
+    expect(automationClickMatchValue({click_match: 'url_prefix'})).toBe('url_prefix');
+    expect(automationClickMatchValue({})).toBe('any');
+  });
+
+  it('summarizes prefix-url clicked email conditions', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const nodes = [
+      {
+        id: 'clicked',
+        type: 'if_clicked_email',
+        automation_email_id: 'email-1',
+        click_match: 'url_prefix',
+        link_url: 'https://example.com/offer',
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
+      'If clicked URL starts with: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
     );
   });
 

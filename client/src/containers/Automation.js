@@ -1918,6 +1918,7 @@ class Automation extends Component {
             {this.renderEmails()}
             {this.renderPreflight()}
             <AutomationWorkflowEditor
+              automationId={this.props.id}
               nodes={nodes}
               emails={this.props.emails || []}
               lists={this.props.lists || []}

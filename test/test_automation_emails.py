@@ -597,6 +597,104 @@ class TestAutomationEmails(test_base.TestBase):
             )
             self.created_funnel_ids.remove(funnel["id"])
 
+    def test_email_links_discovers_metadata_only_without_tracking_side_effects(self):
+        automation = self.create_automation()
+        email = self.create_email(
+            automation["id"],
+            rawText="""
+                <p>
+                    <a href="https://Example.com/offer?x=1">Offer</a>
+                    <a href="https://example.com/offer?x=1">Offer again</a>
+                    <a href="example.com/plain">Plain</a>
+                    <a href="https://example.com/notrack" data-notrack="1">No track</a>
+                </p>
+            """,
+            parts=[
+                {
+                    "type": "text",
+                    "html": '<a href="https://example.com/part">Part link</a>',
+                }
+            ],
+            bodyStyle={"hidden": True},
+        )
+        before_links = self.db.single("select count(*) from links")
+
+        result = self.user_get(
+            "/api/automations/%s/emails/%s/links" % (automation["id"], email["id"])
+        )
+        after_links = self.db.single("select count(*) from links")
+
+        self.assertEqual(result["automation_id"], automation["id"])
+        self.assertEqual(result["automation_email_id"], email["id"])
+        self.assertNotIn("rawText", result)
+        self.assertNotIn("parts", result)
+        self.assertNotIn("bodyStyle", result)
+        self.assertNotIn("data", result)
+        self.assertEqual(before_links, after_links)
+        links = result["links"]
+        self.assertEqual(
+            sorted([link["normalized_url"] for link in links]),
+            sorted([
+                "https://example.com/offer?x=1",
+                "http://example.com/plain",
+                "https://example.com/notrack",
+                "https://example.com/part",
+            ]),
+        )
+        offer = [link for link in links if link["normalized_url"] == "https://example.com/offer?x=1"][0]
+        self.assertEqual(offer["occurrence_count"], 2)
+        self.assertEqual(offer["display_url"], "https://Example.com/offer?x=1")
+        self.assertTrue(offer["tracked"])
+        self.assertNotIn("rawText", offer)
+
+    def test_email_links_can_extract_beefree_html(self):
+        automation = self.create_automation()
+        email = self.create_email(
+            automation["id"],
+            type="beefree",
+            rawText='{"html":"<a href=\\"https://example.com/beefree\\">BeeFree</a>","design":{"hidden":true}}',
+        )
+
+        result = self.user_get(
+            "/api/automations/%s/emails/%s/links" % (automation["id"], email["id"])
+        )
+
+        self.assertEqual(
+            [link["normalized_url"] for link in result["links"]],
+            ["https://example.com/beefree"],
+        )
+        self.assertNotIn("design", result)
+
+    def test_email_links_are_account_and_automation_scoped(self):
+        target = self.create_automation()
+        other = self.create_automation()
+        email = self.create_email(other["id"], rawText='<a href="https://example.com">Link</a>')
+
+        wrong_automation_result = self.simulate_get(
+            "/api/automations/%s/emails/%s/links" % (target["id"], email["id"]),
+            headers=self.headers(),
+        )
+        self.assertEqual(wrong_automation_result.status_code, 404)
+
+        self.db.execute(
+            "update automation_emails set cid = %s where id = %s",
+            "other-account-cid",
+            email["id"],
+        )
+        try:
+            cross_account_result = self.simulate_get(
+                "/api/automations/%s/emails/%s/links" % (other["id"], email["id"]),
+                headers=self.headers(),
+            )
+            self.assertEqual(cross_account_result.status_code, 404)
+        finally:
+            self.db.execute(
+                "delete from automation_emails where id = %s and cid = %s",
+                email["id"],
+                "other-account-cid",
+            )
+            self.created_email_ids.remove(email["id"])
+
     def test_create_email_from_automation_email_source_preserves_supported_fields(self):
         target = self.create_automation()
         source_automation = self.create_automation()
