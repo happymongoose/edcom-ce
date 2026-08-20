@@ -3105,6 +3105,32 @@ class TestAutomationExecution(test_base.TestBase):
             email,
             automation["engagement_email_id"],
             event_type="click",
+            event_data={"link_url": "https://example.com/somepage#section", "test_id": self.test_id},
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["result"], True)
+
+        self.cleanup(automation["id"])
+
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            {
+                "click_match": "url_prefix",
+                "link_url": "https://example.com/somepage",
+            },
+        )
+        enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
             event_data={"link_url": "https://example.com/somepage-other", "test_id": self.test_id},
         )
 
@@ -3244,6 +3270,18 @@ class TestAutomationExecution(test_base.TestBase):
             json=self.workflow(nodes=nodes),
         )
 
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("must have a link URL", result.text)
+
+        nodes[0]["click_match"] = "url_exact"
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
         result = self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
             headers=self.headers(),
