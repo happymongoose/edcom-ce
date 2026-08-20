@@ -218,6 +218,13 @@ Recovery actions should preserve audit/history where possible. `automation_step_
 ## Known Gaps And Future Work
 
 - Specific-link click conditions for `if_clicked_email`.
+- General link-click actions should be designed separately from automation
+  engagement conditions. Future click actions may apply across broadcasts,
+  funnels, transactional emails, and automation emails, and may add/remove tags
+  or eventually perform list/automation actions. That design must account for
+  idempotency per contact/link/action, bot/replay protection, audit/history,
+  account scoping, source metadata, rate limiting, and interaction with
+  automation trigger emission when a clicked-link action mutates tags or lists.
 - Broader list/import/API mutation hooks for list triggers.
 - Production tuning for segment scanner cadence, caps, and expensive segment definitions.
 - Admin throttle/kill-switch UI for automation processing.
