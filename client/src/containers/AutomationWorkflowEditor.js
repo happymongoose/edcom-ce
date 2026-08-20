@@ -99,6 +99,22 @@ export function automationNodeTargetOptions(nodes, node) {
     .value();
 }
 
+export function automationAddNodeMenuItems(hasEmails, hasLists) {
+  return _.sortBy([
+    {type: 'add_tag', label: 'Add Tag Node'},
+    {type: 'add_to_list', label: 'Add To List Node', disabled: !hasLists},
+    {type: 'exit', label: 'Add Exit Node'},
+    {type: 'go_to', label: 'Go To Node'},
+    {type: 'if_clicked_email', label: 'If Clicked Email Node', disabled: !hasEmails},
+    {type: 'if_has_tag', label: 'If Has Tag Node'},
+    {type: 'if_opened_email', label: 'If Opened Email Node', disabled: !hasEmails},
+    {type: 'remove_from_list', label: 'Remove From List Node', disabled: !hasLists},
+    {type: 'remove_tag', label: 'Remove Tag Node'},
+    {type: 'send_email', label: 'Send Email Node', disabled: !hasEmails},
+    {type: 'wait_duration', label: 'Wait Duration Node'},
+  ], item => item.label.toLowerCase());
+}
+
 function optionName(options, id) {
   const option = _.findWhere(options || [], {id: id});
   return option ? option.name : '';
@@ -763,47 +779,23 @@ class AutomationWorkflowEditor extends Component {
   renderAddNodeDropdown(id, title, afterIndex) {
     const hasEmails = (this.props.emails || []).length;
     const hasLists = (this.props.lists || []).length;
+    const menuItems = automationAddNodeMenuItems(hasEmails, hasLists);
     return (
       <DropdownButton
         id={id}
         title={title}
       >
-        <MenuItem onClick={this.addNode.bind(this, 'add_tag', afterIndex)}>Add Tag Node</MenuItem>
-        <MenuItem onClick={this.addNode.bind(this, 'remove_tag', afterIndex)}>Remove Tag Node</MenuItem>
-        <MenuItem
-          onClick={this.addNode.bind(this, 'add_to_list', afterIndex)}
-          disabled={!hasLists}
-        >
-          Add To List Node
-        </MenuItem>
-        <MenuItem
-          onClick={this.addNode.bind(this, 'remove_from_list', afterIndex)}
-          disabled={!hasLists}
-        >
-          Remove From List Node
-        </MenuItem>
-        <MenuItem onClick={this.addNode.bind(this, 'wait_duration', afterIndex)}>Wait Duration Node</MenuItem>
-        <MenuItem onClick={this.addNode.bind(this, 'if_has_tag', afterIndex)}>Condition Node</MenuItem>
-        <MenuItem
-          onClick={this.addNode.bind(this, 'if_opened_email', afterIndex)}
-          disabled={!hasEmails}
-        >
-          If Opened Email Node
-        </MenuItem>
-        <MenuItem
-          onClick={this.addNode.bind(this, 'if_clicked_email', afterIndex)}
-          disabled={!hasEmails}
-        >
-          If Clicked Email Node
-        </MenuItem>
-        <MenuItem onClick={this.addNode.bind(this, 'go_to', afterIndex)}>Go To Node</MenuItem>
-        <MenuItem
-          onClick={this.addNode.bind(this, 'send_email', afterIndex)}
-          disabled={!hasEmails}
-        >
-          Send Email Node
-        </MenuItem>
-        <MenuItem onClick={this.addNode.bind(this, 'exit', afterIndex)}>Add Exit Node</MenuItem>
+        {
+          _.map(menuItems, item => (
+            <MenuItem
+              key={item.type}
+              onClick={this.addNode.bind(this, item.type, afterIndex)}
+              disabled={!!item.disabled}
+            >
+              {item.label}
+            </MenuItem>
+          ))
+        }
       </DropdownButton>
     );
   }

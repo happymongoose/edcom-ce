@@ -19,6 +19,7 @@ import {
   entryTriggers,
 } from './Automation';
 import {
+  automationAddNodeMenuItems,
   appendAutomationNode,
   automationClickMatchValue,
   automationNodeSummary,
@@ -51,6 +52,15 @@ describe('automation enrolment display helpers', () => {
     expect(updated[0].click_match).toBe('any');
     expect(updated[0].link_url).toBe('');
     expect(updated[0].automation_email_id).toBe('email-1');
+  });
+
+  it('keeps add-node menu options alphabetical and descriptive', () => {
+    const items = automationAddNodeMenuItems(true, true);
+    const labels = _.pluck(items, 'label');
+
+    expect(labels).toEqual(labels.slice().sort((a, b) => a.localeCompare(b)));
+    expect(labels).toContain('If Has Tag Node');
+    expect(labels).not.toContain('Condition Node');
   });
 
   it('inserts workflow nodes after a step without rewriting branch targets', () => {
