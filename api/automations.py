@@ -338,6 +338,10 @@ IF_HAS_TAG_NODE_SCHEMA = {
 }
 
 
+IF_MISSING_TAG_NODE_SCHEMA = copy.deepcopy(IF_HAS_TAG_NODE_SCHEMA)
+IF_MISSING_TAG_NODE_SCHEMA["properties"]["type"]["enum"] = ["if_missing_tag"]
+
+
 GO_TO_NODE_SCHEMA = {
     "type": "object",
     "required": ["id", "type", "label", "target_node_id"],
@@ -558,6 +562,7 @@ DRAFT_SCHEMA = {
                     REMOVE_FROM_LIST_NODE_SCHEMA,
                     WAIT_DURATION_NODE_SCHEMA,
                     IF_HAS_TAG_NODE_SCHEMA,
+                    IF_MISSING_TAG_NODE_SCHEMA,
                     GO_TO_NODE_SCHEMA,
                     SEND_EMAIL_NODE_SCHEMA,
                     EMAIL_ENGAGEMENT_CONDITION_NODE_SCHEMA,
@@ -969,6 +974,21 @@ def _published_entry(entry: JsonObj) -> JsonObj:
     }
 
 
+def _validate_tag_condition_node(node: JsonObj, node_ids: set[str], label: str) -> None:
+    if not node.get("draft_tag"):
+        _validation_error("%s nodes must have draft tag configuration." % label)
+    if not node.get("yes_node_id"):
+        _validation_error("%s nodes must have a yes target." % label)
+    if not node.get("no_node_id"):
+        _validation_error("%s nodes must have a no target." % label)
+    if node.get("yes_node_id") not in node_ids:
+        _validation_error("%s yes target must exist in the draft workflow." % label)
+    if node.get("no_node_id") not in node_ids:
+        _validation_error("%s no target must exist in the draft workflow." % label)
+    if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
+        _validation_error("%s nodes cannot target themselves." % label)
+
+
 def _duration_minutes(duration: JsonObj) -> int:
     return (
         int(duration.get("days", 0)) * 24 * 60
@@ -1033,7 +1053,7 @@ def _workflow_edges(nodes: list[JsonObj]) -> dict[str, list[str]]:
             edges[node_id] = []
         elif node_type == "go_to":
             edges[node_id] = [node.get("target_node_id")]
-        elif node_type in ("if_has_tag", "if_opened_email", "if_clicked_email"):
+        elif node_type in ("if_has_tag", "if_missing_tag", "if_opened_email", "if_clicked_email"):
             edges[node_id] = [node.get("yes_node_id"), node.get("no_node_id")]
         elif index + 1 < len(nodes):
             edges[node_id] = [nodes[index + 1].get("id")]
@@ -1385,18 +1405,9 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
                     % (node.get("type"), index + 1)
                 )
         if node.get("type") == "if_has_tag":
-            if not node.get("draft_tag"):
-                _validation_error("If has tag nodes must have draft tag configuration.")
-            if not node.get("yes_node_id"):
-                _validation_error("If has tag nodes must have a yes target.")
-            if not node.get("no_node_id"):
-                _validation_error("If has tag nodes must have a no target.")
-            if node.get("yes_node_id") not in node_ids:
-                _validation_error("If has tag yes target must exist in the draft workflow.")
-            if node.get("no_node_id") not in node_ids:
-                _validation_error("If has tag no target must exist in the draft workflow.")
-            if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
-                _validation_error("If has tag nodes cannot target themselves.")
+            _validate_tag_condition_node(node, node_ids, "If has tag")
+        if node.get("type") == "if_missing_tag":
+            _validate_tag_condition_node(node, node_ids, "If missing tag")
         if node.get("type") in ("if_opened_email", "if_clicked_email"):
             node_label = "If opened email" if node.get("type") == "if_opened_email" else "If clicked email"
             automation_email_id = node.get("automation_email_id")
@@ -4525,12 +4536,12 @@ def _run_next_automation_enrolment(
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
+        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_missing_tag", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
+                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_missing_tag, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -4865,27 +4876,30 @@ def _run_next_automation_enrolment(
                 },
                 "modified": now,
             }
-        elif node_type == "if_has_tag":
+        elif node_type in ("if_has_tag", "if_missing_tag"):
             tag = node.get("draft_tag")
             if not tag:
                 raise falcon.HTTPBadRequest(
-                    title="If has tag node is missing tag configuration",
-                    description="The published if_has_tag node does not include a tag.",
+                    title="%s node is missing tag configuration" % node_type,
+                    description="The published %s node does not include a tag." % node_type,
                 )
 
-            result = _contact_has_tag(db, cid, enrolment["contact_id"], tag)
+            has_tag = _contact_has_tag(db, cid, enrolment["contact_id"], tag)
+            result = has_tag if node_type == "if_has_tag" else not has_tag
             branch = "yes" if result else "no"
             target_node_id = node.get("yes_node_id") if result else node.get("no_node_id")
             if _node_by_id(nodes, target_node_id) is None:
                 raise falcon.HTTPBadRequest(
                     title="Automation branch target is missing",
-                    description="The published if_has_tag %s target was not found in the published workflow." % branch,
+                    description="The published %s %s target was not found in the published workflow." % (node_type, branch),
                 )
 
             success_data.update(
                 {
                     "action": "branch",
+                    "condition": "has_tag" if node_type == "if_has_tag" else "missing_tag",
                     "tag": tag,
+                    "has_tag": has_tag,
                     "result": result,
                     "branch": branch,
                     "target_node_id": target_node_id,

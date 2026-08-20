@@ -59,8 +59,22 @@ describe('automation enrolment display helpers', () => {
     const labels = _.pluck(items, 'label');
 
     expect(labels).toEqual(labels.slice().sort((a, b) => a.localeCompare(b)));
+    expect(labels).toContain('If Contact Does Not Have Tag Node');
     expect(labels).toContain('If Has Tag Node');
     expect(labels).not.toContain('Condition Node');
+  });
+
+  it('creates missing-tag condition nodes with branch targets', () => {
+    const updated = appendAutomationNode([], 'if_missing_tag', {generateId: () => 'missing-tag-node'});
+
+    expect(updated[0]).toEqual({
+      id: 'missing-tag-node',
+      type: 'if_missing_tag',
+      label: 'If contact does not have tag',
+      draft_tag: '',
+      yes_node_id: '',
+      no_node_id: '',
+    });
   });
 
   it('inserts workflow nodes after a step without rewriting branch targets', () => {
@@ -173,6 +187,7 @@ describe('automation enrolment display helpers', () => {
       {id: 'add-list', type: 'add_to_list', list_id: 'list-1'},
       {id: 'remove-list', type: 'remove_from_list', list_id: 'list-1'},
       {id: 'wait', type: 'wait_duration', duration: {days: 1, hours: 2, minutes: 3}},
+      {id: 'missing-tag', type: 'if_missing_tag', draft_tag: 'inactive', yes_node_id: 'exit', no_node_id: 'add-tag'},
       {id: 'exit', type: 'exit'},
     ];
     const options = {nodes: nodes, emails: emails, lists: lists};
@@ -183,7 +198,8 @@ describe('automation enrolment display helpers', () => {
     expect(automationNodeSummary(nodes[3], options)).toBe('Add to list: Customers (42 contacts)');
     expect(automationNodeSummary(nodes[4], options)).toBe('Remove from list: Customers (42 contacts)');
     expect(automationNodeSummary(nodes[5], options)).toBe('Wait: 1 day 2 hours 3 minutes');
-    expect(automationNodeSummary(nodes[6], options)).toBe('Exit automation');
+    expect(automationNodeSummary(nodes[6], options)).toBe('If missing tag: inactive | Yes -> Step 8 - Exit (Exit) | No -> Step 2 - Add tag (Add tag)');
+    expect(automationNodeSummary(nodes[7], options)).toBe('Exit automation');
   });
 
   it('summarizes missing workflow references clearly', () => {

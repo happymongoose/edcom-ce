@@ -28,6 +28,9 @@ export function automationNodeTypeLabel(type) {
   if (type === 'if_has_tag') {
     return 'If has tag';
   }
+  if (type === 'if_missing_tag') {
+    return 'If missing tag';
+  }
   if (type === 'if_opened_email') {
     return 'If opened email';
   }
@@ -106,6 +109,7 @@ export function automationAddNodeMenuItems(hasEmails, hasLists) {
     {type: 'exit', label: 'Add Exit Node'},
     {type: 'go_to', label: 'Go To Node'},
     {type: 'if_clicked_email', label: 'If Clicked Email Node', disabled: !hasEmails},
+    {type: 'if_missing_tag', label: 'If Contact Does Not Have Tag Node'},
     {type: 'if_has_tag', label: 'If Has Tag Node'},
     {type: 'if_opened_email', label: 'If Opened Email Node', disabled: !hasEmails},
     {type: 'remove_from_list', label: 'Remove From List Node', disabled: !hasLists},
@@ -183,6 +187,11 @@ export function automationNodeSummary(node, options) {
       ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
       ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
   }
+  if (node.type === 'if_missing_tag') {
+    return 'If missing tag: ' + (node.draft_tag || 'No tag selected') +
+      ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
+      ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
+  }
   if (node.type === 'if_opened_email') {
     return 'If opened: ' + (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
       ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
@@ -214,13 +223,13 @@ export function createAutomationNode(type, options) {
   const node = {
     id: generateId(),
     type: type,
-    label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
+    label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_missing_tag' ? 'If contact does not have tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
   };
 
   if (type === 'add_tag' || type === 'remove_tag') {
     node.draft_tag = '';
   }
-  if (type === 'if_has_tag') {
+  if (type === 'if_has_tag' || type === 'if_missing_tag') {
     node.draft_tag = '';
     node.yes_node_id = '';
     node.no_node_id = '';
@@ -466,7 +475,7 @@ class AutomationWorkflowEditor extends Component {
   tagData() {
     const tags = this.props.tags || [];
     const nodes = this.props.nodes || [];
-    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
+    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag', 'if_missing_tag'], node.type) && node.draft_tag), 'draft_tag');
     return _.map(_.uniq(tags.concat(draftTags).concat(this.props.entryTags || [])), tag => ({id: tag, text: tag}));
   }
 
@@ -483,7 +492,7 @@ class AutomationWorkflowEditor extends Component {
   }
 
   renderNodeConfig(node, index) {
-    if (node.type === 'add_tag' || node.type === 'remove_tag' || node.type === 'if_has_tag') {
+    if (node.type === 'add_tag' || node.type === 'remove_tag' || node.type === 'if_has_tag' || node.type === 'if_missing_tag') {
       return (
         <div style={{minWidth: '220px'}}>
           <Select2
@@ -508,7 +517,7 @@ class AutomationWorkflowEditor extends Component {
           />
           <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
           {
-            node.type === 'if_has_tag' ?
+            node.type === 'if_has_tag' || node.type === 'if_missing_tag' ?
               <div className="space-top-sm">
                 <SelectLabel
                   id="yes_node_id"

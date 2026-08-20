@@ -36,6 +36,7 @@ Draft/publish and manual execution:
 - `wait_duration`
 - `exit`
 - `if_has_tag`
+- `if_missing_tag`
 - `go_to`
 - `send_email`
 - `add_to_list`
@@ -43,7 +44,8 @@ Draft/publish and manual execution:
 - `if_opened_email`
 - `if_clicked_email`
 
-`if_clicked_email` currently means any click in the selected automation email. Specific-link click conditions are not implemented yet.
+`if_clicked_email` supports any-click, exact URL, and conservative URL-prefix
+matching for clicks captured from the selected automation email.
 
 ## Entry Trigger Types
 
@@ -217,7 +219,19 @@ Recovery actions should preserve audit/history where possible. `automation_step_
 
 ## Known Gaps And Future Work
 
-- Specific-link click conditions for `if_clicked_email`.
+- Richer discovered-link selection for specific-link click conditions, such as
+  link metadata/discovery improvements beyond the current simple read-only
+  extractor.
+- Compound condition nodes should be designed as a separate future slice, not
+  folded into the current simple condition nodes. A future node type may be
+  something like `if_conditions`, with grouped ALL/ANY logic such as contact
+  has tag A AND does not have tag B, clicked a specific automation email URL OR
+  opened an automation email, or has tag A AND clicked URL prefix X. Existing
+  simple condition nodes should remain supported for easy workflows. Compound
+  conditions should reuse existing condition evaluators where possible. Segment
+  based conditions need extra care because segment evaluation can be expensive.
+  Publish validation and execution should treat the compound node as one branch
+  node with yes/no targets.
 - General link-click actions should be designed separately from automation
   engagement conditions. Future click actions may apply across broadcasts,
   funnels, transactional emails, and automation emails, and may add/remove tags

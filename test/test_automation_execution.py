@@ -405,7 +405,7 @@ class TestAutomationExecution(test_base.TestBase):
         published["execution_email_id"] = email["id"]
         return published
 
-    def create_condition_automation(self):
+    def create_condition_automation(self, node_type="if_has_tag", node_overrides=None):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -414,8 +414,8 @@ class TestAutomationExecution(test_base.TestBase):
         nodes = [
             {
                 "id": "node_condition_1",
-                "type": "if_has_tag",
-                "label": "If contact has tag",
+                "type": node_type,
+                "label": "If contact does not have tag" if node_type == "if_missing_tag" else "If contact has tag",
                 "draft_tag": "vip",
                 "yes_node_id": "node_add_tag_1",
                 "no_node_id": "node_exit_1",
@@ -432,6 +432,8 @@ class TestAutomationExecution(test_base.TestBase):
                 "label": "Exit automation",
             },
         ]
+        if node_overrides:
+            nodes[0].update(node_overrides)
         self.user_patch(
             "/api/automations/%s" % automation["id"],
             json=self.workflow(nodes=nodes),
@@ -2737,6 +2739,191 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(data["status"], "held")
         self.assertEqual(data["last_failure_retryable"], False)
         self.assertEqual(data["last_failure_class"], "configuration")
+
+        self.cleanup(automation["id"])
+
+    def test_if_missing_tag_yes_branch_when_contact_lacks_tag(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_condition_automation("if_missing_tag")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertFalse(self.has_tag(contact_id, "branch-tag"))
+
+        step_run = result.json["step_run"]
+        self.assertEqual(step_run["node_type"], "if_missing_tag")
+        self.assertEqual(step_run["node_label"], "If contact does not have tag")
+        self.assertEqual(step_run["condition"], "missing_tag")
+        self.assertEqual(step_run["tag"], "vip")
+        self.assertEqual(step_run["has_tag"], False)
+        self.assertEqual(step_run["result"], True)
+        self.assertEqual(step_run["branch"], "yes")
+        self.assertEqual(step_run["target_node_id"], "node_add_tag_1")
+        self.assertEqual(step_run["published_revision"], automation["published_revision"])
+        self.assertEqual(step_run["status"], "succeeded")
+
+        self.cleanup(automation["id"])
+
+    def test_if_missing_tag_no_branch_when_contact_has_tag(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_condition_automation("if_missing_tag")
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute(
+            f"""insert into contacts."contact_values_{self.user_cookie['cid']}"
+            (contact_id, type, value) values (%s, 'tag', %s)
+            on conflict (contact_id, type, value) do nothing""",
+            contact_id,
+            "vip",
+        )
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["status"], "ready")
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "if_missing_tag")
+        self.assertEqual(result.json["step_run"]["condition"], "missing_tag")
+        self.assertEqual(result.json["step_run"]["has_tag"], True)
+        self.assertEqual(result.json["step_run"]["result"], False)
+        self.assertEqual(result.json["step_run"]["branch"], "no")
+
+        self.cleanup(automation["id"])
+
+    def test_if_missing_tag_target_missing_is_rejected_clearly(self):
+        email, contact_id = self.create_contact()
+        automation = self.create_condition_automation("if_missing_tag")
+        published = automation["published"].copy()
+        published["nodes"] = [
+            node for node in published["nodes"] if node["id"] != "node_add_tag_1"
+        ]
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation["id"], {"published": published})
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("if_missing_tag yes target was not found", result.text)
+        data = self.enrolment_data(enrolment["id"])
+        self.assertEqual(data["status"], "held")
+        self.assertEqual(data["last_failure_retryable"], False)
+        self.assertEqual(data["last_failure_class"], "configuration")
+
+        self.cleanup(automation["id"])
+
+    def test_if_missing_tag_publish_validation(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_missing_tag_validation_%s" % self.unique()},
+        )
+        nodes = [
+            {
+                "id": "node_condition_1",
+                "type": "if_missing_tag",
+                "label": "If contact does not have tag",
+                "draft_tag": "",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add branch tag",
+                "draft_tag": "branch-tag",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If missing tag nodes must have draft tag configuration", result.text)
+
+        nodes[0]["draft_tag"] = "vip"
+        nodes[0]["yes_node_id"] = ""
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If missing tag nodes must have a yes target", result.text)
+
+        nodes[0]["yes_node_id"] = "missing-node"
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If missing tag yes target must exist", result.text)
+
+        nodes[0]["yes_node_id"] = "node_condition_1"
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If missing tag nodes cannot target themselves", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_missing_tag_cycle_detection_includes_branch_targets(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_missing_tag_cycle_%s" % self.unique()},
+        )
+        nodes = [
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add branch tag",
+                "draft_tag": "branch-tag",
+            },
+            {
+                "id": "node_condition_1",
+                "type": "if_missing_tag",
+                "label": "If contact does not have tag",
+                "draft_tag": "vip",
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes),
+        )
+        result = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        )
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Workflow contains a cycle", result.text)
 
         self.cleanup(automation["id"])
 
