@@ -215,6 +215,18 @@ export function automationNodeSummary(node, options) {
   return 'Exit automation';
 }
 
+export function automationNodeSummaryWarning(summary) {
+  return summary.indexOf('No ') === 0 ||
+    summary.indexOf('No tag selected') !== -1 ||
+    summary.indexOf('No email selected') !== -1 ||
+    summary.indexOf('No list selected') !== -1 ||
+    summary.indexOf('No URL entered') !== -1 ||
+    summary.indexOf('Selected email not found') !== -1 ||
+    summary.indexOf('Selected list not found') !== -1 ||
+    summary.indexOf('Target missing') !== -1 ||
+    summary.indexOf('Wait duration incomplete') !== -1;
+}
+
 export function createAutomationNode(type, options) {
   const opts = options || {};
   const emails = opts.emails || [];
@@ -812,10 +824,7 @@ class AutomationWorkflowEditor extends Component {
   renderNodeCard(node, index, nodes) {
     const expanded = !!this.state.expandedNodeIds[node.id];
     const summary = this.nodeSummary(node);
-    const summaryWarning = summary.indexOf('No ') === 0 ||
-      summary.indexOf('missing') !== -1 ||
-      summary.indexOf('not found') !== -1 ||
-      summary.indexOf('incomplete') !== -1;
+    const summaryWarning = automationNodeSummaryWarning(summary);
     return (
       <div
         key={node.id}

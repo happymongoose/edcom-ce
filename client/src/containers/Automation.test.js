@@ -23,6 +23,7 @@ import {
   appendAutomationNode,
   automationClickMatchValue,
   automationNodeSummary,
+  automationNodeSummaryWarning,
   automationNodeTargetOptions,
   insertAutomationNodeAfter,
   moveAutomationNode,
@@ -209,6 +210,14 @@ describe('automation enrolment display helpers', () => {
     expect(automationNodeSummary({id: 'list', type: 'add_to_list', list_id: 'missing'}, {})).toBe('Add to list: Selected list not found');
     expect(automationNodeSummary({id: 'wait', type: 'wait_duration', duration: {}}, {})).toBe('Wait: Wait duration incomplete');
     expect(automationNodeSummary({id: 'go', type: 'go_to'}, {nodes: []})).toBe('Go to: Target missing');
+  });
+
+  it('only marks actual incomplete summaries as warnings', () => {
+    expect(automationNodeSummaryWarning('If missing tag: inactive | Yes -> Step 8 - Exit (Exit) | No -> Step 2 - Add tag (Add tag)')).toBe(false);
+    expect(automationNodeSummaryWarning('No email selected')).toBe(true);
+    expect(automationNodeSummaryWarning('Send email: Selected email not found')).toBe(true);
+    expect(automationNodeSummaryWarning('Go to: Target missing')).toBe(true);
+    expect(automationNodeSummaryWarning('Wait: Wait duration incomplete')).toBe(true);
   });
 
   it('summarizes condition targets and updates target step labels after reorder', () => {
