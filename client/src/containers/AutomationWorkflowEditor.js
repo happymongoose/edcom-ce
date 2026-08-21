@@ -2211,15 +2211,36 @@ class AutomationWorkflowEditor extends Component {
     return (
       <div
         style={{
-          marginTop: '16px',
-          padding: '14px',
-          borderRadius: '8px',
+          marginTop: '-1px',
+          padding: '0 14px 14px',
+          borderRadius: '0 0 8px 8px',
           background: '#f8fafc',
           border: '1px solid #e5ebf3',
+          borderTop: '0',
         }}
       >
-        <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '10px'}}>
-          Branch paths
+        <div
+          aria-hidden="true"
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+            gap: '14px',
+            marginBottom: '4px',
+          }}
+        >
+          {
+            _.map(branch.lanes, lane => (
+              <div key={lane.label + '-stem'} style={{display: 'flex', justifyContent: 'center'}}>
+                <div
+                  style={{
+                    width: '2px',
+                    height: '14px',
+                    background: lane.label === 'No' ? '#ebcccc' : '#cce8d4',
+                  }}
+                />
+              </div>
+            ))
+          }
         </div>
         <div
           style={{
