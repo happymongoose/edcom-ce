@@ -2258,11 +2258,11 @@ class AutomationWorkflowEditor extends Component {
           <div
             style={{
               position: 'absolute',
-              right: '25%',
+              left: '75%',
               top: '22px',
               width: '2px',
               height: '28px',
-              marginRight: '-1px',
+              marginLeft: '-1px',
               background: '#ebcccc',
             }}
           />
@@ -2285,9 +2285,9 @@ class AutomationWorkflowEditor extends Component {
           <div
             style={{
               position: 'absolute',
-              right: '25%',
+              left: '75%',
               top: '34px',
-              transform: 'translateX(50%)',
+              transform: 'translateX(-50%)',
               padding: '3px 9px',
               borderRadius: '12px',
               background: '#fff1f1',
