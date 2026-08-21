@@ -2312,12 +2312,25 @@ class AutomationWorkflowEditor extends Component {
                 key={lane.label}
                 style={{
                   minWidth: 0,
-                  border: '1px solid #dfe5ef',
-                  borderRadius: '8px',
-                  background: '#fff',
-                  padding: '12px',
+                  padding: '0',
                 }}
               >
+                <div
+                  aria-hidden="true"
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'center',
+                    height: '18px',
+                  }}
+                >
+                  <div
+                    style={{
+                      width: '2px',
+                      height: '18px',
+                      background: lane.label === 'No' ? '#ebcccc' : '#cce8d4',
+                    }}
+                  />
+                </div>
                 {
                   lane.blocks.length ?
                     _.map(lane.blocks, (block, index) => this.renderPreviewBlock(block, index, lane.blocks, {suppressBranchPanel: false}))
