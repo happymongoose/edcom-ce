@@ -436,8 +436,6 @@ function automationWorkflowPreviewSummary(node, options) {
   const nodes = opts.nodes || [];
   const emailOptions = automationEmailOptions(opts.emails || []);
   const listOptions = automationListOptions(opts.lists || []);
-  const branchSummary = ' | Yes -> ' + automationPreviewTargetStepSummary(nodes, node.yes_node_id) +
-    ' | No -> ' + automationPreviewTargetStepSummary(nodes, node.no_node_id);
 
   if (node.type === 'send_email') {
     if (!node.automation_email_id) {
@@ -458,11 +456,10 @@ function automationWorkflowPreviewSummary(node, options) {
     return durationSummary(node.duration || {});
   }
   if (node.type === 'if_has_tag' || node.type === 'if_missing_tag') {
-    return (node.draft_tag || 'No tag selected') + branchSummary;
+    return node.draft_tag || 'No tag selected';
   }
   if (node.type === 'if_opened_email') {
-    return (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
-      branchSummary;
+    return node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected';
   }
   if (node.type === 'if_clicked_email') {
     const clickMatch = automationClickMatchValue(node);
@@ -473,22 +470,21 @@ function automationWorkflowPreviewSummary(node, options) {
       clickSummary = 'URL starts with: ' + (node.link_url || 'No URL entered');
     }
     return clickSummary + ' in ' +
-      (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
-      branchSummary;
+      (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected');
   }
   if (node.type === 'if_conditions') {
     const condition = node.condition || {};
     const items = condition.items || [];
     const mode = condition.mode === 'any' ? 'Any' : 'All';
     if (!items.length) {
-      return 'No conditions configured' + branchSummary;
+      return 'No conditions configured';
     }
     if (items.length === 1) {
-      return conditionItemSummary(items[0], opts) + branchSummary;
+      return conditionItemSummary(items[0], opts);
     }
     const preview = _.map(items.slice(0, 2), item => conditionItemSummary(item, opts)).join(' | ');
     return mode + ' of ' + items.length + ' conditions: ' +
-      preview + (items.length > 2 ? ' | ...' : '') + branchSummary;
+      preview + (items.length > 2 ? ' | ...' : '');
   }
   if (node.type === 'go_to') {
     return automationPreviewTargetStepSummary(nodes, node.target_node_id);
@@ -2233,7 +2229,7 @@ class AutomationWorkflowEditor extends Component {
               left: '50%',
               top: 0,
               width: '2px',
-              height: '18px',
+              height: '20px',
               marginLeft: '-1px',
               background: connectorColor,
             }}
@@ -2244,7 +2240,7 @@ class AutomationWorkflowEditor extends Component {
               position: 'absolute',
               left: 'calc(25% - 3.5px)',
               right: 'calc(25% - 3.5px)',
-              top: '18px',
+              top: '20px',
               height: '2px',
               background: connectorColor,
             }}
@@ -2267,19 +2263,20 @@ class AutomationWorkflowEditor extends Component {
                     aria-hidden="true"
                     style={{
                       width: '2px',
-                      height: '30px',
+                      height: '20px',
                       background: connectorColor,
                     }}
                   />
                   <div
                     style={{
+                      position: 'relative',
+                      zIndex: 1,
                       padding: '3px 9px',
                       borderRadius: '12px',
                       background: lane.label === 'No' ? '#fff1f1' : '#eefaf1',
                       color: lane.label === 'No' ? '#a94442' : '#2f7d46',
                       fontWeight: 700,
                       fontSize: '12px',
-                      marginTop: '-14px',
                     }}
                   >
                     {lane.label}

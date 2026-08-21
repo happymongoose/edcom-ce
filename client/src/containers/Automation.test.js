@@ -482,7 +482,7 @@ describe('automation enrolment display helpers', () => {
     expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['send', 'branch']);
     expect(flow.main[0].item.type_label).toBe('Send email');
     expect(flow.main[0].item.summary).toBe('Welcome - Hello (HTML)');
-    expect(flow.main[1].item.summary).toBe('vip | Yes -> Step 3 | No -> Step 4');
+    expect(flow.main[1].item.summary).toBe('vip');
     expect(flow.branch.item.id).toBe('branch');
     expect(_.pluck(flow.branch.lanes, 'label')).toEqual(['Yes', 'No']);
   });
@@ -557,8 +557,9 @@ describe('automation enrolment display helpers', () => {
 
     const flow = automationWorkflowPreviewFlow(nodes, {});
 
-    expect(flow.main[0].item.summary).toBe('has tag vip | Yes -> Step 2 | No -> Step 3');
+    expect(flow.main[0].item.summary).toBe('has tag vip');
     expect(flow.main[0].item.summary).not.toContain('All of 1 condition');
+    expect(flow.main[0].item.summary).not.toContain('Yes ->');
   });
 
   it('uses inline visual preview summaries for simple action nodes only', () => {
