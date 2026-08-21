@@ -443,6 +443,51 @@ class TestAutomationExecution(test_base.TestBase):
             headers=self.headers(),
         ).json
 
+    def create_compound_condition_automation(self, mode="all", items=None, node_overrides=None, reentry=None):
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_compound_condition_%s" % suffix},
+        )
+        node = {
+            "id": "node_compound_condition_1",
+            "type": "if_conditions",
+            "label": "If conditions",
+            "condition": {
+                "mode": mode,
+                "items": items or [
+                    {"type": "has_tag", "tag": "vip"},
+                    {"type": "missing_tag", "tag": "inactive"},
+                ],
+            },
+            "yes_node_id": "node_add_tag_1",
+            "no_node_id": "node_exit_1",
+        }
+        if node_overrides:
+            node.update(node_overrides)
+        nodes = [
+            node,
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add compound branch tag",
+                "draft_tag": "compound-branch",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes, reentry=reentry),
+        )
+        return self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
     def create_email_engagement_condition_automation(self, node_type="if_opened_email"):
         return self.create_email_engagement_condition_automation_with_options(node_type)
 
@@ -2924,6 +2969,335 @@ class TestAutomationExecution(test_base.TestBase):
         )
         self.assertEqual(result.status_code, 400)
         self.assertIn("Workflow contains a cycle", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_valid_all_and_any_publish(self):
+        automation_all = self.create_compound_condition_automation("all")
+        self.assertEqual(automation_all["published"]["nodes"][0]["type"], "if_conditions")
+        self.assertEqual(automation_all["published"]["nodes"][0]["condition"]["mode"], "all")
+        self.cleanup(automation_all["id"])
+
+        automation_any = self.create_compound_condition_automation("any")
+        self.assertEqual(automation_any["published"]["nodes"][0]["condition"]["mode"], "any")
+        self.cleanup(automation_any["id"])
+
+    def test_if_conditions_publish_validation_rejects_empty_too_many_unknown_and_nested_items(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_compound_validation_%s" % self.unique()},
+        )
+        base_node = {
+            "id": "node_compound_condition_1",
+            "type": "if_conditions",
+            "label": "If conditions",
+            "condition": {
+                "mode": "all",
+                "items": [],
+            },
+            "yes_node_id": "node_add_tag_1",
+            "no_node_id": "node_exit_1",
+        }
+        nodes = [
+            base_node,
+            {
+                "id": "node_add_tag_1",
+                "type": "add_tag",
+                "label": "Add branch tag",
+                "draft_tag": "compound-branch",
+            },
+            {
+                "id": "node_exit_1",
+                "type": "exit",
+                "label": "Exit automation",
+            },
+        ]
+        result = self.simulate_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes), headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("too short", result.text)
+
+        nodes[0]["condition"]["items"] = [{"type": "has_tag", "tag": "tag-%s" % i} for i in range(21)]
+        result = self.simulate_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes), headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+
+        nodes[0]["condition"]["items"] = [{"type": "group", "mode": "all", "items": [{"type": "has_tag", "tag": "vip"}]}]
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+        result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Nested condition groups are not supported yet", result.text)
+
+        nodes[0]["condition"]["items"] = [{"type": "unknown_condition"}]
+        result = self.simulate_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes), headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_publish_validation_rejects_missing_selectors(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_compound_selector_validation_%s" % self.unique()},
+        )
+        email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={"name": "Compound email", "subject": "Compound subject", "rawText": "<p>Hello</p>"},
+        )
+        lst = self.create_empty_list()
+        base_items = [
+            {"type": "has_tag", "tag": ""},
+            {"type": "opened_email", "automation_email_id": ""},
+            {"type": "clicked_email", "automation_email_id": email["id"], "click_match": "url_prefix", "link_url": ""},
+            {"type": "in_list", "list_id": ""},
+        ]
+        expected = [
+            "must select a tag",
+            "must select an automation email",
+            "URL conditions must have a link URL",
+            "must select a contact list",
+        ]
+        for item, expected_text in zip(base_items, expected):
+            nodes = [
+                {
+                    "id": "node_compound_condition_1",
+                    "type": "if_conditions",
+                    "label": "If conditions",
+                    "condition": {"mode": "all", "items": [item]},
+                    "yes_node_id": "node_add_tag_1",
+                    "no_node_id": "node_exit_1",
+                },
+                {"id": "node_add_tag_1", "type": "add_tag", "label": "Add branch tag", "draft_tag": "compound-branch"},
+                {"id": "node_exit_1", "type": "exit", "label": "Exit automation"},
+            ]
+            self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+            result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+            self.assertEqual(result.status_code, 400)
+            self.assertIn(expected_text, result.text)
+
+        valid_items = [
+            {"type": "has_tag", "tag": "vip"},
+            {"type": "opened_email", "automation_email_id": email["id"]},
+            {"type": "clicked_email", "automation_email_id": email["id"], "click_match": "url_exact", "link_url": "https://example.com"},
+            {"type": "not_in_list", "list_id": lst["id"]},
+        ]
+        nodes[0]["condition"] = {"mode": "all", "items": valid_items}
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+        result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 200)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_branch_target_validation_and_cycle_detection(self):
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_compound_target_validation_%s" % self.unique()},
+        )
+        nodes = [
+            {
+                "id": "node_compound_condition_1",
+                "type": "if_conditions",
+                "label": "If conditions",
+                "condition": {"mode": "all", "items": [{"type": "has_tag", "tag": "vip"}]},
+                "yes_node_id": "",
+                "no_node_id": "node_exit_1",
+            },
+            {"id": "node_add_tag_1", "type": "add_tag", "label": "Add branch tag", "draft_tag": "compound-branch"},
+            {"id": "node_exit_1", "type": "exit", "label": "Exit automation"},
+        ]
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+        result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If conditions nodes must have a yes target", result.text)
+
+        nodes[0]["yes_node_id"] = "missing-node"
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+        result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If conditions yes target must exist", result.text)
+
+        nodes[0]["yes_node_id"] = "node_compound_condition_1"
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+        result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("If conditions nodes cannot target themselves", result.text)
+
+        nodes = [
+            {"id": "node_add_tag_1", "type": "add_tag", "label": "Add branch tag", "draft_tag": "compound-branch"},
+            {
+                "id": "node_compound_condition_1",
+                "type": "if_conditions",
+                "label": "If conditions",
+                "condition": {"mode": "all", "items": [{"type": "has_tag", "tag": "vip"}]},
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {"id": "node_exit_1", "type": "exit", "label": "Exit automation"},
+        ]
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
+        result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Workflow contains a cycle", result.text)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_all_branches_yes_and_does_not_execute_target(self):
+        email, contact_id = self.create_contact()
+        self.add_existing_tag(contact_id, "vip")
+        automation = self.create_compound_condition_automation("all")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["node_type"], "if_conditions")
+        self.assertEqual(result.json["step_run"]["action"], "if_conditions")
+        self.assertEqual(result.json["step_run"]["mode"], "all")
+        self.assertEqual(result.json["step_run"]["result"], True)
+        self.assertEqual(result.json["step_run"]["branch"], "yes")
+        self.assertEqual(result.json["step_run"]["evaluated_count"], 2)
+        self.assertEqual(result.json["step_run"]["conditions"][0]["type"], "has_tag")
+        self.assertFalse(self.has_tag(contact_id, "compound-branch"))
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_all_branches_no_with_short_circuit(self):
+        email, _ = self.create_contact()
+        automation = self.create_compound_condition_automation("all")
+        enrolment = self.enrol(automation["id"], email)
+
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+        self.assertEqual(result.json["step_run"]["branch"], "no")
+        self.assertEqual(result.json["step_run"]["evaluated_count"], 1)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_any_branches_yes_and_no(self):
+        email, _ = self.create_contact()
+        automation = self.create_compound_condition_automation(
+            "any",
+            [
+                {"type": "has_tag", "tag": "vip"},
+                {"type": "missing_tag", "tag": "inactive"},
+            ],
+        )
+        enrolment = self.enrol(automation["id"], email)
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["result"], True)
+        self.assertEqual(result.json["step_run"]["branch"], "yes")
+        self.assertEqual(result.json["step_run"]["evaluated_count"], 2)
+        self.cleanup(automation["id"])
+
+        email, _ = self.create_contact()
+        automation = self.create_compound_condition_automation(
+            "any",
+            [
+                {"type": "has_tag", "tag": "vip"},
+                {"type": "has_tag", "tag": "inactive"},
+            ],
+        )
+        enrolment = self.enrol(automation["id"], email)
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(result.json["step_run"]["result"], False)
+        self.assertEqual(result.json["step_run"]["branch"], "no")
+        self.assertEqual(result.json["step_run"]["evaluated_count"], 2)
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_email_engagement_scoped_to_current_enrolment(self):
+        email, contact_id = self.create_contact()
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_compound_engagement_%s" % suffix},
+        )
+        automation_email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Compound engagement email",
+                "subject": "Compound engagement subject",
+                "rawText": "<p>Hello</p>",
+            },
+        )
+        nodes = [
+            {
+                "id": "node_compound_condition_1",
+                "type": "if_conditions",
+                "label": "If conditions",
+                "condition": {
+                    "mode": "all",
+                    "items": [
+                        {
+                            "type": "clicked_email",
+                            "automation_email_id": automation_email["id"],
+                            "click_match": "url_prefix",
+                            "link_url": "https://example.com/offer",
+                        },
+                    ],
+                },
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {"id": "node_add_tag_1", "type": "add_tag", "label": "Add branch tag", "draft_tag": "compound-branch"},
+            {"id": "node_exit_1", "type": "exit", "label": "Exit automation"},
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes, reentry="multiple"),
+        )
+        automation = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+        automation_email_id = automation_email["id"]
+
+        first_enrolment = self.enrol(automation["id"], email)
+        self.insert_open_event(
+            automation["id"],
+            first_enrolment["id"],
+            contact_id,
+            email,
+            automation_email_id,
+            event_type="click",
+            event_data={"link_url": "https://example.com/offer?utm=1", "test_id": self.test_id},
+        )
+        first = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(first.json["step_run"]["result"], True)
+        self.assertEqual(self.run_next(automation["id"], first_enrolment["id"]).status_code, 200)
+        exited = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(exited.json["enrolment"]["status"], "exited")
+
+        second_enrolment = self.enrol(automation["id"], email)
+        second = self.run_next(automation["id"], second_enrolment["id"])
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(second.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_list_membership_conditions(self):
+        email, contact_id = self.create_contact()
+        in_list_id = self.contact_list_ids(contact_id)[0]
+        not_in_list = self.create_empty_list()
+        automation = self.create_compound_condition_automation(
+            "all",
+            [
+                {"type": "in_list", "list_id": in_list_id},
+                {"type": "not_in_list", "list_id": not_in_list["id"]},
+            ],
+        )
+        enrolment = self.enrol(automation["id"], email)
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(result.json["step_run"]["result"], True)
+        self.assertEqual(result.json["step_run"]["conditions"][0]["in_list"], True)
+        self.assertEqual(result.json["step_run"]["conditions"][1]["in_list"], False)
 
         self.cleanup(automation["id"])
 

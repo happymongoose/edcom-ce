@@ -342,6 +342,149 @@ IF_MISSING_TAG_NODE_SCHEMA = copy.deepcopy(IF_HAS_TAG_NODE_SCHEMA)
 IF_MISSING_TAG_NODE_SCHEMA["properties"]["type"]["enum"] = ["if_missing_tag"]
 
 
+CONDITION_ITEM_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "object",
+            "required": ["type", "tag"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["has_tag", "missing_tag"],
+                },
+                "tag": {
+                    "type": "string",
+                    "maxLength": 1024,
+                },
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": ["type", "automation_email_id"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["opened_email"],
+                },
+                "automation_email_id": {
+                    "type": "string",
+                    "maxLength": 64,
+                },
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": ["type", "automation_email_id"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["clicked_email"],
+                },
+                "automation_email_id": {
+                    "type": "string",
+                    "maxLength": 64,
+                },
+                "click_match": {
+                    "type": "string",
+                    "enum": ["any", "url", "url_exact", "url_prefix"],
+                },
+                "link_url": {
+                    "type": "string",
+                    "maxLength": 2048,
+                },
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": ["type", "list_id"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["in_list", "not_in_list"],
+                },
+                "list_id": {
+                    "type": "string",
+                    "maxLength": 64,
+                },
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["group"],
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["all", "any"],
+                },
+                "items": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                    },
+                },
+            },
+            "additionalProperties": False,
+        },
+    ],
+}
+
+
+CONDITION_GROUP_SCHEMA = {
+    "type": "object",
+    "required": ["mode", "items"],
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["all", "any"],
+        },
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": CONDITION_ITEM_SCHEMA,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+IF_CONDITIONS_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "condition", "yes_node_id", "no_node_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {
+            "type": "string",
+            "enum": ["if_conditions"],
+        },
+        "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+        },
+        "condition": CONDITION_GROUP_SCHEMA,
+        "yes_node_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+        "no_node_id": {
+            "type": "string",
+            "maxLength": 64,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 GO_TO_NODE_SCHEMA = {
     "type": "object",
     "required": ["id", "type", "label", "target_node_id"],
@@ -563,6 +706,7 @@ DRAFT_SCHEMA = {
                     WAIT_DURATION_NODE_SCHEMA,
                     IF_HAS_TAG_NODE_SCHEMA,
                     IF_MISSING_TAG_NODE_SCHEMA,
+                    IF_CONDITIONS_NODE_SCHEMA,
                     GO_TO_NODE_SCHEMA,
                     SEND_EMAIL_NODE_SCHEMA,
                     EMAIL_ENGAGEMENT_CONDITION_NODE_SCHEMA,
@@ -977,6 +1121,10 @@ def _published_entry(entry: JsonObj) -> JsonObj:
 def _validate_tag_condition_node(node: JsonObj, node_ids: set[str], label: str) -> None:
     if not node.get("draft_tag"):
         _validation_error("%s nodes must have draft tag configuration." % label)
+    _validate_branch_targets(node, node_ids, label)
+
+
+def _validate_branch_targets(node: JsonObj, node_ids: set[str], label: str) -> None:
     if not node.get("yes_node_id"):
         _validation_error("%s nodes must have a yes target." % label)
     if not node.get("no_node_id"):
@@ -987,6 +1135,53 @@ def _validate_tag_condition_node(node: JsonObj, node_ids: set[str], label: str) 
         _validation_error("%s no target must exist in the draft workflow." % label)
     if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
         _validation_error("%s nodes cannot target themselves." % label)
+
+
+def _validate_conditions_node(db: DB, automation: JsonObj, node: JsonObj, node_ids: set[str]) -> None:
+    _validate_branch_targets(node, node_ids, "If conditions")
+    condition = node.get("condition") or {}
+    mode = condition.get("mode")
+    if mode not in ("all", "any"):
+        _validation_error("If conditions nodes must use all or any mode.")
+    items = condition.get("items") or []
+    if not items:
+        _validation_error("If conditions nodes must contain at least one condition.")
+    if len(items) > 20:
+        _validation_error("If conditions nodes cannot contain more than 20 conditions.")
+
+    for index, item in enumerate(items):
+        item_type = item.get("type")
+        label = "If conditions item %s" % (index + 1)
+        if item_type == "group":
+            _validation_error("Nested condition groups are not supported yet.")
+        if item_type in ("has_tag", "missing_tag"):
+            if not (item.get("tag") or "").strip():
+                _validation_error("%s must select a tag." % label)
+        elif item_type in ("opened_email", "clicked_email"):
+            automation_email_id = item.get("automation_email_id")
+            if not automation_email_id:
+                _validation_error("%s must select an automation email." % label)
+            if not _automation_email_exists(
+                db,
+                automation.get("cid"),
+                automation.get("id"),
+                automation_email_id,
+            ):
+                _validation_error("%s must reference an email from this automation." % label)
+            if item_type == "clicked_email":
+                click_match = _automation_click_match_mode(item.get("click_match"))
+                if click_match not in ("any", "url_exact", "url_prefix"):
+                    _validation_error("%s has an unsupported click match mode." % label)
+                if click_match in ("url_exact", "url_prefix") and not _normalize_automation_click_url(item.get("link_url")):
+                    _validation_error("%s URL conditions must have a link URL." % label)
+        elif item_type in ("in_list", "not_in_list"):
+            list_id = item.get("list_id")
+            if not list_id:
+                _validation_error("%s must select a contact list." % label)
+            if db.lists.get(list_id) is None:
+                _validation_error("%s must reference a contact list from this account." % label)
+        else:
+            _validation_error("%s has an unsupported condition type." % label)
 
 
 def _duration_minutes(duration: JsonObj) -> int:
@@ -1053,7 +1248,7 @@ def _workflow_edges(nodes: list[JsonObj]) -> dict[str, list[str]]:
             edges[node_id] = []
         elif node_type == "go_to":
             edges[node_id] = [node.get("target_node_id")]
-        elif node_type in ("if_has_tag", "if_missing_tag", "if_opened_email", "if_clicked_email"):
+        elif node_type in ("if_has_tag", "if_missing_tag", "if_conditions", "if_opened_email", "if_clicked_email"):
             edges[node_id] = [node.get("yes_node_id"), node.get("no_node_id")]
         elif index + 1 < len(nodes):
             edges[node_id] = [nodes[index + 1].get("id")]
@@ -1102,6 +1297,19 @@ def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
             limit 1""",
             contact_id,
             tag,
+        )
+    )
+
+
+def _contact_is_in_list(db: DB, cid: str, contact_id: int, list_id: str) -> bool:
+    return bool(
+        db.single(
+            f"""select contact_id
+            from contacts."contact_lists_{cid}"
+            where contact_id = %s and list_id = %s
+            limit 1""",
+            contact_id,
+            list_id,
         )
     )
 
@@ -1408,6 +1616,8 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
             _validate_tag_condition_node(node, node_ids, "If has tag")
         if node.get("type") == "if_missing_tag":
             _validate_tag_condition_node(node, node_ids, "If missing tag")
+        if node.get("type") == "if_conditions":
+            _validate_conditions_node(db, automation, node, node_ids)
         if node.get("type") in ("if_opened_email", "if_clicked_email"):
             node_label = "If opened email" if node.get("type") == "if_opened_email" else "If clicked email"
             automation_email_id = node.get("automation_email_id")
@@ -4478,6 +4688,255 @@ class AutomationHistory(object):
         }
 
 
+def _automation_email_condition_metadata(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    automation_email_id: str,
+) -> JsonObj:
+    automation_email = _automation_email_obj(
+        db.row(
+            """
+            select id, cid, automation_id, data
+            from automation_emails
+            where cid = %s and automation_id = %s and id = %s
+            """,
+            cid,
+            automation_id,
+            automation_email_id,
+        )
+    )
+    if automation_email is None:
+        raise falcon.HTTPBadRequest(
+            title="Automation email is missing",
+            description="The published condition references an automation email that was not found.",
+        )
+    return automation_email
+
+
+def _automation_email_opened_for_enrolment(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    enrolment_id: str,
+    contact_id: int,
+    automation_email_id: str,
+) -> bool:
+    return bool(
+        db.single(
+            """
+            select true
+            from automation_email_events
+            where cid = %s
+                and automation_id = %s
+                and enrolment_id = %s
+                and contact_id = %s
+                and automation_email_id = %s
+                and event_type = 'open'
+            limit 1
+            """,
+            cid,
+            automation_id,
+            enrolment_id,
+            contact_id,
+            automation_email_id,
+        )
+    )
+
+
+def _automation_email_clicked_for_enrolment(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    enrolment_id: str,
+    contact_id: int,
+    automation_email_id: str,
+    click_match: str,
+    link_url: str | None,
+) -> tuple[bool, str]:
+    if click_match in ("url_exact", "url_prefix"):
+        normalized_link_url = _normalize_automation_click_url(link_url)
+        rows = db.execute(
+            """
+            select data->>'link_url'
+            from automation_email_events
+            where cid = %s
+                and automation_id = %s
+                and enrolment_id = %s
+                and contact_id = %s
+                and automation_email_id = %s
+                and event_type = 'click'
+            """,
+            cid,
+            automation_id,
+            enrolment_id,
+            contact_id,
+            automation_email_id,
+        ).fetchall()
+        for row in rows:
+            normalized_row_url = _normalize_automation_click_url(row[0])
+            if (
+                click_match == "url_exact"
+                and normalized_row_url == normalized_link_url
+            ) or (
+                click_match == "url_prefix"
+                and _automation_click_url_prefix_match(row[0], link_url)
+            ):
+                return True, row[0] or ""
+        return False, ""
+
+    return bool(
+        db.single(
+            """
+            select true
+            from automation_email_events
+            where cid = %s
+                and automation_id = %s
+                and enrolment_id = %s
+                and contact_id = %s
+                and automation_email_id = %s
+                and event_type = 'click'
+            limit 1
+            """,
+            cid,
+            automation_id,
+            enrolment_id,
+            contact_id,
+            automation_email_id,
+        )
+    ), ""
+
+
+def _evaluate_automation_condition_item(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    enrolment_id: str,
+    contact_id: int,
+    item: JsonObj,
+    index: int,
+) -> JsonObj:
+    item_type = item.get("type")
+    result = False
+    metadata: JsonObj = {
+        "index": index,
+        "type": item_type,
+    }
+
+    if item_type in ("has_tag", "missing_tag"):
+        tag = item.get("tag") or ""
+        has_tag = _contact_has_tag(db, cid, contact_id, tag)
+        result = has_tag if item_type == "has_tag" else not has_tag
+        metadata.update({"tag": tag, "has_tag": has_tag})
+    elif item_type in ("in_list", "not_in_list"):
+        list_id = item.get("list_id") or ""
+        in_list = _contact_is_in_list(db, cid, contact_id, list_id)
+        result = in_list if item_type == "in_list" else not in_list
+        metadata.update({"list_id": list_id, "in_list": in_list})
+    elif item_type == "opened_email":
+        automation_email_id = item.get("automation_email_id") or ""
+        automation_email = _automation_email_condition_metadata(db, cid, automation_id, automation_email_id)
+        result = _automation_email_opened_for_enrolment(
+            db,
+            cid,
+            automation_id,
+            enrolment_id,
+            contact_id,
+            automation_email_id,
+        )
+        metadata.update(
+            {
+                "automation_email_id": automation_email_id,
+                "automation_email_name": automation_email.get("name"),
+                "subject": automation_email.get("subject"),
+            }
+        )
+    elif item_type == "clicked_email":
+        automation_email_id = item.get("automation_email_id") or ""
+        automation_email = _automation_email_condition_metadata(db, cid, automation_id, automation_email_id)
+        raw_click_match = item.get("click_match") or "any"
+        click_match = _automation_click_match_mode(raw_click_match)
+        if click_match not in ("any", "url_exact", "url_prefix"):
+            raise falcon.HTTPBadRequest(
+                title="Automation condition is invalid",
+                description="The published clicked email condition has an unsupported click match mode.",
+            )
+        result, matched_link_url = _automation_email_clicked_for_enrolment(
+            db,
+            cid,
+            automation_id,
+            enrolment_id,
+            contact_id,
+            automation_email_id,
+            click_match,
+            item.get("link_url"),
+        )
+        metadata.update(
+            {
+                "automation_email_id": automation_email_id,
+                "automation_email_name": automation_email.get("name"),
+                "subject": automation_email.get("subject"),
+                "click_match": raw_click_match,
+                "effective_click_match": click_match,
+            }
+        )
+        if click_match in ("url_exact", "url_prefix"):
+            metadata["link_url"] = item.get("link_url") or ""
+            metadata["normalized_link_url"] = _normalize_automation_click_url(item.get("link_url"))
+            if matched_link_url:
+                metadata["matched_link_url"] = matched_link_url
+    else:
+        raise falcon.HTTPBadRequest(
+            title="Automation condition is invalid",
+            description="The published condition type is not supported.",
+        )
+
+    metadata["result"] = result
+    return metadata
+
+
+def _evaluate_automation_condition_group(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    enrolment_id: str,
+    contact_id: int,
+    condition: JsonObj,
+) -> JsonObj:
+    mode = condition.get("mode")
+    items = condition.get("items") or []
+    if mode not in ("all", "any") or not items:
+        raise falcon.HTTPBadRequest(
+            title="Automation condition is invalid",
+            description="The published condition group is not valid.",
+        )
+
+    evaluated = []
+    if mode == "all":
+        result = True
+        for index, item in enumerate(items):
+            item_result = _evaluate_automation_condition_item(db, cid, automation_id, enrolment_id, contact_id, item, index)
+            evaluated.append(item_result)
+            if not item_result["result"]:
+                result = False
+                break
+    else:
+        result = False
+        for index, item in enumerate(items):
+            item_result = _evaluate_automation_condition_item(db, cid, automation_id, enrolment_id, contact_id, item, index)
+            evaluated.append(item_result)
+            if item_result["result"]:
+                result = True
+                break
+
+    return {
+        "mode": mode,
+        "result": result,
+        "evaluated_count": len(evaluated),
+        "conditions": evaluated[:20],
+    }
+
+
 def _run_next_automation_enrolment(
     db: DB,
     cid: str,
@@ -4536,12 +4995,12 @@ def _run_next_automation_enrolment(
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_missing_tag", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
+        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_missing_tag", "if_conditions", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_missing_tag, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
+                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_missing_tag, if_conditions, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -4903,6 +5362,39 @@ def _run_next_automation_enrolment(
                     "result": result,
                     "branch": branch,
                     "target_node_id": target_node_id,
+                }
+            )
+            enrolment_update = {
+                "status": "ready",
+                "current_node_id": target_node_id,
+                "modified": now,
+            }
+        elif node_type == "if_conditions":
+            group_result = _evaluate_automation_condition_group(
+                db,
+                cid,
+                id,
+                enrolment_id,
+                enrolment["contact_id"],
+                node.get("condition") or {},
+            )
+            branch = "yes" if group_result["result"] else "no"
+            target_node_id = node.get("yes_node_id") if group_result["result"] else node.get("no_node_id")
+            if _node_by_id(nodes, target_node_id) is None:
+                raise falcon.HTTPBadRequest(
+                    title="Automation branch target is missing",
+                    description="The published if_conditions %s target was not found in the published workflow." % branch,
+                )
+
+            success_data.update(
+                {
+                    "action": "if_conditions",
+                    "mode": group_result["mode"],
+                    "result": group_result["result"],
+                    "branch": branch,
+                    "target_node_id": target_node_id,
+                    "evaluated_count": group_result["evaluated_count"],
+                    "conditions": group_result["conditions"],
                 }
             )
             enrolment_update = {

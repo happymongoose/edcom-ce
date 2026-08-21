@@ -37,6 +37,9 @@ export function automationNodeTypeLabel(type) {
   if (type === 'if_clicked_email') {
     return 'If clicked email';
   }
+  if (type === 'if_conditions') {
+    return 'If conditions';
+  }
   if (type === 'go_to') {
     return 'Go to';
   }
@@ -109,6 +112,7 @@ export function automationAddNodeMenuItems(hasEmails, hasLists) {
     {type: 'exit', label: 'Add Exit Node'},
     {type: 'go_to', label: 'Go To Node'},
     {type: 'if_clicked_email', label: 'If Clicked Email Node', disabled: !hasEmails},
+    {type: 'if_conditions', label: 'If Conditions Node'},
     {type: 'if_missing_tag', label: 'If Contact Does Not Have Tag Node'},
     {type: 'if_has_tag', label: 'If Has Tag Node'},
     {type: 'if_opened_email', label: 'If Opened Email Node', disabled: !hasEmails},
@@ -117,6 +121,49 @@ export function automationAddNodeMenuItems(hasEmails, hasLists) {
     {type: 'send_email', label: 'Send Email Node', disabled: !hasEmails},
     {type: 'wait_duration', label: 'Wait Duration Node'},
   ], item => item.label.toLowerCase());
+}
+
+export function automationConditionItemTypeLabel(type) {
+  if (type === 'has_tag') {
+    return 'Has tag';
+  }
+  if (type === 'missing_tag') {
+    return 'Missing tag';
+  }
+  if (type === 'opened_email') {
+    return 'Opened email';
+  }
+  if (type === 'clicked_email') {
+    return 'Clicked email';
+  }
+  if (type === 'in_list') {
+    return 'In list';
+  }
+  if (type === 'not_in_list') {
+    return 'Not in list';
+  }
+  return 'Unsupported condition';
+}
+
+export function createAutomationConditionItem(type, options) {
+  const opts = options || {};
+  const emails = opts.emails || [];
+  const lists = opts.lists || [];
+  if (type === 'opened_email') {
+    return {type: type, automation_email_id: emails.length ? emails[0].id : ''};
+  }
+  if (type === 'clicked_email') {
+    return {
+      type: type,
+      automation_email_id: emails.length ? emails[0].id : '',
+      click_match: 'any',
+      link_url: '',
+    };
+  }
+  if (type === 'in_list' || type === 'not_in_list') {
+    return {type: type, list_id: lists.length ? lists[0].id : ''};
+  }
+  return {type: type, tag: ''};
 }
 
 function optionName(options, id) {
@@ -147,6 +194,38 @@ function durationSummary(duration) {
     parts.push(minutes + ' ' + (minutes === 1 ? 'minute' : 'minutes'));
   }
   return parts.length ? parts.join(' ') : 'Wait duration incomplete';
+}
+
+function conditionItemSummary(item, options) {
+  const opts = options || {};
+  const emailOptions = automationEmailOptions(opts.emails || []);
+  const listOptions = automationListOptions(opts.lists || []);
+  if (item.type === 'has_tag') {
+    return 'has tag ' + (item.tag || 'No tag selected');
+  }
+  if (item.type === 'missing_tag') {
+    return 'missing tag ' + (item.tag || 'No tag selected');
+  }
+  if (item.type === 'opened_email') {
+    return 'opened ' + (item.automation_email_id ? (optionName(emailOptions, item.automation_email_id) || 'Selected email not found') : 'No email selected');
+  }
+  if (item.type === 'clicked_email') {
+    const clickMatch = automationClickMatchValue(item);
+    let clickSummary = 'any link';
+    if (clickMatch === 'url_exact') {
+      clickSummary = 'exact URL ' + (item.link_url || 'No URL entered');
+    } else if (clickMatch === 'url_prefix') {
+      clickSummary = 'URL starts with ' + (item.link_url || 'No URL entered');
+    }
+    return 'clicked ' + clickSummary + ' in ' + (item.automation_email_id ? (optionName(emailOptions, item.automation_email_id) || 'Selected email not found') : 'No email selected');
+  }
+  if (item.type === 'in_list') {
+    return 'in list ' + (item.list_id ? (optionName(listOptions, item.list_id) || 'Selected list not found') : 'No list selected');
+  }
+  if (item.type === 'not_in_list') {
+    return 'not in list ' + (item.list_id ? (optionName(listOptions, item.list_id) || 'Selected list not found') : 'No list selected');
+  }
+  return 'Unsupported condition';
 }
 
 export function automationNodeSummary(node, options) {
@@ -209,6 +288,21 @@ export function automationNodeSummary(node, options) {
       ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
       ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
   }
+  if (node.type === 'if_conditions') {
+    const condition = node.condition || {};
+    const items = condition.items || [];
+    const mode = condition.mode === 'any' ? 'Any' : 'All';
+    if (!items.length) {
+      return mode + ' of 0 conditions: No conditions configured' +
+        ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
+        ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
+    }
+    const preview = _.map(items.slice(0, 2), item => conditionItemSummary(item, opts)).join(' | ');
+    return mode + ' of ' + items.length + ' condition' + (items.length === 1 ? '' : 's') +
+      ': ' + preview + (items.length > 2 ? ' | ...' : '') +
+      ' | Yes -> ' + targetSummary(nodes, node, node.yes_node_id) +
+      ' | No -> ' + targetSummary(nodes, node, node.no_node_id);
+  }
   if (node.type === 'go_to') {
     return 'Go to: ' + targetSummary(nodes, node, node.target_node_id);
   }
@@ -220,6 +314,7 @@ export function automationNodeSummaryWarning(summary) {
     summary.indexOf('No tag selected') !== -1 ||
     summary.indexOf('No email selected') !== -1 ||
     summary.indexOf('No list selected') !== -1 ||
+    summary.indexOf('No conditions configured') !== -1 ||
     summary.indexOf('No URL entered') !== -1 ||
     summary.indexOf('Selected email not found') !== -1 ||
     summary.indexOf('Selected list not found') !== -1 ||
@@ -235,7 +330,7 @@ export function createAutomationNode(type, options) {
   const node = {
     id: generateId(),
     type: type,
-    label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_missing_tag' ? 'If contact does not have tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
+    label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_missing_tag' ? 'If contact does not have tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'if_conditions' ? 'If conditions' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
   };
 
   if (type === 'add_tag' || type === 'remove_tag') {
@@ -254,6 +349,14 @@ export function createAutomationNode(type, options) {
       node.click_match = 'any';
       node.link_url = '';
     }
+  }
+  if (type === 'if_conditions') {
+    node.condition = {
+      mode: 'all',
+      items: [createAutomationConditionItem('has_tag', opts)],
+    };
+    node.yes_node_id = '';
+    node.no_node_id = '';
   }
   if (type === 'wait_duration') {
     node.duration = {
@@ -322,6 +425,17 @@ class AutomationWorkflowEditor extends Component {
         node.automation_email_id
       ) {
         this.loadAutomationEmailLinks(node.automation_email_id);
+      }
+      if (this.state.expandedNodeIds[node.id] && node.type === 'if_conditions') {
+        _.each(((node.condition || {}).items || []), item => {
+          if (
+            item.type === 'clicked_email' &&
+            automationClickMatchValue(item) !== 'any' &&
+            item.automation_email_id
+          ) {
+            this.loadAutomationEmailLinks(item.automation_email_id);
+          }
+        });
       }
     });
   }
@@ -425,6 +539,101 @@ class AutomationWorkflowEditor extends Component {
     });
   }
 
+  conditionModeChange = (index, event) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            condition: {
+              mode: {$set: getvalue(event)},
+            },
+          },
+        },
+      },
+    });
+  }
+
+  conditionItemChange = (index, itemIndex, event) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            condition: {
+              items: {
+                [itemIndex]: {
+                  [event.target.id]: {$set: getvalue(event)},
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  conditionItemTypeChange = (index, itemIndex, event) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            condition: {
+              items: {
+                [itemIndex]: {$set: createAutomationConditionItem(getvalue(event), {
+                  emails: this.props.emails || [],
+                  lists: this.props.lists || [],
+                })},
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  conditionItemTagChange = (index, itemIndex, event) => {
+    this.conditionItemChange(index, itemIndex, {
+      target: {
+        id: 'tag',
+        value: event.params.data.id,
+      },
+    });
+  }
+
+  addConditionItem = index => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            condition: {
+              items: {
+                $push: [createAutomationConditionItem('has_tag', {
+                  emails: this.props.emails || [],
+                  lists: this.props.lists || [],
+                })],
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  removeConditionItem = (index, itemIndex) => {
+    this.props.update({
+      draft: {
+        nodes: {
+          [index]: {
+            condition: {
+              items: {
+                $splice: [[itemIndex, 1]],
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
   addNode = (type, afterIndex) => {
     const node = createAutomationNode(type, {
       emails: this.props.emails || [],
@@ -488,7 +697,8 @@ class AutomationWorkflowEditor extends Component {
     const tags = this.props.tags || [];
     const nodes = this.props.nodes || [];
     const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag', 'if_missing_tag'], node.type) && node.draft_tag), 'draft_tag');
-    return _.map(_.uniq(tags.concat(draftTags).concat(this.props.entryTags || [])), tag => ({id: tag, text: tag}));
+    const conditionTags = _.flatten(_.map(nodes, node => _.map(((node.condition || {}).items || []), item => item.tag || '')));
+    return _.map(_.uniq(tags.concat(draftTags).concat(conditionTags).concat(this.props.entryTags || [])), tag => tag).filter(Boolean).map(tag => ({id: tag, text: tag}));
   }
 
   nodeTargetOptions(node) {
@@ -754,6 +964,55 @@ class AutomationWorkflowEditor extends Component {
       );
     }
 
+    if (node.type === 'if_conditions') {
+      const condition = node.condition || {mode: 'all', items: []};
+      const items = condition.items || [];
+      return (
+        <div style={{minWidth: '320px'}}>
+          <label className="control-label" htmlFor="mode">Match</label>
+          <FormControl
+            id="mode"
+            componentClass="select"
+            value={condition.mode || 'all'}
+            onChange={this.conditionModeChange.bind(this, index)}
+          >
+            <option value="all">All conditions</option>
+            <option value="any">Any condition</option>
+          </FormControl>
+          <div className="space-top-sm">
+            {
+              _.map(items, (item, itemIndex) => this.renderConditionItem(node, index, item, itemIndex))
+            }
+          </div>
+          <Button
+            bsSize="small"
+            onClick={this.addConditionItem.bind(this, index)}
+            disabled={items.length >= 20}
+          >
+            Add condition
+          </Button>
+          <div className="space-top-sm">
+            <SelectLabel
+              id="yes_node_id"
+              label="Yes target"
+              obj={node}
+              onChange={this.nodeTargetChange.bind(this, index)}
+              options={this.nodeTargetOptions(node)}
+              emptyVal="Select target"
+            />
+            <SelectLabel
+              id="no_node_id"
+              label="No target"
+              obj={node}
+              onChange={this.nodeTargetChange.bind(this, index)}
+              options={this.nodeTargetOptions(node)}
+              emptyVal="Select target"
+            />
+          </div>
+        </div>
+      );
+    }
+
     if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
       const options = automationListOptions(this.props.lists || []);
       if (!options.length) {
@@ -778,6 +1037,200 @@ class AutomationWorkflowEditor extends Component {
     }
 
     return null;
+  }
+
+  renderConditionItem(node, index, item, itemIndex) {
+    const emailOptions = automationEmailOptions(this.props.emails || []);
+    const listOptions = automationListOptions(this.props.lists || []);
+    const clickMatch = automationClickMatchValue(item);
+    const discoveredLinks = item.automation_email_id ?
+      (this.state.emailLinksById[item.automation_email_id] || []) :
+      [];
+    const selectedDiscoveredLink = _.find(discoveredLinks, link => link.normalized_url === (item.link_url || ''));
+
+    return (
+      <div
+        key={itemIndex}
+        style={{
+          border: '1px solid #e3e8f0',
+          borderRadius: '4px',
+          padding: '12px',
+          marginBottom: '10px',
+          background: '#fbfcfe',
+        }}
+      >
+        <div className="row">
+          <div className="col-sm-3">
+            <label className="control-label" htmlFor="type">Condition</label>
+            <FormControl
+              id="type"
+              componentClass="select"
+              value={item.type || 'has_tag'}
+              onChange={this.conditionItemTypeChange.bind(this, index, itemIndex)}
+            >
+              <option value="clicked_email">Clicked email</option>
+              <option value="has_tag">Has tag</option>
+              <option value="in_list">In list</option>
+              <option value="missing_tag">Missing tag</option>
+              <option value="not_in_list">Not in list</option>
+              <option value="opened_email">Opened email</option>
+            </FormControl>
+          </div>
+          <div className="col-sm-7">
+            {this.renderConditionItemFields(index, itemIndex, item, emailOptions, listOptions, clickMatch, discoveredLinks, selectedDiscoveredLink)}
+          </div>
+          <div className="col-sm-2">
+            <label className="control-label">&nbsp;</label>
+            <Button
+              bsSize="small"
+              onClick={this.removeConditionItem.bind(this, index, itemIndex)}
+              disabled={((node.condition || {}).items || []).length <= 1}
+              block
+            >
+              Remove
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  renderConditionItemFields(index, itemIndex, item, emailOptions, listOptions, clickMatch, discoveredLinks, selectedDiscoveredLink) {
+    if (item.type === 'has_tag' || item.type === 'missing_tag') {
+      return (
+        <div>
+          <label className="control-label">Tag</label>
+          <Select2
+            data={this.tagData()}
+            value={item.tag || ''}
+            onSelect={this.conditionItemTagChange.bind(this, index, itemIndex)}
+            style={{width:'100%'}}
+            options={{
+              placeholder: 'Select or create tag',
+              tags: true,
+              createTag: function (params) {
+                const fixed = fixTag(params.term);
+                if (!fixed) {
+                  return null;
+                }
+                return {
+                  id: fixed,
+                  text: fixed,
+                };
+              }
+            }}
+          />
+        </div>
+      );
+    }
+
+    if (item.type === 'in_list' || item.type === 'not_in_list') {
+      if (!listOptions.length) {
+        return <p className="help-block">Create a contact list before configuring this condition.</p>;
+      }
+      return (
+        <SelectLabel
+          id="list_id"
+          label="Contact list"
+          obj={item}
+          onChange={this.conditionItemChange.bind(this, index, itemIndex)}
+          options={listOptions}
+          emptyVal="Select list"
+        />
+      );
+    }
+
+    if (item.type === 'opened_email' || item.type === 'clicked_email') {
+      if (!emailOptions.length) {
+        return <p className="help-block">Create an automation email before configuring this condition.</p>;
+      }
+      return (
+        <div>
+          <SelectLabel
+            id="automation_email_id"
+            label="Automation email"
+            obj={item}
+            onChange={this.conditionItemChange.bind(this, index, itemIndex)}
+            options={emailOptions}
+            emptyVal="Select email"
+          />
+          {
+            item.type === 'clicked_email' ?
+              <div>
+                <label className="control-label" htmlFor="click_match">Click match</label>
+                <FormControl
+                  id="click_match"
+                  componentClass="select"
+                  value={clickMatch}
+                  onChange={this.conditionItemChange.bind(this, index, itemIndex)}
+                >
+                  <option value="any">Any link</option>
+                  <option value="url_exact">Specific URL</option>
+                  <option value="url_prefix">URL starts with</option>
+                </FormControl>
+                {
+                  clickMatch !== 'any' ?
+                    <div className="space-top-sm">
+                      <label className="control-label" htmlFor="discovered_link_url">Discovered links</label>
+                      {
+                        item.automation_email_id && this.state.emailLinksLoading[item.automation_email_id] ?
+                          <p className="help-block">Loading discovered links...</p>
+                        :
+                          null
+                      }
+                      {
+                        item.automation_email_id && this.state.emailLinksError[item.automation_email_id] ?
+                          <p className="help-block text-danger">{this.state.emailLinksError[item.automation_email_id]}</p>
+                        :
+                          null
+                      }
+                      <FormControl
+                        id="discovered_link_url"
+                        componentClass="select"
+                        value={selectedDiscoveredLink ? item.link_url || '' : ''}
+                        onChange={event => {
+                          if (event.target.value) {
+                            this.conditionItemChange(index, itemIndex, {
+                              target: {id: 'link_url', value: event.target.value},
+                            });
+                          }
+                        }}
+                        disabled={!discoveredLinks.length}
+                      >
+                        <option value="">
+                          {discoveredLinks.length ? 'Select discovered URL' : 'No links discovered'}
+                        </option>
+                        {
+                          _.map(discoveredLinks, link => (
+                            <option key={link.normalized_url + '-' + link.tracked} value={link.normalized_url}>
+                              {link.display_url || link.normalized_url}
+                              {link.occurrence_count > 1 ? ' (' + link.occurrence_count + ')' : ''}
+                              {link.tracked === false ? ' - untracked' : ''}
+                            </option>
+                          ))
+                        }
+                      </FormControl>
+                      <label className="control-label" htmlFor="link_url">URL</label>
+                      <FormControl
+                        id="link_url"
+                        type="text"
+                        value={item.link_url || ''}
+                        onChange={this.conditionItemChange.bind(this, index, itemIndex)}
+                        placeholder="https://example.com/page"
+                      />
+                    </div>
+                  :
+                    null
+                }
+              </div>
+            :
+              null
+          }
+        </div>
+      );
+    }
+
+    return <p className="help-block text-danger">Unsupported condition type</p>;
   }
 
   renderNodeDetails(node, index) {

@@ -22,6 +22,7 @@ import {
   automationAddNodeMenuItems,
   appendAutomationNode,
   automationClickMatchValue,
+  createAutomationConditionItem,
   automationNodeSummary,
   automationNodeSummaryWarning,
   automationNodeTargetOptions,
@@ -76,6 +77,41 @@ describe('automation enrolment display helpers', () => {
       yes_node_id: '',
       no_node_id: '',
     });
+  });
+
+  it('creates compound condition nodes with a flat all group by default', () => {
+    const updated = appendAutomationNode([], 'if_conditions', {generateId: () => 'compound-node'});
+
+    expect(updated[0]).toEqual({
+      id: 'compound-node',
+      type: 'if_conditions',
+      label: 'If conditions',
+      condition: {
+        mode: 'all',
+        items: [
+          {type: 'has_tag', tag: ''},
+        ],
+      },
+      yes_node_id: '',
+      no_node_id: '',
+    });
+  });
+
+  it('creates compound condition items for tag email click and list conditions', () => {
+    const options = {
+      emails: [{id: 'email-1'}],
+      lists: [{id: 'list-1'}],
+    };
+
+    expect(createAutomationConditionItem('missing_tag', options)).toEqual({type: 'missing_tag', tag: ''});
+    expect(createAutomationConditionItem('opened_email', options)).toEqual({type: 'opened_email', automation_email_id: 'email-1'});
+    expect(createAutomationConditionItem('clicked_email', options)).toEqual({
+      type: 'clicked_email',
+      automation_email_id: 'email-1',
+      click_match: 'any',
+      link_url: '',
+    });
+    expect(createAutomationConditionItem('not_in_list', options)).toEqual({type: 'not_in_list', list_id: 'list-1'});
   });
 
   it('inserts workflow nodes after a step without rewriting branch targets', () => {
@@ -248,6 +284,33 @@ describe('automation enrolment display helpers', () => {
     );
     expect(automationNodeSummary(nodes[1], {nodes: nodes, emails: emails})).toBe(
       'If clicked any link: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+    );
+  });
+
+  it('summarizes compound conditions compactly', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const lists = [{id: 'list-1', name: 'Customers', count: 2}];
+    const nodes = [
+      {
+        id: 'compound',
+        type: 'if_conditions',
+        condition: {
+          mode: 'all',
+          items: [
+            {type: 'has_tag', tag: 'vip'},
+            {type: 'clicked_email', automation_email_id: 'email-1', click_match: 'url_prefix', link_url: 'https://example.com/offer'},
+            {type: 'not_in_list', list_id: 'list-1'},
+          ],
+        },
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails, lists: lists})).toBe(
+      'All of 3 conditions: has tag vip | clicked URL starts with https://example.com/offer in Welcome - Hello (HTML) | ... | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
     );
   });
 
