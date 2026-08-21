@@ -2229,7 +2229,7 @@ class AutomationWorkflowEditor extends Component {
               left: '50%',
               top: 0,
               width: '2px',
-              height: '20px',
+              height: '31px',
               marginLeft: '-1px',
               background: connectorColor,
             }}
@@ -2240,7 +2240,7 @@ class AutomationWorkflowEditor extends Component {
               position: 'absolute',
               left: 'calc(25% - 3.5px)',
               right: 'calc(25% - 3.5px)',
-              top: '20px',
+              top: '31px',
               height: '2px',
               background: connectorColor,
             }}
@@ -2257,16 +2257,9 @@ class AutomationWorkflowEditor extends Component {
                     display: 'flex',
                     flexDirection: 'column',
                     alignItems: 'center',
+                    paddingTop: '20px',
                   }}
                 >
-                  <div
-                    aria-hidden="true"
-                    style={{
-                      width: '2px',
-                      height: '20px',
-                      background: connectorColor,
-                    }}
-                  />
                   <div
                     style={{
                       position: 'relative',
