@@ -381,6 +381,7 @@ export function automationWorkflowPreviewItems(nodes, options) {
       summary: summary,
       warning: automationNodeSummaryWarning(summary),
       connections: [],
+      linear_continuation: false,
       terminal_label: '',
     };
 
@@ -409,6 +410,7 @@ export function automationWorkflowPreviewItems(nodes, options) {
         label: 'Next',
         target: automationPreviewTarget(workflowNodes, workflowNodes[index + 1].id),
       });
+      item.linear_continuation = true;
     } else {
       item.terminal_label = 'Completes automation';
     }
@@ -1528,6 +1530,8 @@ class AutomationWorkflowEditor extends Component {
 
   renderPreviewConnection(connection) {
     const target = connection.target || {};
+    const isGoTo = connection.kind === 'go_to';
+    const isBranch = connection.kind === 'branch';
     return (
       <div
         key={connection.label + '-' + (target.id || 'missing')}
@@ -1545,8 +1549,8 @@ class AutomationWorkflowEditor extends Component {
             minWidth: '48px',
             padding: '3px 8px',
             borderRadius: '12px',
-            background: connection.label === 'No' ? '#fff1f1' : connection.label === 'Yes' ? '#eefaf1' : '#eef2f8',
-            color: connection.label === 'No' ? '#a94442' : connection.label === 'Yes' ? '#2f7d46' : '#46566d',
+            background: connection.label === 'No' ? '#fff1f1' : connection.label === 'Yes' ? '#eefaf1' : isGoTo ? '#fff7e6' : '#eef2f8',
+            color: connection.label === 'No' ? '#a94442' : connection.label === 'Yes' ? '#2f7d46' : isGoTo ? '#8a5a00' : '#46566d',
             fontWeight: 700,
             fontSize: '12px',
             textAlign: 'center',
@@ -1561,12 +1565,102 @@ class AutomationWorkflowEditor extends Component {
             borderRadius: '4px',
             background: target.missing ? '#f8eeee' : '#f6f8fb',
             color: target.missing ? '#a94442' : '#334155',
-            border: '1px solid ' + (target.missing ? '#ebcccc' : '#dfe5ef'),
+            border: (isGoTo && !target.missing ? '1px dashed #d79a25' : '1px solid ' + (target.missing ? '#ebcccc' : '#dfe5ef')),
             fontSize: '13px',
           }}
         >
-          {target.label}{target.type_label ? ' (' + target.type_label + ')' : ''}
+          {isGoTo ? 'Jump to ' : ''}{target.label}{target.type_label ? ' (' + target.type_label + ')' : ''}
         </span>
+        {
+          isBranch && !target.missing ?
+            <span className="text-muted" style={{fontSize: '12px'}}>branch target</span>
+          :
+            null
+        }
+      </div>
+    );
+  }
+
+  renderPreviewConnectionPanel(item) {
+    if (!item.connections.length) {
+      return (
+        <div
+          style={{
+            marginTop: '12px',
+            paddingLeft: '46px',
+            color: '#6b7280',
+            fontSize: '13px',
+            fontWeight: 600,
+          }}
+        >
+          {item.terminal_label}
+        </div>
+      );
+    }
+
+    if (_.every(item.connections, connection => connection.kind === 'branch')) {
+      return (
+        <div
+          style={{
+            marginTop: '14px',
+            padding: '12px',
+            borderRadius: '6px',
+            background: '#f8fafc',
+            border: '1px solid #e5ebf3',
+          }}
+        >
+          <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '8px'}}>
+            Branches
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+              gap: '10px',
+            }}
+          >
+            {
+              _.map(item.connections, connection => (
+                <div
+                  key={connection.label}
+                  style={{
+                    border: '1px solid ' + (connection.target.missing ? '#ebcccc' : '#dfe5ef'),
+                    borderRadius: '6px',
+                    padding: '8px 10px',
+                    background: connection.target.missing ? '#fffafa' : '#fff',
+                  }}
+                >
+                  {this.renderPreviewConnection(connection)}
+                </div>
+              ))
+            }
+          </div>
+        </div>
+      );
+    }
+
+    if (_.every(item.connections, connection => connection.kind === 'go_to')) {
+      return (
+        <div
+          style={{
+            marginTop: '14px',
+            padding: '12px',
+            borderRadius: '6px',
+            background: '#fffaf0',
+            border: '1px dashed #d79a25',
+          }}
+        >
+          <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>
+            Jump
+          </div>
+          {_.map(item.connections, connection => this.renderPreviewConnection(connection))}
+        </div>
+      );
+    }
+
+    return (
+      <div style={{marginTop: '12px', paddingLeft: '46px'}}>
+        {_.map(item.connections, connection => this.renderPreviewConnection(connection))}
       </div>
     );
   }
@@ -1673,27 +1767,10 @@ class AutomationWorkflowEditor extends Component {
                     Edit in list
                   </Button>
                 </div>
-                {
-                  item.connections.length ?
-                    <div style={{marginTop: '12px', paddingLeft: '46px'}}>
-                      {_.map(item.connections, connection => this.renderPreviewConnection(connection))}
-                    </div>
-                  :
-                    <div
-                      style={{
-                        marginTop: '12px',
-                        paddingLeft: '46px',
-                        color: '#6b7280',
-                        fontSize: '13px',
-                        fontWeight: 600,
-                      }}
-                    >
-                      {item.terminal_label}
-                    </div>
-                }
+                {this.renderPreviewConnectionPanel(item)}
               </div>
               {
-                item.step < items.length ?
+                item.linear_continuation ?
                   <div
                     aria-hidden="true"
                     style={{

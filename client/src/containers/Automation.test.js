@@ -389,13 +389,49 @@ describe('automation enrolment display helpers', () => {
         },
       },
     ]);
+    expect(items[0].linear_continuation).toBe(true);
     expect(_.pluck(items[1].connections, 'label')).toEqual(['Yes', 'No']);
+    expect(items[1].linear_continuation).toBe(false);
     expect(items[1].connections[0].target.label).toBe('Step 3 - Go to exit');
     expect(items[1].connections[1].target.label).toBe('Step 4 - Exit');
+    expect(items[2].connections[0].kind).toBe('go_to');
     expect(items[2].connections[0].label).toBe('Go to');
     expect(items[2].connections[0].target.label).toBe('Step 4 - Exit');
+    expect(items[2].linear_continuation).toBe(false);
     expect(items[3].connections).toEqual([]);
     expect(items[3].terminal_label).toBe('Terminal exit');
+    expect(items[3].linear_continuation).toBe(false);
+  });
+
+  it('keeps branch-to-next-step as a labelled branch instead of linear continuation', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'later'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target', draft_tag: 'yes'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait'},
+      {id: 'later', type: 'exit', label: 'No target'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {});
+
+    expect(items[0].connections).toHaveLength(2);
+    expect(_.pluck(items[0].connections, 'kind')).toEqual(['branch', 'branch']);
+    expect(items[0].connections[0].label).toBe('Yes');
+    expect(items[0].connections[0].target.label).toBe('Step 2 - Yes target');
+    expect(items[0].connections[1].label).toBe('No');
+    expect(items[0].connections[1].target.label).toBe('Step 4 - No target');
+    expect(items[0].linear_continuation).toBe(false);
+  });
+
+  it('marks final non-exit preview nodes as completion without continuation', () => {
+    const nodes = [
+      {id: 'tag', type: 'add_tag', label: 'Add tag', draft_tag: 'done'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {});
+
+    expect(items[0].connections).toEqual([]);
+    expect(items[0].terminal_label).toBe('Completes automation');
+    expect(items[0].linear_continuation).toBe(false);
   });
 
   it('marks missing visual preview targets as warnings', () => {
