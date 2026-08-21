@@ -1678,7 +1678,12 @@ class AutomationWorkflowEditor extends Component {
         </div>
         {
           _.map(items, item => (
-            <div key={item.id}>
+            <div
+              key={item.id}
+              style={{
+                marginBottom: item.step < items.length && !item.linear_continuation ? '18px' : 0,
+              }}
+            >
               <div
                 style={{
                   border: '1px solid ' + (item.warning ? '#ebcccc' : '#dfe5ef'),
