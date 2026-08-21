@@ -1,6 +1,6 @@
 import React, { Component } from "react";
 import axios from "axios";
-import { Button, DropdownButton, FormControl, MenuItem } from "react-bootstrap";
+import { Button, ButtonGroup, DropdownButton, FormControl, MenuItem } from "react-bootstrap";
 import _ from "underscore";
 import shortid from "shortid";
 import Select2 from "react-select2-wrapper";
@@ -322,6 +322,105 @@ export function automationNodeSummaryWarning(summary) {
     summary.indexOf('Wait duration incomplete') !== -1;
 }
 
+function automationBranchNode(type) {
+  return _.contains([
+    'if_has_tag',
+    'if_missing_tag',
+    'if_opened_email',
+    'if_clicked_email',
+    'if_conditions',
+  ], type);
+}
+
+function automationPreviewTarget(nodes, id) {
+  if (!id) {
+    return {
+      id: '',
+      missing: true,
+      label: 'Target missing',
+      step: null,
+      type_label: '',
+    };
+  }
+  const targetIndex = _.findIndex(nodes || [], node => node.id === id);
+  if (targetIndex === -1) {
+    return {
+      id: id,
+      missing: true,
+      label: 'Target missing',
+      step: null,
+      type_label: '',
+    };
+  }
+  const target = nodes[targetIndex];
+  return {
+    id: target.id,
+    missing: false,
+    label: 'Step ' + (targetIndex + 1) + ' - ' +
+      (target.label || automationNodeTypeLabel(target.type)),
+    step: targetIndex + 1,
+    type_label: automationNodeTypeLabel(target.type),
+  };
+}
+
+export function automationWorkflowPreviewItems(nodes, options) {
+  const workflowNodes = nodes || [];
+  const opts = {
+    ...(options || {}),
+    nodes: workflowNodes,
+  };
+
+  return _.map(workflowNodes, (node, index) => {
+    const summary = automationNodeSummary(node, opts);
+    const item = {
+      id: node.id,
+      node: node,
+      step: index + 1,
+      type: node.type,
+      type_label: automationNodeTypeLabel(node.type),
+      summary: summary,
+      warning: automationNodeSummaryWarning(summary),
+      connections: [],
+      terminal_label: '',
+    };
+
+    if (node.type === 'exit') {
+      item.terminal_label = 'Terminal exit';
+    } else if (node.type === 'go_to') {
+      item.connections.push({
+        kind: 'go_to',
+        label: 'Go to',
+        target: automationPreviewTarget(workflowNodes, node.target_node_id),
+      });
+    } else if (automationBranchNode(node.type)) {
+      item.connections.push({
+        kind: 'branch',
+        label: 'Yes',
+        target: automationPreviewTarget(workflowNodes, node.yes_node_id),
+      });
+      item.connections.push({
+        kind: 'branch',
+        label: 'No',
+        target: automationPreviewTarget(workflowNodes, node.no_node_id),
+      });
+    } else if (workflowNodes[index + 1]) {
+      item.connections.push({
+        kind: 'linear',
+        label: 'Next',
+        target: automationPreviewTarget(workflowNodes, workflowNodes[index + 1].id),
+      });
+    } else {
+      item.terminal_label = 'Completes automation';
+    }
+
+    if (_.some(item.connections, connection => connection.target.missing)) {
+      item.warning = true;
+    }
+
+    return item;
+  });
+}
+
 export function createAutomationNode(type, options) {
   const opts = options || {};
   const emails = opts.emails || [];
@@ -406,6 +505,7 @@ class AutomationWorkflowEditor extends Component {
     emailLinksById: {},
     emailLinksLoading: {},
     emailLinksError: {},
+    workflowView: 'edit',
   }
 
   componentDidMount() {
@@ -679,6 +779,22 @@ class AutomationWorkflowEditor extends Component {
       expandedNodeIds: {
         ...this.state.expandedNodeIds,
         [node.id]: !this.state.expandedNodeIds[node.id],
+      },
+    });
+  }
+
+  showWorkflowView = view => {
+    this.setState({
+      workflowView: view,
+    });
+  }
+
+  editPreviewNode = node => {
+    this.setState({
+      workflowView: 'edit',
+      expandedNodeIds: {
+        ...this.state.expandedNodeIds,
+        [node.id]: true,
       },
     });
   }
@@ -1410,13 +1526,219 @@ class AutomationWorkflowEditor extends Component {
     );
   }
 
+  renderPreviewConnection(connection) {
+    const target = connection.target || {};
+    return (
+      <div
+        key={connection.label + '-' + (target.id || 'missing')}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          flexWrap: 'wrap',
+          marginTop: '8px',
+        }}
+      >
+        <span
+          style={{
+            display: 'inline-block',
+            minWidth: '48px',
+            padding: '3px 8px',
+            borderRadius: '12px',
+            background: connection.label === 'No' ? '#fff1f1' : connection.label === 'Yes' ? '#eefaf1' : '#eef2f8',
+            color: connection.label === 'No' ? '#a94442' : connection.label === 'Yes' ? '#2f7d46' : '#46566d',
+            fontWeight: 700,
+            fontSize: '12px',
+            textAlign: 'center',
+          }}
+        >
+          {connection.label}
+        </span>
+        <span
+          style={{
+            display: 'inline-block',
+            padding: '5px 9px',
+            borderRadius: '4px',
+            background: target.missing ? '#f8eeee' : '#f6f8fb',
+            color: target.missing ? '#a94442' : '#334155',
+            border: '1px solid ' + (target.missing ? '#ebcccc' : '#dfe5ef'),
+            fontSize: '13px',
+          }}
+        >
+          {target.label}{target.type_label ? ' (' + target.type_label + ')' : ''}
+        </span>
+      </div>
+    );
+  }
+
+  renderWorkflowPreview(nodes) {
+    const items = automationWorkflowPreviewItems(nodes, {
+      emails: this.props.emails || [],
+      lists: this.props.lists || [],
+    });
+
+    return (
+      <div style={{marginTop: '18px'}}>
+        <div className="help-block" style={{marginBottom: '12px'}}>
+          Read-only preview of the draft workflow. Edit nodes in the list view.
+        </div>
+        {
+          _.map(items, item => (
+            <div key={item.id}>
+              <div
+                style={{
+                  border: '1px solid ' + (item.warning ? '#ebcccc' : '#dfe5ef'),
+                  borderRadius: '6px',
+                  background: item.warning ? '#fffafa' : '#fff',
+                  boxShadow: '0 1px 2px rgba(18, 32, 58, 0.04)',
+                  padding: '14px 16px',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    justifyContent: 'space-between',
+                    gap: '12px',
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      gap: '12px',
+                      flex: '1 1 420px',
+                      minWidth: 0,
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: '34px',
+                        height: '34px',
+                        borderRadius: '17px',
+                        background: item.warning ? '#f8eeee' : '#edf3ff',
+                        color: item.warning ? '#a94442' : '#3f77ff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontWeight: 700,
+                        flex: '0 0 auto',
+                      }}
+                    >
+                      {item.step}
+                    </div>
+                    <div style={{minWidth: 0}}>
+                      <div
+                        className="text-muted"
+                        style={{
+                          fontSize: '11px',
+                          textTransform: 'uppercase',
+                          marginBottom: '5px',
+                        }}
+                      >
+                        Step {item.step}
+                      </div>
+                      <div style={{marginBottom: '6px'}}>
+                        <span
+                          style={{
+                            display: 'inline-block',
+                            padding: '3px 8px',
+                            borderRadius: '4px',
+                            background: '#eef2f8',
+                            color: '#334155',
+                            fontSize: '12px',
+                            fontWeight: 700,
+                          }}
+                        >
+                          {item.type_label}
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          color: item.warning ? '#a94442' : '#1f2937',
+                          fontWeight: 600,
+                          lineHeight: '1.45',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {item.summary}
+                      </div>
+                    </div>
+                  </div>
+                  <Button
+                    bsSize="small"
+                    onClick={this.editPreviewNode.bind(this, item.node)}
+                  >
+                    Edit in list
+                  </Button>
+                </div>
+                {
+                  item.connections.length ?
+                    <div style={{marginTop: '12px', paddingLeft: '46px'}}>
+                      {_.map(item.connections, connection => this.renderPreviewConnection(connection))}
+                    </div>
+                  :
+                    <div
+                      style={{
+                        marginTop: '12px',
+                        paddingLeft: '46px',
+                        color: '#6b7280',
+                        fontSize: '13px',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {item.terminal_label}
+                    </div>
+                }
+              </div>
+              {
+                item.step < items.length ?
+                  <div
+                    aria-hidden="true"
+                    style={{
+                      width: '2px',
+                      height: '18px',
+                      background: '#dfe5ef',
+                      marginLeft: '33px',
+                    }}
+                  />
+                :
+                  null
+              }
+            </div>
+          ))
+        }
+      </div>
+    );
+  }
+
   render() {
     const nodes = this.props.nodes || [];
+    const workflowView = this.state.workflowView || 'edit';
     return (
       <EDFormBox space>
-        <div className="flex-items space-between">
+        <div className="flex-items space-between" style={{alignItems: 'center', gap: '12px', flexWrap: 'wrap'}}>
           <h4>Draft Workflow</h4>
-          {this.renderAddNodeDropdown('automation-node-create-dropdown', 'Add Node')}
+          <div style={{display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap'}}>
+            <ButtonGroup>
+              <Button
+                bsSize="small"
+                active={workflowView === 'edit'}
+                onClick={this.showWorkflowView.bind(this, 'edit')}
+              >
+                Edit list
+              </Button>
+              <Button
+                bsSize="small"
+                active={workflowView === 'preview'}
+                onClick={this.showWorkflowView.bind(this, 'preview')}
+              >
+                Visual preview
+              </Button>
+            </ButtonGroup>
+            {workflowView === 'edit' ? this.renderAddNodeDropdown('automation-node-create-dropdown', 'Add Node') : null}
+          </div>
         </div>
         {
           (this.props.emails || []).length ?
@@ -1432,9 +1754,12 @@ class AutomationWorkflowEditor extends Component {
         }
         {
           nodes.length ?
-            <div>
-              {_.map(nodes, (node, index) => this.renderNodeCard(node, index, nodes))}
-            </div>
+            workflowView === 'preview' ?
+              this.renderWorkflowPreview(nodes)
+            :
+              <div>
+                {_.map(nodes, (node, index) => this.renderNodeCard(node, index, nodes))}
+              </div>
           :
             <div className="text-center space-top-sm">
               <h4>This draft does not have any nodes yet.</h4>

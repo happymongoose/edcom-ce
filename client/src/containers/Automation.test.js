@@ -26,6 +26,7 @@ import {
   automationNodeSummary,
   automationNodeSummaryWarning,
   automationNodeTargetOptions,
+  automationWorkflowPreviewItems,
   insertAutomationNodeAfter,
   moveAutomationNode,
 } from './AutomationWorkflowEditor';
@@ -361,6 +362,71 @@ describe('automation enrolment display helpers', () => {
     expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
       'If clicked URL starts with: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
     );
+  });
+
+  it('derives visual preview connections for linear branch go-to and exit nodes', () => {
+    const nodes = [
+      {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'exit'},
+      {id: 'yes', type: 'go_to', label: 'Go to exit', target_node_id: 'exit'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {
+      emails: [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}],
+    });
+
+    expect(items[0].connections).toEqual([
+      {
+        kind: 'linear',
+        label: 'Next',
+        target: {
+          id: 'branch',
+          missing: false,
+          label: 'Step 2 - Check tag',
+          step: 2,
+          type_label: 'If has tag',
+        },
+      },
+    ]);
+    expect(_.pluck(items[1].connections, 'label')).toEqual(['Yes', 'No']);
+    expect(items[1].connections[0].target.label).toBe('Step 3 - Go to exit');
+    expect(items[1].connections[1].target.label).toBe('Step 4 - Exit');
+    expect(items[2].connections[0].label).toBe('Go to');
+    expect(items[2].connections[0].target.label).toBe('Step 4 - Exit');
+    expect(items[3].connections).toEqual([]);
+    expect(items[3].terminal_label).toBe('Terminal exit');
+  });
+
+  it('marks missing visual preview targets as warnings', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_missing_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'missing', no_node_id: ''},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {});
+
+    expect(items[0].warning).toBe(true);
+    expect(items[0].connections[0].target).toEqual({
+      id: 'missing',
+      missing: true,
+      label: 'Target missing',
+      step: null,
+      type_label: '',
+    });
+    expect(items[0].connections[1].target.missing).toBe(true);
+  });
+
+  it('derives visual preview data without mutating workflow nodes', () => {
+    const nodes = [
+      {id: 'one', type: 'add_tag', label: 'Add', draft_tag: 'vip'},
+      {id: 'two', type: 'exit', label: 'Exit'},
+    ];
+    const before = JSON.stringify(nodes);
+
+    automationWorkflowPreviewItems(nodes, {});
+
+    expect(JSON.stringify(nodes)).toBe(before);
   });
 
   it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {
