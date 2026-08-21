@@ -28,6 +28,7 @@ import {
   automationNodeTargetOptions,
   automationWorkflowPreviewFlow,
   automationWorkflowPreviewItems,
+  automationWorkflowPreviewSummaryInline,
   insertAutomationNodeAfter,
   moveAutomationNode,
 } from './AutomationWorkflowEditor';
@@ -558,6 +559,18 @@ describe('automation enrolment display helpers', () => {
 
     expect(flow.main[0].item.summary).toBe('has tag vip | Yes -> Step 2 | No -> Step 3');
     expect(flow.main[0].item.summary).not.toContain('All of 1 condition');
+  });
+
+  it('uses inline visual preview summaries for simple action nodes only', () => {
+    expect(automationWorkflowPreviewSummaryInline('add_tag')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('remove_tag')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('add_to_list')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('remove_from_list')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('wait_duration')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('go_to')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('send_email')).toBe(false);
+    expect(automationWorkflowPreviewSummaryInline('if_has_tag')).toBe(false);
+    expect(automationWorkflowPreviewSummaryInline('if_conditions')).toBe(false);
   });
 
   it('shows missing branch targets as warning lane blocks', () => {

@@ -723,6 +723,17 @@ export function automationWorkflowPreviewFlow(nodes, options) {
   };
 }
 
+export function automationWorkflowPreviewSummaryInline(type) {
+  return _.contains([
+    'add_tag',
+    'remove_tag',
+    'add_to_list',
+    'remove_from_list',
+    'wait_duration',
+    'go_to',
+  ], type);
+}
+
 export function createAutomationNode(type, options) {
   const opts = options || {};
   const emails = opts.emails || [];
@@ -1883,6 +1894,9 @@ class AutomationWorkflowEditor extends Component {
 
   renderPreviewConnectionPanel(item, options) {
     const opts = options || {};
+    if (item.type === 'go_to') {
+      return null;
+    }
     if (item.nested_branch_stop) {
       return (
         <div
@@ -1993,6 +2007,7 @@ class AutomationWorkflowEditor extends Component {
 
   renderPreviewNodeCard(item, options) {
     const opts = options || {};
+    const inlineSummary = automationWorkflowPreviewSummaryInline(item.type);
     return (
       <div
         style={{
@@ -2048,7 +2063,15 @@ class AutomationWorkflowEditor extends Component {
               >
                 Step {item.step}
               </div>
-              <div style={{marginBottom: '6px'}}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  flexWrap: 'wrap',
+                  marginBottom: inlineSummary ? 0 : '6px',
+                }}
+              >
                 <span
                   style={{
                     display: 'inline-block',
@@ -2062,17 +2085,37 @@ class AutomationWorkflowEditor extends Component {
                 >
                   {item.type_label}
                 </span>
+                {
+                  inlineSummary && item.summary ?
+                    <span
+                      style={{
+                        color: item.warning ? '#a94442' : '#1f2937',
+                        fontWeight: 600,
+                        lineHeight: '1.45',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {item.summary}
+                    </span>
+                  :
+                    null
+                }
               </div>
-              <div
-                style={{
-                  color: item.warning ? '#a94442' : '#1f2937',
-                  fontWeight: 600,
-                  lineHeight: '1.45',
-                  wordBreak: 'break-word',
-                }}
-              >
-                {item.summary}
-              </div>
+              {
+                !inlineSummary && item.summary ?
+                  <div
+                    style={{
+                      color: item.warning ? '#a94442' : '#1f2937',
+                      fontWeight: 600,
+                      lineHeight: '1.45',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {item.summary}
+                  </div>
+                :
+                  null
+              }
             </div>
           </div>
         </div>
@@ -2209,7 +2252,7 @@ class AutomationWorkflowEditor extends Component {
                     marginBottom: '10px',
                   }}
                 >
-                  {lane.label} lane
+                  {lane.label}
                 </div>
                 {
                   lane.blocks.length ?
