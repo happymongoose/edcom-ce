@@ -2208,6 +2208,11 @@ class AutomationWorkflowEditor extends Component {
       return null;
     }
     const connectorColor = '#cfd8e6';
+    const laneGridStyle = {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+      gap: '14px',
+    };
 
     return (
       <div
@@ -2216,95 +2221,84 @@ class AutomationWorkflowEditor extends Component {
         }}
       >
         <div
-          aria-hidden="true"
           style={{
             position: 'relative',
-            height: '62px',
-            margin: '0 14px',
+            margin: '0 0 0',
           }}
         >
           <div
+            aria-hidden="true"
             style={{
               position: 'absolute',
               left: '50%',
               top: 0,
               width: '2px',
-              height: '22px',
+              height: '18px',
               marginLeft: '-1px',
               background: connectorColor,
             }}
           />
           <div
+            aria-hidden="true"
             style={{
               position: 'absolute',
-              left: '25%',
-              right: '25%',
-              top: '22px',
+              left: 'calc(25% - 3.5px)',
+              right: 'calc(25% - 3.5px)',
+              top: '18px',
               height: '2px',
               background: connectorColor,
             }}
           />
           <div
-            style={{
-              position: 'absolute',
-              left: '25%',
-              top: '22px',
-              width: '2px',
-              height: '28px',
-              marginLeft: '-1px',
-              background: '#cce8d4',
-            }}
-          />
-          <div
-            style={{
-              position: 'absolute',
-              left: '75%',
-              top: '22px',
-              width: '2px',
-              height: '28px',
-              marginLeft: '-1px',
-              background: '#ebcccc',
-            }}
-          />
-          <div
-            style={{
-              position: 'absolute',
-              left: '25%',
-              top: '34px',
-              transform: 'translateX(-50%)',
-              padding: '3px 9px',
-              borderRadius: '12px',
-              background: '#eefaf1',
-              color: '#2f7d46',
-              fontWeight: 700,
-              fontSize: '12px',
-            }}
+            style={laneGridStyle}
           >
-            Yes
-          </div>
-          <div
-            style={{
-              position: 'absolute',
-              left: '75%',
-              top: '34px',
-              transform: 'translateX(-50%)',
-              padding: '3px 9px',
-              borderRadius: '12px',
-              background: '#fff1f1',
-              color: '#a94442',
-              fontWeight: 700,
-              fontSize: '12px',
-            }}
-          >
-            No
+            {
+              _.map(branch.lanes, lane => (
+                <div
+                  key={lane.label + '-connector'}
+                  style={{
+                    minWidth: 0,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                  }}
+                >
+                  <div
+                    aria-hidden="true"
+                    style={{
+                      width: '2px',
+                      height: '30px',
+                      background: connectorColor,
+                    }}
+                  />
+                  <div
+                    style={{
+                      padding: '3px 9px',
+                      borderRadius: '12px',
+                      background: lane.label === 'No' ? '#fff1f1' : '#eefaf1',
+                      color: lane.label === 'No' ? '#a94442' : '#2f7d46',
+                      fontWeight: 700,
+                      fontSize: '12px',
+                      marginTop: '-14px',
+                    }}
+                  >
+                    {lane.label}
+                  </div>
+                  <div
+                    aria-hidden="true"
+                    style={{
+                      width: '2px',
+                      height: '20px',
+                      background: connectorColor,
+                    }}
+                  />
+                </div>
+              ))
+            }
           </div>
         </div>
         <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-            gap: '14px',
-          }}
+          style={laneGridStyle}
         >
           {
             _.map(branch.lanes, lane => (
@@ -2315,22 +2309,6 @@ class AutomationWorkflowEditor extends Component {
                   padding: '0',
                 }}
               >
-                <div
-                  aria-hidden="true"
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'center',
-                    height: '18px',
-                  }}
-                >
-                  <div
-                    style={{
-                      width: '2px',
-                      height: '18px',
-                      background: lane.label === 'No' ? '#ebcccc' : '#cce8d4',
-                    }}
-                  />
-                </div>
                 {
                   lane.blocks.length ?
                     _.map(lane.blocks, (block, index) => this.renderPreviewBlock(block, index, lane.blocks, {suppressBranchPanel: false}))
