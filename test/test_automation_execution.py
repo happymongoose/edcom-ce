@@ -446,7 +446,7 @@ class TestAutomationExecution(test_base.TestBase):
     def create_email_engagement_condition_automation(self, node_type="if_opened_email"):
         return self.create_email_engagement_condition_automation_with_options(node_type)
 
-    def create_email_engagement_condition_automation_with_options(self, node_type="if_opened_email", node_overrides=None):
+    def create_email_engagement_condition_automation_with_options(self, node_type="if_opened_email", node_overrides=None, reentry=None):
         suffix = self.unique()
         automation = self.user_post(
             "/api/automations",
@@ -485,7 +485,7 @@ class TestAutomationExecution(test_base.TestBase):
             nodes[0].update(node_overrides)
         self.user_patch(
             "/api/automations/%s" % automation["id"],
-            json=self.workflow(nodes=nodes),
+            json=self.workflow(nodes=nodes, reentry=reentry),
         )
         published = self.simulate_post(
             "/api/automations/%s/publish" % automation["id"],
@@ -3554,6 +3554,80 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["step_run"]["result"], False)
 
         self.cleanup(automation["id"])
+
+    def assert_click_condition_counts_current_enrolment_only(self, node_overrides, event_url=None):
+        email, contact_id = self.create_contact()
+        automation = self.create_email_engagement_condition_automation_with_options(
+            "if_clicked_email",
+            node_overrides,
+            reentry="multiple",
+        )
+
+        first_enrolment = self.enrol(automation["id"], email)
+        event_data = {"test_id": self.test_id}
+        if event_url:
+            event_data["link_url"] = event_url
+        self.insert_open_event(
+            automation["id"],
+            first_enrolment["id"],
+            contact_id,
+            email,
+            automation["engagement_email_id"],
+            event_type="click",
+            event_data=event_data,
+        )
+
+        first_result = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(first_result.status_code, 200)
+        self.assertEqual(first_result.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(first_result.json["step_run"]["result"], True)
+        self.assertEqual(first_result.json["step_run"]["branch"], "yes")
+        add_tag_result = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(add_tag_result.status_code, 200)
+        self.assertEqual(add_tag_result.json["enrolment"]["status"], "ready")
+        self.assertEqual(add_tag_result.json["enrolment"]["current_node_id"], "node_exit_1")
+        exit_result = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(exit_result.status_code, 200)
+        self.assertEqual(exit_result.json["enrolment"]["status"], "exited")
+
+        second_enrolment = self.enrol(automation["id"], email)
+        second_result = self.run_next(automation["id"], second_enrolment["id"])
+        self.assertEqual(second_result.status_code, 200)
+        self.assertEqual(second_result.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(second_result.json["step_run"]["result"], False)
+        self.assertEqual(second_result.json["step_run"]["branch"], "no")
+
+        self.cleanup(automation["id"])
+
+    def test_if_clicked_email_any_click_counts_current_enrolment_only(self):
+        self.assert_click_condition_counts_current_enrolment_only({}, event_url=None)
+
+    def test_if_clicked_email_legacy_url_counts_current_enrolment_only(self):
+        self.assert_click_condition_counts_current_enrolment_only(
+            {
+                "click_match": "url",
+                "link_url": "https://example.com/offer",
+            },
+            event_url="https://example.com/offer",
+        )
+
+    def test_if_clicked_email_url_exact_counts_current_enrolment_only(self):
+        self.assert_click_condition_counts_current_enrolment_only(
+            {
+                "click_match": "url_exact",
+                "link_url": "https://example.com/offer",
+            },
+            event_url="https://example.com/offer",
+        )
+
+    def test_if_clicked_email_url_prefix_counts_current_enrolment_only(self):
+        self.assert_click_condition_counts_current_enrolment_only(
+            {
+                "click_match": "url_prefix",
+                "link_url": "https://example.com/offer",
+            },
+            event_url="https://example.com/offer?utm=1",
+        )
 
     def test_if_clicked_email_ignores_click_from_another_automation_email(self):
         email, contact_id = self.create_contact()
