@@ -479,6 +479,9 @@ describe('automation enrolment display helpers', () => {
     });
 
     expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['send', 'branch']);
+    expect(flow.main[0].item.type_label).toBe('Send email');
+    expect(flow.main[0].item.summary).toBe('Welcome - Hello (HTML)');
+    expect(flow.main[1].item.summary).toBe('vip | Yes -> Step 3 | No -> Step 4');
     expect(flow.branch.item.id).toBe('branch');
     expect(_.pluck(flow.branch.lanes, 'label')).toEqual(['Yes', 'No']);
   });
@@ -496,8 +499,12 @@ describe('automation enrolment display helpers', () => {
 
     expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['yes', 'yes-exit']);
     expect(_.pluck(_.map(flow.branch.lanes[1].blocks, block => block.item), 'id')).toEqual(['no', 'no-exit']);
-    expect(flow.branch.lanes[0].blocks[1].item.terminal_label).toBe('Terminal exit');
-    expect(flow.branch.lanes[1].blocks[1].item.terminal_label).toBe('Terminal exit');
+    expect(flow.branch.lanes[0].blocks[0].item.summary).toBe('yes');
+    expect(flow.branch.lanes[1].blocks[0].item.summary).toBe('no');
+    expect(flow.branch.lanes[0].blocks[1].item.type_label).toBe('Exit automation');
+    expect(flow.branch.lanes[0].blocks[1].item.terminal_label).toBe('');
+    expect(flow.branch.lanes[1].blocks[1].item.type_label).toBe('Exit automation');
+    expect(flow.branch.lanes[1].blocks[1].item.terminal_label).toBe('');
   });
 
   it('stops a preview lane at go-to without continuing to the next array node', () => {
@@ -513,6 +520,7 @@ describe('automation enrolment display helpers', () => {
     expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['go']);
     expect(flow.branch.lanes[0].blocks[0].item.connections[0].kind).toBe('go_to');
     expect(flow.branch.lanes[0].blocks[0].item.connections[0].target.label).toBe('Step 1 - Check tag');
+    expect(flow.branch.lanes[0].blocks[0].item.summary).toBe('Step 1');
   });
 
   it('stops a preview lane at exit without continuing', () => {
@@ -525,7 +533,31 @@ describe('automation enrolment display helpers', () => {
     const flow = automationWorkflowPreviewFlow(nodes, {});
 
     expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['exit']);
-    expect(flow.branch.lanes[0].blocks[0].item.terminal_label).toBe('Terminal exit');
+    expect(flow.branch.lanes[0].blocks[0].item.type_label).toBe('Exit automation');
+    expect(flow.branch.lanes[0].blocks[0].item.terminal_label).toBe('');
+  });
+
+  it('keeps single compound condition preview summaries compact', () => {
+    const nodes = [
+      {
+        id: 'compound',
+        type: 'if_conditions',
+        label: 'Check one',
+        condition: {
+          mode: 'all',
+          items: [{type: 'has_tag', tag: 'vip'}],
+        },
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes', draft_tag: 'yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(flow.main[0].item.summary).toBe('has tag vip | Yes -> Step 2 | No -> Step 3');
+    expect(flow.main[0].item.summary).not.toContain('All of 1 condition');
   });
 
   it('shows missing branch targets as warning lane blocks', () => {

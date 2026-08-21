@@ -423,19 +423,95 @@ export function automationWorkflowPreviewItems(nodes, options) {
   });
 }
 
+function automationPreviewTargetStepSummary(nodes, id) {
+  const target = automationPreviewTarget(nodes, id);
+  if (target.missing) {
+    return 'Target missing';
+  }
+  return 'Step ' + target.step;
+}
+
+function automationWorkflowPreviewSummary(node, options) {
+  const opts = options || {};
+  const nodes = opts.nodes || [];
+  const emailOptions = automationEmailOptions(opts.emails || []);
+  const listOptions = automationListOptions(opts.lists || []);
+  const branchSummary = ' | Yes -> ' + automationPreviewTargetStepSummary(nodes, node.yes_node_id) +
+    ' | No -> ' + automationPreviewTargetStepSummary(nodes, node.no_node_id);
+
+  if (node.type === 'send_email') {
+    if (!node.automation_email_id) {
+      return 'No email selected';
+    }
+    return optionName(emailOptions, node.automation_email_id) || 'Selected email not found';
+  }
+  if (node.type === 'add_tag' || node.type === 'remove_tag') {
+    return node.draft_tag || 'No tag selected';
+  }
+  if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
+    if (!node.list_id) {
+      return 'No list selected';
+    }
+    return optionName(listOptions, node.list_id) || 'Selected list not found';
+  }
+  if (node.type === 'wait_duration') {
+    return durationSummary(node.duration || {});
+  }
+  if (node.type === 'if_has_tag' || node.type === 'if_missing_tag') {
+    return (node.draft_tag || 'No tag selected') + branchSummary;
+  }
+  if (node.type === 'if_opened_email') {
+    return (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
+      branchSummary;
+  }
+  if (node.type === 'if_clicked_email') {
+    const clickMatch = automationClickMatchValue(node);
+    let clickSummary = 'any link';
+    if (clickMatch === 'url_exact') {
+      clickSummary = 'exact URL: ' + (node.link_url || 'No URL entered');
+    } else if (clickMatch === 'url_prefix') {
+      clickSummary = 'URL starts with: ' + (node.link_url || 'No URL entered');
+    }
+    return clickSummary + ' in ' +
+      (node.automation_email_id ? (optionName(emailOptions, node.automation_email_id) || 'Selected email not found') : 'No email selected') +
+      branchSummary;
+  }
+  if (node.type === 'if_conditions') {
+    const condition = node.condition || {};
+    const items = condition.items || [];
+    const mode = condition.mode === 'any' ? 'Any' : 'All';
+    if (!items.length) {
+      return 'No conditions configured' + branchSummary;
+    }
+    if (items.length === 1) {
+      return conditionItemSummary(items[0], opts) + branchSummary;
+    }
+    const preview = _.map(items.slice(0, 2), item => conditionItemSummary(item, opts)).join(' | ');
+    return mode + ' of ' + items.length + ' conditions: ' +
+      preview + (items.length > 2 ? ' | ...' : '') + branchSummary;
+  }
+  if (node.type === 'go_to') {
+    return automationPreviewTargetStepSummary(nodes, node.target_node_id);
+  }
+  if (node.type === 'exit') {
+    return '';
+  }
+  return automationNodeSummary(node, opts);
+}
+
 function automationWorkflowPreviewItemForNode(workflowNodes, node, options) {
   const index = _.findIndex(workflowNodes || [], candidate => candidate.id === node.id);
   const opts = {
     ...(options || {}),
     nodes: workflowNodes || [],
   };
-  const summary = automationNodeSummary(node, opts);
+  const summary = automationWorkflowPreviewSummary(node, opts);
   const item = {
     id: node.id,
     node: node,
     step: index + 1,
     type: node.type,
-    type_label: automationNodeTypeLabel(node.type),
+    type_label: node.type === 'exit' ? 'Exit automation' : automationNodeTypeLabel(node.type),
     summary: summary,
     warning: automationNodeSummaryWarning(summary),
     connections: [],
@@ -444,7 +520,7 @@ function automationWorkflowPreviewItemForNode(workflowNodes, node, options) {
   };
 
   if (node.type === 'exit') {
-    item.terminal_label = 'Terminal exit';
+    item.terminal_label = '';
   } else if (node.type === 'go_to') {
     item.connections.push({
       kind: 'go_to',
@@ -1793,7 +1869,7 @@ class AutomationWorkflowEditor extends Component {
             fontSize: '13px',
           }}
         >
-          {isGoTo ? 'Jump to ' : ''}{target.label}{target.type_label ? ' (' + target.type_label + ')' : ''}
+          {isGoTo && !target.missing ? 'Go to Step ' + target.step : target.label + (target.type_label ? ' (' + target.type_label + ')' : '')}
         </span>
         {
           isBranch && !target.missing ?
@@ -1999,12 +2075,6 @@ class AutomationWorkflowEditor extends Component {
               </div>
             </div>
           </div>
-          <Button
-            bsSize="small"
-            onClick={this.editPreviewNode.bind(this, item.node)}
-          >
-            Edit in list
-          </Button>
         </div>
         {this.renderPreviewConnectionPanel(item, opts)}
       </div>
