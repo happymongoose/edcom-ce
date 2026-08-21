@@ -2207,40 +2207,97 @@ class AutomationWorkflowEditor extends Component {
     if (!branch) {
       return null;
     }
+    const connectorColor = '#cfd8e6';
 
     return (
       <div
         style={{
-          marginTop: '-1px',
-          padding: '0 14px 14px',
-          borderRadius: '0 0 8px 8px',
-          background: '#f8fafc',
-          border: '1px solid #e5ebf3',
-          borderTop: '0',
+          marginTop: '0',
         }}
       >
         <div
           aria-hidden="true"
           style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-            gap: '14px',
-            marginBottom: '4px',
+            position: 'relative',
+            height: '62px',
+            margin: '0 14px',
           }}
         >
-          {
-            _.map(branch.lanes, lane => (
-              <div key={lane.label + '-stem'} style={{display: 'flex', justifyContent: 'center'}}>
-                <div
-                  style={{
-                    width: '2px',
-                    height: '14px',
-                    background: lane.label === 'No' ? '#ebcccc' : '#cce8d4',
-                  }}
-                />
-              </div>
-            ))
-          }
+          <div
+            style={{
+              position: 'absolute',
+              left: '50%',
+              top: 0,
+              width: '2px',
+              height: '22px',
+              marginLeft: '-1px',
+              background: connectorColor,
+            }}
+          />
+          <div
+            style={{
+              position: 'absolute',
+              left: '25%',
+              right: '25%',
+              top: '22px',
+              height: '2px',
+              background: connectorColor,
+            }}
+          />
+          <div
+            style={{
+              position: 'absolute',
+              left: '25%',
+              top: '22px',
+              width: '2px',
+              height: '28px',
+              marginLeft: '-1px',
+              background: '#cce8d4',
+            }}
+          />
+          <div
+            style={{
+              position: 'absolute',
+              right: '25%',
+              top: '22px',
+              width: '2px',
+              height: '28px',
+              marginRight: '-1px',
+              background: '#ebcccc',
+            }}
+          />
+          <div
+            style={{
+              position: 'absolute',
+              left: '25%',
+              top: '34px',
+              transform: 'translateX(-50%)',
+              padding: '3px 9px',
+              borderRadius: '12px',
+              background: '#eefaf1',
+              color: '#2f7d46',
+              fontWeight: 700,
+              fontSize: '12px',
+            }}
+          >
+            Yes
+          </div>
+          <div
+            style={{
+              position: 'absolute',
+              right: '25%',
+              top: '34px',
+              transform: 'translateX(50%)',
+              padding: '3px 9px',
+              borderRadius: '12px',
+              background: '#fff1f1',
+              color: '#a94442',
+              fontWeight: 700,
+              fontSize: '12px',
+            }}
+          >
+            No
+          </div>
         </div>
         <div
           style={{
@@ -2261,20 +2318,6 @@ class AutomationWorkflowEditor extends Component {
                   padding: '12px',
                 }}
               >
-                <div
-                  style={{
-                    display: 'inline-block',
-                    padding: '4px 10px',
-                    borderRadius: '12px',
-                    background: lane.label === 'No' ? '#fff1f1' : '#eefaf1',
-                    color: lane.label === 'No' ? '#a94442' : '#2f7d46',
-                    fontWeight: 700,
-                    fontSize: '12px',
-                    marginBottom: '10px',
-                  }}
-                >
-                  {lane.label}
-                </div>
                 {
                   lane.blocks.length ?
                     _.map(lane.blocks, (block, index) => this.renderPreviewBlock(block, index, lane.blocks, {suppressBranchPanel: false}))
