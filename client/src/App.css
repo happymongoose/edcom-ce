@@ -960,3 +960,23 @@ div.ed-table.extra-pad {
 .nobottomspace {
   margin-bottom: 0;
 }
+
+.automation-workflow-visual-preview-narrow-message {
+  display: none;
+}
+
+@media all and (max-width: 767px) {
+  .automation-workflow-visual-preview {
+    display: none;
+  }
+
+  .automation-workflow-visual-preview-narrow-message {
+    display: block;
+    padding: 14px 16px;
+    border: 1px solid #dfe5ef;
+    border-radius: 6px;
+    background: #f8fafc;
+    color: #46566d;
+    font-weight: 600;
+  }
+}

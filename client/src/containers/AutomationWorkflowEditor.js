@@ -2326,11 +2326,16 @@ class AutomationWorkflowEditor extends Component {
 
     return (
       <div style={{marginTop: '18px'}}>
-        <div className="help-block" style={{marginBottom: '12px'}}>
-          Read-only preview of the draft workflow. Edit nodes in the list view.
+        <div className="automation-workflow-visual-preview-narrow-message">
+          Visual preview is available on wider screens. Use Edit list on this device.
         </div>
-        {_.map(flow.main, (block, index) => this.renderPreviewBlock(block, index, flow.main, {suppressBranchPanel: !!flow.branch && block.item === flow.branch.item}))}
-        {this.renderPreviewBranchLanes(flow.branch)}
+        <div className="automation-workflow-visual-preview">
+          <div className="help-block" style={{marginBottom: '12px'}}>
+            Read-only preview of the draft workflow. Edit nodes in the list view.
+          </div>
+          {_.map(flow.main, (block, index) => this.renderPreviewBlock(block, index, flow.main, {suppressBranchPanel: !!flow.branch && block.item === flow.branch.item}))}
+          {this.renderPreviewBranchLanes(flow.branch)}
+        </div>
       </div>
     );
   }
