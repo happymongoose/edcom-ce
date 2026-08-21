@@ -234,6 +234,18 @@ Recovery actions should preserve audit/history where possible. `automation_step_
   conditions need extra care because segment evaluation can be expensive.
   Publish validation and execution should continue treating the compound node as
   one branch node with yes/no targets.
+- A future visual workflow editor should provide a flowchart-style automation
+  view similar in spirit to Mautic/ActiveCampaign, while keeping the current
+  list/card editor as a fallback or compact mode. The first safe slice should be
+  a read-only visual preview of the draft workflow, not full drag/drop editing.
+  The preview should show nodes as boxes with type labels and summaries, linear
+  connections, Yes/No-labelled branch connectors, go-to connectors, and
+  missing/invalid targets as warning states. Later editing slices can add node
+  side-panel editing, inserting nodes on connectors, drag/drop layout,
+  reconnecting branch targets, and zoom/minimap support. The persisted data
+  model should remain stable: node IDs and yes/no/go-to target IDs stay
+  authoritative, and backend publish validation remains the source of truth for
+  cycles and invalid references. Do not fold this into compound-condition work.
 - General link-click actions should be designed separately from automation
   engagement conditions. Future click actions may apply across broadcasts,
   funnels, transactional emails, and automation emails, and may add/remove tags
