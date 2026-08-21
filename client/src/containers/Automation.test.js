@@ -26,6 +26,7 @@ import {
   automationNodeSummary,
   automationNodeSummaryWarning,
   automationNodeTargetOptions,
+  automationWorkflowPreviewFlow,
   automationWorkflowPreviewItems,
   insertAutomationNodeAfter,
   moveAutomationNode,
@@ -463,6 +464,111 @@ describe('automation enrolment display helpers', () => {
     automationWorkflowPreviewItems(nodes, {});
 
     expect(JSON.stringify(nodes)).toBe(before);
+  });
+
+  it('derives a path-based preview with a single path before the first branch', () => {
+    const nodes = [
+      {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target', draft_tag: 'yes'},
+      {id: 'no', type: 'exit', label: 'No target'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {
+      emails: [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}],
+    });
+
+    expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['send', 'branch']);
+    expect(flow.branch.item.id).toBe('branch');
+    expect(_.pluck(flow.branch.lanes, 'label')).toEqual(['Yes', 'No']);
+  });
+
+  it('renders branch target cards inside separate preview lanes', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target', draft_tag: 'yes'},
+      {id: 'yes-exit', type: 'exit', label: 'Yes exit'},
+      {id: 'no', type: 'remove_tag', label: 'No target', draft_tag: 'no'},
+      {id: 'no-exit', type: 'exit', label: 'No exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['yes', 'yes-exit']);
+    expect(_.pluck(_.map(flow.branch.lanes[1].blocks, block => block.item), 'id')).toEqual(['no', 'no-exit']);
+    expect(flow.branch.lanes[0].blocks[1].item.terminal_label).toBe('Terminal exit');
+    expect(flow.branch.lanes[1].blocks[1].item.terminal_label).toBe('Terminal exit');
+  });
+
+  it('stops a preview lane at go-to without continuing to the next array node', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'go', no_node_id: 'exit'},
+      {id: 'go', type: 'go_to', label: 'Jump back', target_node_id: 'branch'},
+      {id: 'should-not-render', type: 'add_tag', label: 'Should not render', draft_tag: 'wrong'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['go']);
+    expect(flow.branch.lanes[0].blocks[0].item.connections[0].kind).toBe('go_to');
+    expect(flow.branch.lanes[0].blocks[0].item.connections[0].target.label).toBe('Step 1 - Check tag');
+  });
+
+  it('stops a preview lane at exit without continuing', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'exit', no_node_id: 'after'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+      {id: 'after', type: 'add_tag', label: 'After exit', draft_tag: 'after'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['exit']);
+    expect(flow.branch.lanes[0].blocks[0].item.terminal_label).toBe('Terminal exit');
+  });
+
+  it('shows missing branch targets as warning lane blocks', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_missing_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'missing', no_node_id: ''},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(flow.branch.lanes[0].blocks[0].kind).toBe('missing');
+    expect(flow.branch.lanes[0].blocks[0].warning).toBe(true);
+    expect(flow.branch.lanes[1].blocks[0].kind).toBe('missing');
+  });
+
+  it('protects path-based preview lanes from cycles', () => {
+    const nodes = [
+      {id: 'pre', type: 'add_tag', label: 'Pre', draft_tag: 'pre'},
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'pre', no_node_id: 'exit'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['pre', 'branch']);
+    expect(flow.branch.lanes[0].blocks[0].kind).toBe('reference');
+    expect(flow.branch.lanes[0].blocks[0].label).toBe('Continues at');
+    expect(flow.branch.lanes[0].blocks[0].target.label).toBe('Step 1 - Pre');
+  });
+
+  it('marks nested branches as a compact stop in preview lanes', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Outer', draft_tag: 'vip', yes_node_id: 'nested', no_node_id: 'exit'},
+      {id: 'nested', type: 'if_missing_tag', label: 'Nested', draft_tag: 'cold', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes', draft_tag: 'yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(flow.branch.lanes[0].blocks[0].item.id).toBe('nested');
+    expect(flow.branch.lanes[0].blocks[0].item.nested_branch_stop).toBe(true);
+    expect(flow.branch.lanes[0].blocks).toHaveLength(1);
   });
 
   it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {

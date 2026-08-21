@@ -423,6 +423,230 @@ export function automationWorkflowPreviewItems(nodes, options) {
   });
 }
 
+function automationWorkflowPreviewItemForNode(workflowNodes, node, options) {
+  const index = _.findIndex(workflowNodes || [], candidate => candidate.id === node.id);
+  const opts = {
+    ...(options || {}),
+    nodes: workflowNodes || [],
+  };
+  const summary = automationNodeSummary(node, opts);
+  const item = {
+    id: node.id,
+    node: node,
+    step: index + 1,
+    type: node.type,
+    type_label: automationNodeTypeLabel(node.type),
+    summary: summary,
+    warning: automationNodeSummaryWarning(summary),
+    connections: [],
+    terminal_label: '',
+    nested_branch_stop: false,
+  };
+
+  if (node.type === 'exit') {
+    item.terminal_label = 'Terminal exit';
+  } else if (node.type === 'go_to') {
+    item.connections.push({
+      kind: 'go_to',
+      label: 'Go to',
+      target: automationPreviewTarget(workflowNodes, node.target_node_id),
+    });
+  } else if (automationBranchNode(node.type)) {
+    item.connections.push({
+      kind: 'branch',
+      label: 'Yes',
+      target: automationPreviewTarget(workflowNodes, node.yes_node_id),
+    });
+    item.connections.push({
+      kind: 'branch',
+      label: 'No',
+      target: automationPreviewTarget(workflowNodes, node.no_node_id),
+    });
+  }
+
+  if (_.some(item.connections, connection => connection.target.missing)) {
+    item.warning = true;
+  }
+
+  return item;
+}
+
+function automationWorkflowPreviewMissingBlock(workflowNodes, targetId) {
+  return {
+    kind: 'missing',
+    warning: true,
+    target: automationPreviewTarget(workflowNodes, targetId),
+  };
+}
+
+function automationWorkflowPreviewReferenceBlock(workflowNodes, nodeId, label) {
+  return {
+    kind: 'reference',
+    target: automationPreviewTarget(workflowNodes, nodeId),
+    label: label || 'Continues at',
+  };
+}
+
+function automationWorkflowPreviewNodeIndex(workflowNodes, nodeId) {
+  for (let i = 0; i < (workflowNodes || []).length; i += 1) {
+    if (workflowNodes[i].id === nodeId) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function automationWorkflowPreviewPath(workflowNodes, startId, options, visited, depth) {
+  const opts = options || {};
+  const maxDepth = opts.maxDepth || 40;
+  const blocks = [];
+  let nodeId = startId;
+  let currentVisited = {...(visited || {})};
+  let currentDepth = depth || 0;
+
+  if (!nodeId) {
+    return [automationWorkflowPreviewMissingBlock(workflowNodes, nodeId)];
+  }
+
+  while (nodeId) {
+    if (currentDepth >= maxDepth) {
+      blocks.push({
+        kind: 'reference',
+        warning: true,
+        label: 'Preview depth limit reached at',
+        target: automationPreviewTarget(workflowNodes, nodeId),
+      });
+      return blocks;
+    }
+
+    const nodeIndex = automationWorkflowPreviewNodeIndex(workflowNodes, nodeId);
+    if (nodeIndex === -1) {
+      blocks.push(automationWorkflowPreviewMissingBlock(workflowNodes, nodeId));
+      return blocks;
+    }
+
+    if (currentVisited[nodeId]) {
+      blocks.push(automationWorkflowPreviewReferenceBlock(workflowNodes, nodeId, 'Continues at'));
+      return blocks;
+    }
+
+    const node = workflowNodes[nodeIndex];
+    const item = automationWorkflowPreviewItemForNode(workflowNodes, node, opts);
+    currentVisited = {
+      ...currentVisited,
+      [nodeId]: true,
+    };
+    blocks.push({
+      kind: 'node',
+      item: item,
+    });
+
+    if (node.type === 'exit') {
+      return blocks;
+    }
+    if (node.type === 'go_to') {
+      return blocks;
+    }
+    if (automationBranchNode(node.type)) {
+      item.nested_branch_stop = true;
+      return blocks;
+    }
+    if (!workflowNodes[nodeIndex + 1]) {
+      item.terminal_label = 'Completes automation';
+      return blocks;
+    }
+
+    nodeId = workflowNodes[nodeIndex + 1].id;
+    currentDepth += 1;
+  }
+
+  return blocks;
+}
+
+export function automationWorkflowPreviewFlow(nodes, options) {
+  const workflowNodes = nodes || [];
+  const opts = {
+    ...(options || {}),
+    nodes: workflowNodes,
+  };
+  const main = [];
+  let branch = null;
+  let nodeId = workflowNodes[0] ? workflowNodes[0].id : '';
+  let visited = {};
+  let depth = 0;
+  const maxDepth = opts.maxDepth || 40;
+
+  while (nodeId) {
+    if (depth >= maxDepth) {
+      main.push({
+        kind: 'reference',
+        warning: true,
+        label: 'Preview depth limit reached at',
+        target: automationPreviewTarget(workflowNodes, nodeId),
+      });
+      break;
+    }
+
+    const nodeIndex = automationWorkflowPreviewNodeIndex(workflowNodes, nodeId);
+    if (nodeIndex === -1) {
+      main.push(automationWorkflowPreviewMissingBlock(workflowNodes, nodeId));
+      break;
+    }
+
+    if (visited[nodeId]) {
+      main.push(automationWorkflowPreviewReferenceBlock(workflowNodes, nodeId, 'Continues at'));
+      break;
+    }
+
+    const node = workflowNodes[nodeIndex];
+    const item = automationWorkflowPreviewItemForNode(workflowNodes, node, opts);
+    visited = {
+      ...visited,
+      [nodeId]: true,
+    };
+    main.push({
+      kind: 'node',
+      item: item,
+    });
+
+    if (automationBranchNode(node.type)) {
+      const laneVisited = {...visited};
+      branch = {
+        item: item,
+        lanes: [
+          {
+            label: 'Yes',
+            blocks: automationWorkflowPreviewPath(workflowNodes, node.yes_node_id, opts, laneVisited, depth + 1),
+          },
+          {
+            label: 'No',
+            blocks: automationWorkflowPreviewPath(workflowNodes, node.no_node_id, opts, laneVisited, depth + 1),
+          },
+        ],
+      };
+      break;
+    }
+    if (node.type === 'exit') {
+      break;
+    }
+    if (node.type === 'go_to') {
+      break;
+    }
+    if (!workflowNodes[nodeIndex + 1]) {
+      item.terminal_label = 'Completes automation';
+      break;
+    }
+
+    nodeId = workflowNodes[nodeIndex + 1].id;
+    depth += 1;
+  }
+
+  return {
+    main: main,
+    branch: branch,
+  };
+}
+
 export function createAutomationNode(type, options) {
   const opts = options || {};
   const emails = opts.emails || [];
@@ -1581,8 +1805,31 @@ class AutomationWorkflowEditor extends Component {
     );
   }
 
-  renderPreviewConnectionPanel(item) {
+  renderPreviewConnectionPanel(item, options) {
+    const opts = options || {};
+    if (item.nested_branch_stop) {
+      return (
+        <div
+          style={{
+            marginTop: '12px',
+            padding: '10px 12px',
+            borderRadius: '6px',
+            background: '#fffaf0',
+            border: '1px dashed #d79a25',
+            color: '#8a5a00',
+            fontSize: '13px',
+            fontWeight: 600,
+          }}
+        >
+          Nested branch not expanded in this preview.
+        </div>
+      );
+    }
+
     if (!item.connections.length) {
+      if (!item.terminal_label) {
+        return null;
+      }
       return (
         <div
           style={{
@@ -1599,6 +1846,9 @@ class AutomationWorkflowEditor extends Component {
     }
 
     if (_.every(item.connections, connection => connection.kind === 'branch')) {
+      if (opts.suppressBranchPanel) {
+        return null;
+      }
       return (
         <div
           style={{
@@ -1665,8 +1915,253 @@ class AutomationWorkflowEditor extends Component {
     );
   }
 
+  renderPreviewNodeCard(item, options) {
+    const opts = options || {};
+    return (
+      <div
+        style={{
+          border: '1px solid ' + (item.warning ? '#ebcccc' : '#dfe5ef'),
+          borderRadius: '6px',
+          background: item.warning ? '#fffafa' : '#fff',
+          boxShadow: '0 1px 2px rgba(18, 32, 58, 0.04)',
+          padding: '14px 16px',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            justifyContent: 'space-between',
+            gap: '12px',
+            flexWrap: 'wrap',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: '12px',
+              flex: '1 1 360px',
+              minWidth: 0,
+            }}
+          >
+            <div
+              style={{
+                width: '34px',
+                height: '34px',
+                borderRadius: '17px',
+                background: item.warning ? '#f8eeee' : '#edf3ff',
+                color: item.warning ? '#a94442' : '#3f77ff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontWeight: 700,
+                flex: '0 0 auto',
+              }}
+            >
+              {item.step}
+            </div>
+            <div style={{minWidth: 0}}>
+              <div
+                className="text-muted"
+                style={{
+                  fontSize: '11px',
+                  textTransform: 'uppercase',
+                  marginBottom: '5px',
+                }}
+              >
+                Step {item.step}
+              </div>
+              <div style={{marginBottom: '6px'}}>
+                <span
+                  style={{
+                    display: 'inline-block',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    background: '#eef2f8',
+                    color: '#334155',
+                    fontSize: '12px',
+                    fontWeight: 700,
+                  }}
+                >
+                  {item.type_label}
+                </span>
+              </div>
+              <div
+                style={{
+                  color: item.warning ? '#a94442' : '#1f2937',
+                  fontWeight: 600,
+                  lineHeight: '1.45',
+                  wordBreak: 'break-word',
+                }}
+              >
+                {item.summary}
+              </div>
+            </div>
+          </div>
+          <Button
+            bsSize="small"
+            onClick={this.editPreviewNode.bind(this, item.node)}
+          >
+            Edit in list
+          </Button>
+        </div>
+        {this.renderPreviewConnectionPanel(item, opts)}
+      </div>
+    );
+  }
+
+  renderPreviewMissingBlock(block) {
+    const target = block.target || {};
+    return (
+      <div
+        style={{
+          border: '1px solid #ebcccc',
+          borderRadius: '6px',
+          background: '#fffafa',
+          color: '#a94442',
+          padding: '12px 14px',
+          fontWeight: 600,
+        }}
+      >
+        {target.label || 'Target missing'}
+      </div>
+    );
+  }
+
+  renderPreviewReferenceBlock(block) {
+    const target = block.target || {};
+    return (
+      <div
+        style={{
+          border: '1px dashed #d79a25',
+          borderRadius: '6px',
+          background: block.warning ? '#fffafa' : '#fffaf0',
+          color: block.warning ? '#a94442' : '#8a5a00',
+          padding: '12px 14px',
+          fontWeight: 600,
+        }}
+      >
+        {block.label || 'Continues at'} {target.label}{target.type_label ? ' (' + target.type_label + ')' : ''}
+      </div>
+    );
+  }
+
+  previewBlockContinues(block) {
+    if (!block || block.kind !== 'node') {
+      return false;
+    }
+    const item = block.item || {};
+    return item.type !== 'exit' &&
+      item.type !== 'go_to' &&
+      !automationBranchNode(item.type) &&
+      !item.terminal_label;
+  }
+
+  renderPreviewBlock(block, index, blocks, options) {
+    const opts = options || {};
+    let rendered = null;
+    if (block.kind === 'node') {
+      rendered = this.renderPreviewNodeCard(block.item, opts);
+    } else if (block.kind === 'missing') {
+      rendered = this.renderPreviewMissingBlock(block);
+    } else {
+      rendered = this.renderPreviewReferenceBlock(block);
+    }
+
+    return (
+      <div key={(block.item || block.target || {}).id || block.kind + '-' + index}>
+        {rendered}
+        {
+          index < blocks.length - 1 && this.previewBlockContinues(block) ?
+            <div
+              aria-hidden="true"
+              style={{
+                width: '2px',
+                height: '18px',
+                background: '#dfe5ef',
+                marginLeft: '33px',
+              }}
+            />
+          :
+            null
+        }
+      </div>
+    );
+  }
+
+  renderPreviewBranchLanes(branch) {
+    if (!branch) {
+      return null;
+    }
+
+    return (
+      <div
+        style={{
+          marginTop: '16px',
+          padding: '14px',
+          borderRadius: '8px',
+          background: '#f8fafc',
+          border: '1px solid #e5ebf3',
+        }}
+      >
+        <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '10px'}}>
+          Branch paths
+        </div>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+            gap: '14px',
+          }}
+        >
+          {
+            _.map(branch.lanes, lane => (
+              <div
+                key={lane.label}
+                style={{
+                  minWidth: 0,
+                  border: '1px solid #dfe5ef',
+                  borderRadius: '8px',
+                  background: '#fff',
+                  padding: '12px',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'inline-block',
+                    padding: '4px 10px',
+                    borderRadius: '12px',
+                    background: lane.label === 'No' ? '#fff1f1' : '#eefaf1',
+                    color: lane.label === 'No' ? '#a94442' : '#2f7d46',
+                    fontWeight: 700,
+                    fontSize: '12px',
+                    marginBottom: '10px',
+                  }}
+                >
+                  {lane.label} lane
+                </div>
+                {
+                  lane.blocks.length ?
+                    _.map(lane.blocks, (block, index) => this.renderPreviewBlock(block, index, lane.blocks, {suppressBranchPanel: false}))
+                  :
+                    this.renderPreviewMissingBlock({
+                      kind: 'missing',
+                      target: {
+                        label: 'Target missing',
+                      },
+                    })
+                }
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    );
+  }
+
   renderWorkflowPreview(nodes) {
-    const items = automationWorkflowPreviewItems(nodes, {
+    const flow = automationWorkflowPreviewFlow(nodes, {
       emails: this.props.emails || [],
       lists: this.props.lists || [],
     });
@@ -1676,121 +2171,8 @@ class AutomationWorkflowEditor extends Component {
         <div className="help-block" style={{marginBottom: '12px'}}>
           Read-only preview of the draft workflow. Edit nodes in the list view.
         </div>
-        {
-          _.map(items, item => (
-            <div
-              key={item.id}
-              style={{
-                marginBottom: item.step < items.length && !item.linear_continuation ? '18px' : 0,
-              }}
-            >
-              <div
-                style={{
-                  border: '1px solid ' + (item.warning ? '#ebcccc' : '#dfe5ef'),
-                  borderRadius: '6px',
-                  background: item.warning ? '#fffafa' : '#fff',
-                  boxShadow: '0 1px 2px rgba(18, 32, 58, 0.04)',
-                  padding: '14px 16px',
-                }}
-              >
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'flex-start',
-                    justifyContent: 'space-between',
-                    gap: '12px',
-                    flexWrap: 'wrap',
-                  }}
-                >
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      gap: '12px',
-                      flex: '1 1 420px',
-                      minWidth: 0,
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: '34px',
-                        height: '34px',
-                        borderRadius: '17px',
-                        background: item.warning ? '#f8eeee' : '#edf3ff',
-                        color: item.warning ? '#a94442' : '#3f77ff',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontWeight: 700,
-                        flex: '0 0 auto',
-                      }}
-                    >
-                      {item.step}
-                    </div>
-                    <div style={{minWidth: 0}}>
-                      <div
-                        className="text-muted"
-                        style={{
-                          fontSize: '11px',
-                          textTransform: 'uppercase',
-                          marginBottom: '5px',
-                        }}
-                      >
-                        Step {item.step}
-                      </div>
-                      <div style={{marginBottom: '6px'}}>
-                        <span
-                          style={{
-                            display: 'inline-block',
-                            padding: '3px 8px',
-                            borderRadius: '4px',
-                            background: '#eef2f8',
-                            color: '#334155',
-                            fontSize: '12px',
-                            fontWeight: 700,
-                          }}
-                        >
-                          {item.type_label}
-                        </span>
-                      </div>
-                      <div
-                        style={{
-                          color: item.warning ? '#a94442' : '#1f2937',
-                          fontWeight: 600,
-                          lineHeight: '1.45',
-                          wordBreak: 'break-word',
-                        }}
-                      >
-                        {item.summary}
-                      </div>
-                    </div>
-                  </div>
-                  <Button
-                    bsSize="small"
-                    onClick={this.editPreviewNode.bind(this, item.node)}
-                  >
-                    Edit in list
-                  </Button>
-                </div>
-                {this.renderPreviewConnectionPanel(item)}
-              </div>
-              {
-                item.linear_continuation ?
-                  <div
-                    aria-hidden="true"
-                    style={{
-                      width: '2px',
-                      height: '18px',
-                      background: '#dfe5ef',
-                      marginLeft: '33px',
-                    }}
-                  />
-                :
-                  null
-              }
-            </div>
-          ))
-        }
+        {_.map(flow.main, (block, index) => this.renderPreviewBlock(block, index, flow.main, {suppressBranchPanel: !!flow.branch && block.item === flow.branch.item}))}
+        {this.renderPreviewBranchLanes(flow.branch)}
       </div>
     );
   }
