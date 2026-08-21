@@ -3280,6 +3280,113 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def assert_if_conditions_clicked_email_counts_current_enrolment_only(self, click_match, configured_url=None, event_url=None):
+        email, contact_id = self.create_contact()
+        suffix = self.unique()
+        automation = self.user_post(
+            "/api/automations",
+            json={"name": "automation_execution_compound_click_scope_%s" % suffix},
+        )
+        automation_email = self.user_post(
+            "/api/automations/%s/emails" % automation["id"],
+            json={
+                "name": "Compound click scope email",
+                "subject": "Compound click scope subject",
+                "rawText": "<p>Hello</p>",
+            },
+        )
+        item = {
+            "type": "clicked_email",
+            "automation_email_id": automation_email["id"],
+            "click_match": click_match,
+        }
+        if configured_url is not None:
+            item["link_url"] = configured_url
+        nodes = [
+            {
+                "id": "node_compound_condition_1",
+                "type": "if_conditions",
+                "label": "If conditions",
+                "condition": {
+                    "mode": "all",
+                    "items": [item],
+                },
+                "yes_node_id": "node_add_tag_1",
+                "no_node_id": "node_exit_1",
+            },
+            {"id": "node_add_tag_1", "type": "add_tag", "label": "Add branch tag", "draft_tag": "compound-branch"},
+            {"id": "node_exit_1", "type": "exit", "label": "Exit automation"},
+        ]
+        self.user_patch(
+            "/api/automations/%s" % automation["id"],
+            json=self.workflow(nodes=nodes, reentry="multiple"),
+        )
+        automation = self.simulate_post(
+            "/api/automations/%s/publish" % automation["id"],
+            headers=self.headers(),
+        ).json
+
+        first_enrolment = self.enrol(automation["id"], email)
+        event_data = {"test_id": self.test_id}
+        if event_url is not None:
+            event_data["link_url"] = event_url
+        self.insert_open_event(
+            automation["id"],
+            first_enrolment["id"],
+            contact_id,
+            email,
+            automation_email["id"],
+            event_type="click",
+            event_data=event_data,
+        )
+        first = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json["enrolment"]["current_node_id"], "node_add_tag_1")
+        self.assertEqual(first.json["step_run"]["result"], True)
+        self.assertEqual(first.json["step_run"]["conditions"][0]["click_match"], click_match)
+        if click_match == "url":
+            self.assertEqual(first.json["step_run"]["conditions"][0]["effective_click_match"], "url_exact")
+        else:
+            self.assertEqual(first.json["step_run"]["conditions"][0]["effective_click_match"], click_match)
+        self.assertEqual(self.run_next(automation["id"], first_enrolment["id"]).status_code, 200)
+        exited = self.run_next(automation["id"], first_enrolment["id"])
+        self.assertEqual(exited.status_code, 200)
+        self.assertEqual(exited.json["enrolment"]["status"], "exited")
+
+        second_enrolment = self.enrol(automation["id"], email)
+        second = self.run_next(automation["id"], second_enrolment["id"])
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.assertEqual(second.json["step_run"]["result"], False)
+
+        self.cleanup(automation["id"])
+
+    def test_if_conditions_clicked_email_legacy_url_counts_current_enrolment_only(self):
+        self.assert_if_conditions_clicked_email_counts_current_enrolment_only(
+            "url",
+            configured_url="https://example.com/compound",
+            event_url="https://example.com/compound",
+        )
+
+    def test_if_conditions_clicked_email_any_counts_current_enrolment_only(self):
+        self.assert_if_conditions_clicked_email_counts_current_enrolment_only(
+            "any",
+        )
+
+    def test_if_conditions_clicked_email_url_exact_counts_current_enrolment_only(self):
+        self.assert_if_conditions_clicked_email_counts_current_enrolment_only(
+            "url_exact",
+            configured_url="https://example.com/compound",
+            event_url="https://example.com/compound",
+        )
+
+    def test_if_conditions_clicked_email_url_prefix_counts_current_enrolment_only(self):
+        self.assert_if_conditions_clicked_email_counts_current_enrolment_only(
+            "url_prefix",
+            configured_url="https://example.com/compound",
+            event_url="https://example.com/compound?utm=1",
+        )
+
     def test_if_conditions_list_membership_conditions(self):
         email, contact_id = self.create_contact()
         in_list_id = self.contact_list_ids(contact_id)[0]
