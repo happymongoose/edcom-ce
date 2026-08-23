@@ -467,6 +467,20 @@ describe('automation enrolment display helpers', () => {
     expect(JSON.stringify(nodes)).toBe(before);
   });
 
+  it('includes contact counts in visual preview items', () => {
+    const nodes = [
+      {id: 'one', type: 'add_tag', label: 'Add', draft_tag: 'vip'},
+      {id: 'two', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {
+      nodeContactCount: node => node.id === 'one' ? 7 : 0,
+    });
+
+    expect(flow.main[0].item.contact_count).toBe(7);
+    expect(flow.main[1].item.contact_count).toBe(0);
+  });
+
   it('derives a path-based preview with a single path before the first branch', () => {
     const nodes = [
       {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},

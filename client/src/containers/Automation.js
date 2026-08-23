@@ -1925,6 +1925,12 @@ class Automation extends Component {
               tags={this.props.tags || []}
               entryTags={entryTagValues(data.entry)}
               update={this.props.update}
+              nodeContactCount={node => automationNodeContactCount(
+                node,
+                (data.draft && data.draft.nodes) || [],
+                (data.published && data.published.nodes) || [],
+                (this.props.enrolmentsData && this.props.enrolmentsData.summary) || {}
+              )}
               renderNodeContactCount={this.renderNodeContactCount.bind(this)}
             />
             {this.renderEnrolments()}

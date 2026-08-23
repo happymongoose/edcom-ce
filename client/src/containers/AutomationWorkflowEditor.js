@@ -376,6 +376,7 @@ export function automationWorkflowPreviewItems(nodes, options) {
       id: node.id,
       node: node,
       step: index + 1,
+      contact_count: _.isFunction(opts.nodeContactCount) ? opts.nodeContactCount(node) : null,
       type: node.type,
       type_label: automationNodeTypeLabel(node.type),
       summary: summary,
@@ -506,6 +507,7 @@ function automationWorkflowPreviewItemForNode(workflowNodes, node, options) {
     id: node.id,
     node: node,
     step: index + 1,
+    contact_count: _.isFunction(opts.nodeContactCount) ? opts.nodeContactCount(node) : null,
     type: node.type,
     type_label: node.type === 'exit' ? 'Exit automation' : automationNodeTypeLabel(node.type),
     summary: summary,
@@ -2058,6 +2060,14 @@ class AutomationWorkflowEditor extends Component {
                 }}
               >
                 Step {item.step}
+                {
+                  item.contact_count !== null && item.contact_count !== undefined ?
+                    <span style={{textTransform: 'none', fontWeight: 400}}>
+                      {' '}({item.contact_count} {item.contact_count === 1 ? 'contact' : 'contacts'})
+                    </span>
+                  :
+                    null
+                }
               </div>
               <div
                 style={{
@@ -2322,6 +2332,7 @@ class AutomationWorkflowEditor extends Component {
     const flow = automationWorkflowPreviewFlow(nodes, {
       emails: this.props.emails || [],
       lists: this.props.lists || [],
+      nodeContactCount: this.props.nodeContactCount,
     });
 
     return (
