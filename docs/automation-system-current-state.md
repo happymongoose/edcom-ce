@@ -46,10 +46,31 @@ Draft/publish and manual execution:
 - `if_clicked_email`
 
 `if_clicked_email` supports any-click, exact URL, and conservative URL-prefix
-matching for clicks captured from the selected automation email.
+matching for clicks captured from the selected automation email. Engagement
+checks are scoped to the current account, automation, enrolment/pass, contact,
+selected automation email, and event type. A click from an earlier pass through
+the same automation does not count for a later enrolment.
+
+Click match modes:
+
+- `any`: any captured click in the selected automation email.
+- `url_exact`: normalized URL equality. Legacy `click_match: "url"` remains
+  compatible with this exact-match behavior.
+- `url_prefix`: conservative prefix matching for query/hash variants without
+  matching sibling paths such as `/somepage-other`.
+
 `if_conditions` supports flat ALL/ANY groups for tag, list membership, opened
 email, and clicked email conditions. Nested condition groups are intentionally
 deferred.
+
+Flat `if_conditions` item types currently supported:
+
+- `has_tag`
+- `missing_tag`
+- `opened_email`
+- `clicked_email`
+- `in_list`
+- `not_in_list`
 
 ## Entry Trigger Types
 
@@ -138,6 +159,12 @@ are current-account scoped; funnel message sources require both the message and
 the referenced funnel to belong to the current account, and the message must be
 present in `funnels.data.messages[]`.
 
+Automation email links can be discovered through a read-only, side-effect-free
+endpoint for configuring URL-specific click conditions. The extractor returns
+metadata only, does not insert rows into tracking/link tables, and does not
+return raw body/design JSON. Manual URL entry remains available when discovery
+misses a link or when a URL should be matched by prefix.
+
 ## Schedulers And Processors
 
 - Automation enrolment processor:
@@ -191,17 +218,54 @@ Admin/support impersonation can view automation diagnostics regardless of `autom
 
 Diagnostic endpoints are backend-gated by automation diagnostics visibility. Frontend menu hiding is convenience only.
 
+## Workflow Editor And Visual Preview
+
+The workflow editor remains the list/card editing surface and the source of
+draft workflow changes. The visual workflow preview is read-only and does not
+mutate workflow JSON.
+
+Current preview behavior:
+
+- Shows draft workflow nodes as step cards with type labels, compact summaries,
+  and contact counts.
+- Uses a path-based layout for the first branch so Yes and No paths render in
+  separate lanes instead of falling back to raw array order.
+- Shows `go_to` nodes as explicit jumps to their target step and does not imply
+  normal next-step continuation.
+- Shows `exit` and final nodes as terminal.
+- Shows missing/invalid targets as warning states.
+- Stops at nested branch nodes with a clear "Nested branch not expanded in this
+  preview" message. Full nested branch layout is deferred.
+- Protects against loops/repeated targets with visited/max-depth bounds.
+- Shows a narrow-screen fallback message for visual preview instead of trying
+  to render a misleading phone-sized flowchart. Edit list mode remains
+  available on narrow screens.
+
 ## Queue Purging And Recovery
 
 Existing broadcast, funnel, and transactional admin queue purge actions delete rows from their queue tables (`campqueue`, `funnelqueue`, and `txnqueue`). Automation does not have a single equivalent queue table: work is represented across enrolments, trigger events, scanner snapshots, claims, retry/backoff metadata, and history tables.
 
-Do not add a broad "Purge automation queue" action. Future admin recovery actions should be narrow and state-preserving, such as:
+Do not add a broad "Purge automation queue" action. Admin recovery actions
+should be narrow and state-preserving.
+
+Currently implemented admin recovery controls live in the admin customer
+Automation Operations section:
+
+- Clear stale automation enrolment claims.
+- Clear stale trigger event claims.
+- Clear stale segment scanner claims.
+
+These controls are admin-only and customer-scoped. They default to dry-run,
+return bounded preview/apply results, and require `dry_run: false` plus an exact
+confirmation token to apply. They never delete rows and do not remove step-run
+history, engagement events, debug logs, trigger events, segment snapshots, or
+segment members.
+
+Future recovery actions may include:
 
 - Pause all automations for a customer.
-- Clear stale automation execution claims.
 - Cancel selected active enrolments.
 - Cancel pending trigger events.
-- Clear stale trigger/scanner claims.
 - Rebuild a selected segment trigger baseline.
 
 Recovery actions should preserve audit/history where possible. `automation_step_runs`, `automation_email_events`, `debug_email_logs`, and terminal `automation_enrolments` should not be purged except through deliberate retention policies. Any future recovery action must be admin-only, customer-scoped, explicit, and should preferably preview/report what it will change before applying.
