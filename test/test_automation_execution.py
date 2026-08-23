@@ -5564,6 +5564,21 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn("confirmation is required", result.text)
 
+    def test_recovery_apply_requires_exact_confirmation(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+
+        result = self.recovery_post(
+            cid,
+            "clear-stale-trigger-event-claims",
+            {
+                "dry_run": False,
+                "confirm": "clear_stale_enrolment_claims",
+            },
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("confirmation is required", result.text)
+
     def test_recovery_clears_only_eligible_stale_enrolment_claims(self):
         cid = self.create_scheduler_candidate_account(status="ready")
         other_cid = self.create_scheduler_candidate_account(status="ready")
