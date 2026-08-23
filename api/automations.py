@@ -2471,9 +2471,14 @@ AUTOMATION_PROCESS_DEFAULT_LIMIT = 25
 AUTOMATION_PROCESS_MAX_LIMIT = 100
 AUTOMATION_PROCESS_ERROR_LIMIT = 100
 AUTOMATION_PROCESS_ACCOUNT_LIMIT = 50
+AUTOMATION_RECOVERY_DEFAULT_LIMIT = 50
+AUTOMATION_RECOVERY_MAX_LIMIT = 100
 CHECK_AUTOMATION_ENROLMENTS_LOCK = 58413921
 CHECK_AUTOMATION_SEGMENT_TRIGGERS_LOCK = 58413922
 AUTOMATION_RETENTION_CLEANUP_LOCK = 98337413
+AUTOMATION_RECOVERY_ENROLMENT_CLAIMS_LOCK = 58413931
+AUTOMATION_RECOVERY_TRIGGER_EVENT_CLAIMS_LOCK = 58413932
+AUTOMATION_RECOVERY_SEGMENT_SCANNER_CLAIMS_LOCK = 58413933
 AUTOMATION_RETENTION_DEBUG_LOG_DAYS = 14
 AUTOMATION_RETENTION_TRIGGER_EVENT_DAYS = 30
 AUTOMATION_RETENTION_ACCOUNT_LIMIT = 25
@@ -6093,6 +6098,329 @@ def _automation_processing_status(db: DB, cid: str) -> JsonObj:
         "stale_running": stale_running,
         "flags": _automation_processing_feature_flags(),
     }
+
+
+def _automation_recovery_limit(value: object) -> int:
+    limit = _safe_int(value, AUTOMATION_RECOVERY_DEFAULT_LIMIT)
+    return max(1, min(limit, AUTOMATION_RECOVERY_MAX_LIMIT))
+
+
+def _automation_recovery_lock(db: DB, lock_id: int) -> bool:
+    return bool(db.single("select pg_try_advisory_xact_lock(%s::bigint)", lock_id))
+
+
+def _automation_recovery_base_result(action: str, cid: str, dry_run: bool, limit: int) -> JsonObj:
+    return {
+        "action": action,
+        "company_id": cid,
+        "dry_run": dry_run,
+        "stale_after_minutes": int(CLAIM_STALE_AFTER.total_seconds() / 60),
+        "matched_count": 0,
+        "changed_count": 0,
+        "limit": limit,
+        "locked": False,
+        "items": [],
+        "warnings": [],
+    }
+
+
+def recover_stale_automation_enrolment_claims(
+    db: DB,
+    cid: str,
+    dry_run: bool = True,
+    limit: int = AUTOMATION_RECOVERY_DEFAULT_LIMIT,
+    automation_id: str | None = None,
+    recovered_by_uid: str | None = None,
+) -> JsonObj:
+    limit = _automation_recovery_limit(limit)
+    action = "clear_stale_enrolment_claims"
+    result = _automation_recovery_base_result(action, cid, dry_run, limit)
+    stale_before = datetime.utcnow() - CLAIM_STALE_AFTER
+    now = _iso_datetime(datetime.utcnow())
+
+    with db.transaction():
+        if not _automation_recovery_lock(db, AUTOMATION_RECOVERY_ENROLMENT_CLAIMS_LOCK):
+            result["locked"] = True
+            return result
+
+        if dry_run:
+            rows = db.execute(
+                """
+                select e.id, e.automation_id, a.data->>'name', e.contact_email,
+                    e.data->>'running_status', e.data->>'claimed_at', e.data->>'claimed_node_id'
+                from automation_enrolments e
+                join automations a on a.cid = e.cid and a.id = e.automation_id
+                where e.cid = %s
+                    and (%s is null or e.automation_id = %s)
+                    and e.data->>'status' = 'running'
+                    and e.data->>'running_status' in ('ready', 'waiting')
+                    and nullif(e.data->>'claimed_at', '')::timestamptz < %s
+                order by nullif(e.data->>'claimed_at', '')::timestamptz, e.id
+                limit %s
+                """,
+                cid,
+                automation_id,
+                automation_id,
+                stale_before,
+                limit,
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                with candidates as (
+                    select e.id, e.automation_id, a.data->>'name' as automation_name, e.contact_email,
+                        e.data->>'running_status' as restore_status,
+                        e.data->>'claimed_at' as claimed_at,
+                        e.data->>'claimed_node_id' as claimed_node_id
+                    from automation_enrolments e
+                    join automations a on a.cid = e.cid and a.id = e.automation_id
+                    where e.cid = %s
+                        and (%s is null or e.automation_id = %s)
+                        and e.data->>'status' = 'running'
+                        and e.data->>'running_status' in ('ready', 'waiting')
+                        and nullif(e.data->>'claimed_at', '')::timestamptz < %s
+                    order by nullif(e.data->>'claimed_at', '')::timestamptz, e.id
+                    limit %s
+                    for update skip locked
+                )
+                update automation_enrolments e
+                set data = e.data || jsonb_build_object(
+                    'status', candidates.restore_status,
+                    'running_status', null,
+                    'claim_token', null,
+                    'claimed_at', null,
+                    'claimed_node_id', null,
+                    'claimed_published_revision', null,
+                    'modified', %s,
+                    'admin_recovered_at', %s,
+                    'admin_recovered_by_uid', %s,
+                    'admin_recovery_action', %s
+                )
+                from candidates
+                where e.cid = %s and e.id = candidates.id
+                returning e.id, e.automation_id, candidates.automation_name, candidates.contact_email,
+                    candidates.restore_status, candidates.claimed_at, candidates.claimed_node_id
+                """,
+                cid,
+                automation_id,
+                automation_id,
+                stale_before,
+                limit,
+                now,
+                now,
+                recovered_by_uid,
+                action,
+                cid,
+            ).fetchall()
+
+    result["matched_count"] = len(rows)
+    result["changed_count"] = 0 if dry_run else len(rows)
+    result["items"] = [
+        {
+            "enrolment_id": enrolment_id,
+            "automation_id": automation_id,
+            "automation_name": automation_name or "",
+            "contact_email": contact_email or "",
+            "restore_status": restore_status,
+            "claimed_at": claimed_at,
+            "claimed_node_id": claimed_node_id,
+        }
+        for enrolment_id, automation_id, automation_name, contact_email, restore_status, claimed_at, claimed_node_id in rows
+    ]
+    return result
+
+
+def recover_stale_automation_trigger_event_claims(
+    db: DB,
+    cid: str,
+    dry_run: bool = True,
+    limit: int = AUTOMATION_RECOVERY_DEFAULT_LIMIT,
+    event_type: str | None = None,
+    recovered_by_uid: str | None = None,
+) -> JsonObj:
+    limit = _automation_recovery_limit(limit)
+    action = "clear_stale_trigger_event_claims"
+    result = _automation_recovery_base_result(action, cid, dry_run, limit)
+    stale_before = datetime.utcnow() - CLAIM_STALE_AFTER
+    now = _utc_now()
+
+    with db.transaction():
+        if not _automation_recovery_lock(db, AUTOMATION_RECOVERY_TRIGGER_EVENT_CLAIMS_LOCK):
+            result["locked"] = True
+            return result
+
+        if dry_run:
+            rows = db.execute(
+                """
+                select id, event_type, contact_email, data->>'claimed_at',
+                    data->>'tag', data->>'list_id', data->>'segment_id'
+                from automation_trigger_events
+                where cid = %s
+                    and (%s is null or event_type = %s)
+                    and data->>'status' = 'processing'
+                    and nullif(data->>'claimed_at', '')::timestamptz < %s
+                order by nullif(data->>'claimed_at', '')::timestamptz, id
+                limit %s
+                """,
+                cid,
+                event_type,
+                event_type,
+                stale_before,
+                limit,
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                with candidates as (
+                    select id, event_type, contact_email, data->>'claimed_at' as claimed_at,
+                        data->>'tag' as tag, data->>'list_id' as list_id, data->>'segment_id' as segment_id
+                    from automation_trigger_events
+                    where cid = %s
+                        and (%s is null or event_type = %s)
+                        and data->>'status' = 'processing'
+                        and nullif(data->>'claimed_at', '')::timestamptz < %s
+                    order by nullif(data->>'claimed_at', '')::timestamptz, id
+                    limit %s
+                    for update skip locked
+                )
+                update automation_trigger_events e
+                set data = e.data || jsonb_build_object(
+                    'status', 'pending',
+                    'claimed_at', null,
+                    'admin_recovered_at', %s,
+                    'admin_recovered_by_uid', %s,
+                    'admin_recovery_action', %s,
+                    'recovery_count', coalesce((e.data->>'recovery_count')::int, 0) + 1
+                )
+                from candidates
+                where e.cid = %s and e.id = candidates.id
+                returning e.id, e.event_type, candidates.contact_email, candidates.claimed_at,
+                    candidates.tag, candidates.list_id, candidates.segment_id
+                """,
+                cid,
+                event_type,
+                event_type,
+                stale_before,
+                limit,
+                now,
+                recovered_by_uid,
+                action,
+                cid,
+            ).fetchall()
+
+    result["matched_count"] = len(rows)
+    result["changed_count"] = 0 if dry_run else len(rows)
+    result["items"] = [
+        {
+            "event_id": event_id,
+            "event_type": row_event_type,
+            "contact_email": contact_email or "",
+            "claimed_at": claimed_at,
+            "tag": tag,
+            "list_id": list_id,
+            "segment_id": segment_id,
+        }
+        for event_id, row_event_type, contact_email, claimed_at, tag, list_id, segment_id in rows
+    ]
+    return result
+
+
+def recover_stale_automation_segment_scanner_claims(
+    db: DB,
+    cid: str,
+    dry_run: bool = True,
+    limit: int = AUTOMATION_RECOVERY_DEFAULT_LIMIT,
+    segment_id: str | None = None,
+    recovered_by_uid: str | None = None,
+) -> JsonObj:
+    limit = _automation_recovery_limit(limit)
+    action = "clear_stale_segment_scanner_claims"
+    result = _automation_recovery_base_result(action, cid, dry_run, limit)
+    stale_before = datetime.utcnow() - CLAIM_STALE_AFTER
+    now = _utc_now()
+
+    with db.transaction():
+        if not _automation_recovery_lock(db, AUTOMATION_RECOVERY_SEGMENT_SCANNER_CLAIMS_LOCK):
+            result["locked"] = True
+            return result
+
+        if dry_run:
+            rows = db.execute(
+                """
+                select s.id, s.segment_id, coalesce(seg.data->>'name', ''), s.status,
+                    s.claimed_at, s.hashlimit, s.last_hashval
+                from automation_segment_trigger_snapshots s
+                left join segments seg on seg.cid = s.cid and seg.id = s.segment_id
+                where s.cid = %s
+                    and (%s is null or s.segment_id = %s)
+                    and s.status in ('baselining', 'diffing')
+                    and s.claimed_at < %s
+                order by s.claimed_at, s.id
+                limit %s
+                """,
+                cid,
+                segment_id,
+                segment_id,
+                stale_before,
+                limit,
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                with candidates as (
+                    select s.id, s.segment_id, coalesce(seg.data->>'name', '') as segment_name,
+                        s.status as previous_status, s.claimed_at, s.hashlimit, s.last_hashval
+                    from automation_segment_trigger_snapshots s
+                    left join segments seg on seg.cid = s.cid and seg.id = s.segment_id
+                    where s.cid = %s
+                        and (%s is null or s.segment_id = %s)
+                        and s.status in ('baselining', 'diffing')
+                        and s.claimed_at < %s
+                    order by s.claimed_at, s.id
+                    limit %s
+                    for update skip locked
+                )
+                update automation_segment_trigger_snapshots s
+                set status = 'idle',
+                    claimed_at = null,
+                    claim_token = null,
+                    data = s.data || jsonb_build_object(
+                        'admin_recovered_at', %s,
+                        'admin_recovered_by_uid', %s,
+                        'admin_recovery_action', %s,
+                        'admin_recovered_status', candidates.previous_status
+                    )
+                from candidates
+                where s.cid = %s and s.id = candidates.id
+                returning s.id, s.segment_id, candidates.segment_name, candidates.previous_status,
+                    candidates.claimed_at, candidates.hashlimit, candidates.last_hashval
+                """,
+                cid,
+                segment_id,
+                segment_id,
+                stale_before,
+                limit,
+                now,
+                recovered_by_uid,
+                action,
+                cid,
+            ).fetchall()
+
+    result["matched_count"] = len(rows)
+    result["changed_count"] = 0 if dry_run else len(rows)
+    result["items"] = [
+        {
+            "snapshot_id": snapshot_id,
+            "segment_id": row_segment_id,
+            "segment_name": segment_name or "",
+            "previous_status": previous_status,
+            "claimed_at": claimed_at.isoformat() if hasattr(claimed_at, "isoformat") else claimed_at,
+            "hashlimit": hashlimit,
+            "last_hashval": last_hashval,
+        }
+        for snapshot_id, row_segment_id, segment_name, previous_status, claimed_at, hashlimit, last_hashval in rows
+    ]
+    return result
 
 
 def _automation_segment_trigger_status_flags(db: DB, cid: str) -> JsonObj:

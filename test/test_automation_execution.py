@@ -6,7 +6,12 @@ from datetime import datetime, timedelta
 
 import test_base
 from api import automations
-from api.migrations import add_automation_email_events_table, add_debug_email_tables
+from api.migrations import (
+    add_automation_email_events_table,
+    add_automation_segment_trigger_baselines_table,
+    add_automation_trigger_events_table,
+    add_debug_email_tables,
+)
 
 
 class TestAutomationExecution(test_base.TestBase):
@@ -15,6 +20,8 @@ class TestAutomationExecution(test_base.TestBase):
         super(TestAutomationExecution, self).setUp()
         add_debug_email_tables.run(self.db)
         add_automation_email_events_table.run(self.db)
+        add_automation_trigger_events_table.run(self.db)
+        add_automation_segment_trigger_baselines_table.run(self.db)
         self.created_list_ids = []
         self.created_emails = []
         self.test_id = "automation_execution_%s" % shortuuid.uuid().lower()
@@ -141,6 +148,18 @@ class TestAutomationExecution(test_base.TestBase):
     def cleanup_scheduler_accounts(self):
         if not self.created_scheduler_cids:
             return
+        self.db.execute(
+            "delete from automation_segment_trigger_members where cid = any(%s)",
+            self.created_scheduler_cids,
+        )
+        self.db.execute(
+            "delete from automation_segment_trigger_snapshots where cid = any(%s)",
+            self.created_scheduler_cids,
+        )
+        self.db.execute(
+            "delete from automation_trigger_events where cid = any(%s)",
+            self.created_scheduler_cids,
+        )
         self.db.execute(
             "delete from automation_step_runs where cid = any(%s)",
             self.created_scheduler_cids,
@@ -5454,6 +5473,244 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result.json["summary"]["failed"], 0)
         self.assertEqual(result.json["summary"]["total"], 1)
         self.assertNotEqual(cid, other_cid)
+
+    def recovery_post(self, cid, action, body=None, headers=None):
+        return self.simulate_post(
+            "/api/companies/%s/automation-recovery/%s" % (cid, action),
+            json=body or {},
+            headers=headers or self.admin_headers(),
+        )
+
+    def scheduler_enrolment_id(self, cid):
+        return self.db.single("select id from automation_enrolments where cid = %s limit 1", cid)
+
+    def scheduler_automation_id(self, cid):
+        return self.db.single("select id from automations where cid = %s limit 1", cid)
+
+    def set_scheduler_enrolment_data(self, cid, data):
+        self.db.execute(
+            "update automation_enrolments set data = data || %s where cid = %s",
+            data,
+            cid,
+        )
+
+    def test_customer_cannot_run_automation_recovery(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+
+        result = self.recovery_post(
+            cid,
+            "clear-stale-enrolment-claims",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(result.status_code, 401)
+
+    def test_recovery_dry_run_for_each_action_mutates_nothing(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+        stale = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        self.set_scheduler_enrolment_data(cid, {
+            "status": "running",
+            "running_status": "ready",
+            "claim_token": "stale-enrolment",
+            "claimed_at": stale,
+            "claimed_node_id": "node_add_tag_1",
+        })
+        self.db.execute(
+            """
+            insert into automation_trigger_events
+                (id, cid, contact_id, contact_email, event_type, ts, data)
+            values (%s, %s, 1, %s, 'tag_added', now(), %s)
+            """,
+            "trigger-dry-run-%s" % self.unique(),
+            cid,
+            "trigger-dry-run@example.com",
+            {"status": "processing", "claimed_at": stale, "tag": "vip"},
+        )
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_snapshots
+                (id, cid, segment_id, status, hashlimit, last_hashval, claimed_at, claim_token, data)
+            values (%s, %s, %s, 'baselining', 1, null, %s, 'stale-segment', %s)
+            """,
+            "snapshot-dry-run-%s" % self.unique(),
+            cid,
+            "segment-dry-run",
+            stale,
+            {"baseline_complete": False},
+        )
+
+        enrolment_result = self.recovery_post(cid, "clear-stale-enrolment-claims")
+        trigger_result = self.recovery_post(cid, "clear-stale-trigger-event-claims")
+        segment_result = self.recovery_post(cid, "clear-stale-segment-scanner-claims")
+
+        for result in (enrolment_result, trigger_result, segment_result):
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertTrue(result.json["dry_run"])
+            self.assertEqual(result.json["matched_count"], 1)
+            self.assertEqual(result.json["changed_count"], 0)
+        self.assertEqual(self.db.single("select data->>'status' from automation_enrolments where cid = %s", cid), "running")
+        self.assertEqual(self.db.single("select data->>'status' from automation_trigger_events where cid = %s", cid), "processing")
+        self.assertEqual(self.db.single("select status from automation_segment_trigger_snapshots where cid = %s", cid), "baselining")
+
+    def test_recovery_apply_requires_confirmation(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+
+        result = self.recovery_post(
+            cid,
+            "clear-stale-enrolment-claims",
+            {"dry_run": False},
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("confirmation is required", result.text)
+
+    def test_recovery_clears_only_eligible_stale_enrolment_claims(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+        other_cid = self.create_scheduler_candidate_account(status="ready")
+        stale = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        fresh = datetime.utcnow().isoformat() + "Z"
+        self.set_scheduler_enrolment_data(cid, {
+            "status": "running",
+            "running_status": "ready",
+            "claim_token": "stale-enrolment",
+            "claimed_at": stale,
+            "claimed_node_id": "node_add_tag_1",
+        })
+        self.set_scheduler_enrolment_data(other_cid, {
+            "status": "running",
+            "running_status": "ready",
+            "claim_token": "other-stale-enrolment",
+            "claimed_at": stale,
+        })
+        blocked_cid = self.create_scheduler_candidate_account(status="ready")
+        self.set_scheduler_enrolment_data(blocked_cid, {
+            "status": "running",
+            "running_status": "held",
+            "claim_token": "held-stale-enrolment",
+            "claimed_at": stale,
+        })
+        fresh_cid = self.create_scheduler_candidate_account(status="ready")
+        self.set_scheduler_enrolment_data(fresh_cid, {
+            "status": "running",
+            "running_status": "ready",
+            "claim_token": "fresh-enrolment",
+            "claimed_at": fresh,
+        })
+
+        result = self.recovery_post(
+            cid,
+            "clear-stale-enrolment-claims",
+            {
+                "dry_run": False,
+                "confirm": "clear_stale_enrolment_claims",
+                "limit": 1,
+            },
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertFalse(result.json["dry_run"])
+        self.assertEqual(result.json["matched_count"], 1)
+        self.assertEqual(result.json["changed_count"], 1)
+        self.assertEqual(len(result.json["items"]), 1)
+        self.assertNotIn("data", result.json["items"][0])
+        data = self.db.single("select data from automation_enrolments where cid = %s", cid)
+        self.assertEqual(data["status"], "ready")
+        self.assertIsNone(data.get("claim_token"))
+        self.assertEqual(self.db.single("select data->>'claim_token' from automation_enrolments where cid = %s", other_cid), "other-stale-enrolment")
+        self.assertEqual(self.db.single("select data->>'claim_token' from automation_enrolments where cid = %s", blocked_cid), "held-stale-enrolment")
+        self.assertEqual(self.db.single("select data->>'claim_token' from automation_enrolments where cid = %s", fresh_cid), "fresh-enrolment")
+
+    def test_recovery_clears_only_stale_trigger_event_claims(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+        other_cid = self.create_scheduler_candidate_account(status="ready")
+        stale = (datetime.utcnow() - timedelta(minutes=31)).isoformat() + "Z"
+        fresh = datetime.utcnow().isoformat() + "Z"
+        for event_id, row_cid, claimed_at in (
+            ("stale-trigger-%s" % self.unique(), cid, stale),
+            ("fresh-trigger-%s" % self.unique(), cid, fresh),
+            ("other-trigger-%s" % self.unique(), other_cid, stale),
+        ):
+            self.db.execute(
+                """
+                insert into automation_trigger_events
+                    (id, cid, contact_id, contact_email, event_type, ts, data)
+                values (%s, %s, 1, %s, 'tag_added', now(), %s)
+                """,
+                event_id,
+                row_cid,
+                "%s@example.com" % event_id,
+                {"status": "processing", "claimed_at": claimed_at, "tag": "vip"},
+            )
+
+        result = self.recovery_post(
+            cid,
+            "clear-stale-trigger-event-claims",
+            {
+                "dry_run": False,
+                "confirm": "clear_stale_trigger_event_claims",
+                "limit": 1000,
+            },
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["limit"], 100)
+        self.assertEqual(result.json["changed_count"], 1)
+        self.assertEqual(self.db.single("select count(*) from automation_trigger_events where cid = %s and data->>'status' = 'pending'", cid), 1)
+        self.assertEqual(self.db.single("select count(*) from automation_trigger_events where cid = %s and data->>'status' = 'processing'", cid), 1)
+        self.assertEqual(self.db.single("select count(*) from automation_trigger_events where cid = %s and data->>'status' = 'processing'", other_cid), 1)
+        self.assertNotIn("data", result.json["items"][0])
+
+    def test_recovery_clears_only_stale_segment_scanner_claims(self):
+        cid = self.create_scheduler_candidate_account(status="ready")
+        other_cid = self.create_scheduler_candidate_account(status="ready")
+        stale = datetime.utcnow() - timedelta(minutes=31)
+        fresh = datetime.utcnow()
+        for snapshot_id, row_cid, segment_id, status, claimed_at in (
+            ("stale-snapshot-%s" % self.unique(), cid, "segment-stale", "diffing", stale),
+            ("fresh-snapshot-%s" % self.unique(), cid, "segment-fresh", "diffing", fresh),
+            ("completed-snapshot-%s" % self.unique(), cid, "segment-completed", "completed", stale),
+            ("other-snapshot-%s" % self.unique(), other_cid, "segment-other", "baselining", stale),
+        ):
+            self.db.execute(
+                """
+                insert into automation_segment_trigger_snapshots
+                    (id, cid, segment_id, status, hashlimit, last_hashval, claimed_at, claim_token, data)
+                values (%s, %s, %s, %s, 1, 0, %s, 'claim-token', %s)
+                """,
+                snapshot_id,
+                row_cid,
+                segment_id,
+                status,
+                claimed_at,
+                {"baseline_complete": True},
+            )
+        self.db.execute(
+            """
+            insert into automation_segment_trigger_members
+                (cid, segment_id, contact_id, contact_email, bucket, first_seen_at, last_seen_at, scan_id)
+            values (%s, 'segment-stale', 1, 'segment@example.com', 0, now(), now(), 'scan')
+            """,
+            cid,
+        )
+
+        result = self.recovery_post(
+            cid,
+            "clear-stale-segment-scanner-claims",
+            {
+                "dry_run": False,
+                "confirm": "clear_stale_segment_scanner_claims",
+            },
+        )
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["changed_count"], 1)
+        self.assertEqual(self.db.single("select status from automation_segment_trigger_snapshots where cid = %s and segment_id = 'segment-stale'", cid), "idle")
+        self.assertIsNone(self.db.single("select claim_token from automation_segment_trigger_snapshots where cid = %s and segment_id = 'segment-stale'", cid))
+        self.assertEqual(self.db.single("select status from automation_segment_trigger_snapshots where cid = %s and segment_id = 'segment-fresh'", cid), "diffing")
+        self.assertEqual(self.db.single("select status from automation_segment_trigger_snapshots where cid = %s and segment_id = 'segment-completed'", cid), "completed")
+        self.assertEqual(self.db.single("select status from automation_segment_trigger_snapshots where cid = %s and segment_id = 'segment-other'", other_cid), "baselining")
+        self.assertEqual(self.db.single("select count(*) from automation_segment_trigger_members where cid = %s and segment_id = 'segment-stale'", cid), 1)
+        self.assertNotIn("data", result.json["items"][0])
 
     def test_scheduler_feature_flag_off_does_not_dispatch(self):
         os.environ.pop("automation_processing_enabled", None)

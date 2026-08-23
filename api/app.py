@@ -2220,6 +2220,89 @@ class CompanyAutomationOperations(object):
         }
 
 
+class CompanyAutomationRecovery(object):
+
+    ACTIONS = {
+        "clear-stale-enrolment-claims": (
+            "clear_stale_enrolment_claims",
+            automations.recover_stale_automation_enrolment_claims,
+        ),
+        "clear-stale-trigger-event-claims": (
+            "clear_stale_trigger_event_claims",
+            automations.recover_stale_automation_trigger_event_claims,
+        ),
+        "clear-stale-segment-scanner-claims": (
+            "clear_stale_segment_scanner_claims",
+            automations.recover_stale_automation_segment_scanner_claims,
+        ),
+    }
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str, action: str) -> None:
+        if not req.context["admin"]:
+            raise falcon.HTTPUnauthorized()
+
+        action_config = self.ACTIONS.get(action)
+        if action_config is None:
+            raise falcon.HTTPBadRequest(
+                title="Unknown automation recovery action",
+                description="The requested automation recovery action is not supported.",
+            )
+        confirmation_token, handler = action_config
+
+        db = req.context["db"]
+        company = db.companies.get(id)
+        if company is None or company.get("admin"):
+            raise falcon.HTTPForbidden()
+
+        doc = req.context.get("doc") or {}
+        if not isinstance(doc, dict):
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+
+        dry_run = doc.get("dry_run", True) is not False
+        if not dry_run and doc.get("confirm") != confirmation_token:
+            raise falcon.HTTPBadRequest(
+                title="Automation recovery confirmation is required",
+                description="Set dry_run to false and provide confirm=%s to apply this recovery action." % confirmation_token,
+            )
+
+        kwargs = {
+            "db": db,
+            "cid": id,
+            "dry_run": dry_run,
+            "limit": doc.get("limit"),
+            "recovered_by_uid": req.context.get("uid"),
+        }
+        if action == "clear-stale-enrolment-claims":
+            automation_id = doc.get("automation_id")
+            if automation_id is not None and not isinstance(automation_id, str):
+                raise falcon.HTTPBadRequest(
+                    title="Invalid automation_id",
+                    description="automation_id must be a string.",
+                )
+            kwargs["automation_id"] = automation_id
+        elif action == "clear-stale-trigger-event-claims":
+            event_type = doc.get("event_type")
+            if event_type is not None and event_type not in automations.SUPPORTED_TRIGGER_EVENT_TYPES:
+                raise falcon.HTTPBadRequest(
+                    title="Invalid event_type",
+                    description="event_type must be a supported automation trigger event type.",
+                )
+            kwargs["event_type"] = event_type
+        elif action == "clear-stale-segment-scanner-claims":
+            segment_id = doc.get("segment_id")
+            if segment_id is not None and not isinstance(segment_id, str):
+                raise falcon.HTTPBadRequest(
+                    title="Invalid segment_id",
+                    description="segment_id must be a string.",
+                )
+            kwargs["segment_id"] = segment_id
+
+        req.context["result"] = handler(**kwargs)
+
+
 class CompanyCampaign(object):
 
     def on_get(
@@ -3886,6 +3969,7 @@ app.add_route("/api/companylimits", CompanyLimits())
 app.add_route("/api/companies", Companies())
 app.add_route("/api/companies/{id}", Company())
 app.add_route("/api/companies/{id}/automation-operations", CompanyAutomationOperations())
+app.add_route("/api/companies/{id}/automation-recovery/{action}", CompanyAutomationRecovery())
 app.add_route("/api/companies/{id}/users", CompanyUsers())
 app.add_route("/api/companies/{id}/pendinglists", CompanyPendingLists())
 app.add_route(
