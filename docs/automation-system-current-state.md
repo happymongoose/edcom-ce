@@ -2,6 +2,25 @@
 
 This note summarizes the automation system as of the current implementation. It is intended as a development checkpoint before further automation features are added.
 
+## Release Readiness Checkpoint
+
+Current status: automation is suitable for controlled selected-customer testing, not broad rollout.
+
+- Retention cleanup test isolation has been fixed so retention tests no longer depend on global old debug or trigger rows created by other automation suites.
+- The broad focused backend automation suite now passes.
+- Segment trigger scanning remains selected-test/dev-only until real account performance has been observed.
+- Trigger emission and processing remain a deliberate flag-gated rollout.
+- The visual workflow preview is read-only and path-based; nested branches are not expanded yet.
+- Admin stale-claim recovery exists for automation enrolment claims, trigger event claims, and segment scanner claims. Recovery is dry-run by default and apply mode requires explicit confirmation.
+
+Highest remaining risks before broader production use:
+
+- Segment scanner performance on large or complex customer accounts.
+- Route and sender-domain readiness for real automation sends.
+- Trigger storms if broader mutation hooks are added without additional throttles and guardrails.
+- Lack of per-account and per-automation throttles.
+- Full graph editing is not implemented; the editable workflow remains list/card based with a read-only visual preview.
+
 ## Core Tables
 
 - `automations`: automation draft configuration, published snapshots, entry triggers, status, and revisions.
