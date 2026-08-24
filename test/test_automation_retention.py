@@ -180,7 +180,11 @@ class TestAutomationRetentionCleanup(test_base.TestBase):
 
     def test_cleanup_does_not_delete_engagement_step_runs_or_enrolments(self):
         self.enable_cleanup()
+        os.environ["automation_retention_account_limit"] = "1"
         old_ts = datetime.utcnow() - timedelta(days=200)
+        oldest_ts = datetime.utcnow() - timedelta(days=3650)
+        retention_cid = "%s_protected" % self.test_id
+        cleanup_debug_id = self.insert_debug_log(cid=retention_cid, ts=oldest_ts)
         email_event_id = shortuuid.uuid()
         step_run_id = shortuuid.uuid()
         enrolment_id = shortuuid.uuid()
@@ -195,7 +199,7 @@ class TestAutomationRetentionCleanup(test_base.TestBase):
             ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             email_event_id,
-            self.cid(),
+            retention_cid,
             123456,
             "%s@example.com" % self.test_id,
             "%s_automation" % self.test_id,
@@ -214,7 +218,7 @@ class TestAutomationRetentionCleanup(test_base.TestBase):
             values (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             step_run_id,
-            self.cid(),
+            retention_cid,
             "%s_automation" % self.test_id,
             enrolment_id,
             123456,
@@ -229,7 +233,7 @@ class TestAutomationRetentionCleanup(test_base.TestBase):
             values (%s, %s, %s, %s, %s, %s)
             """,
             enrolment_id,
-            self.cid(),
+            retention_cid,
             "%s_automation" % self.test_id,
             123456,
             "%s@example.com" % self.test_id,
@@ -238,7 +242,11 @@ class TestAutomationRetentionCleanup(test_base.TestBase):
 
         result = automations.check_automation_retention_cleanup()
 
-        self.assertEqual(result["deleted"], 0)
+        self.assertEqual(result["accounts"], 1)
+        self.assertEqual(result["account_results"][0]["cid"], retention_cid)
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["debug_email_logs_deleted"], 1)
+        self.assertEqual(self.count_rows("debug_email_logs", [cleanup_debug_id]), 0)
         self.assertEqual(self.count_rows("automation_email_events", [email_event_id]), 1)
         self.assertEqual(self.count_rows("automation_step_runs", [step_run_id]), 1)
         self.assertEqual(self.count_rows("automation_enrolments", [enrolment_id]), 1)
