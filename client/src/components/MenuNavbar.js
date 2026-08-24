@@ -167,6 +167,8 @@ export default class MenuNavbar extends Component {
     var props = this.props;
 
     var daysleft = this.daysLeft();
+    var showAutomationDiagnostics = canViewAutomationDiagnostics(this.props);
+    var showImpersonationAdminMenu = props.loggedInImpersonate && showAutomationDiagnostics;
 
     return (
       <div>
@@ -373,28 +375,28 @@ export default class MenuNavbar extends Component {
                           Automations
                         </RouteNavItem>
                         {
-                          canViewAutomationDiagnostics(this.props) &&
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
                           <RouteNavItem href="/debug-email-logs">
                             <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
                             Debug Email Logs
                           </RouteNavItem>
                         }
                         {
-                          canViewAutomationDiagnostics(this.props) &&
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
                           <RouteNavItem href="/automation-trigger-events">
                             <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
                             Automation Trigger Events
                           </RouteNavItem>
                         }
                         {
-                          canViewAutomationDiagnostics(this.props) &&
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
                           <RouteNavItem href="/automation-processing-status">
                             <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
                             Automation Processing Status
                           </RouteNavItem>
                         }
                         {
-                          canViewAutomationDiagnostics(this.props) &&
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
                           <RouteNavItem href="/automation-segment-trigger-status">
                             <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
                             Segment Trigger Status
@@ -455,6 +457,30 @@ export default class MenuNavbar extends Component {
                           Pabbly
                         </RouteNavItem>
                       </NavDropdown>
+                      {
+                        showImpersonationAdminMenu &&
+                        <NavDropdown id="impersonation-admin" noCaret title={<span>
+                          <BackendNavigationCustomersIcon className="nav-icon tie-guy"/>
+                          Admin
+                        </span>}>
+                          <RouteNavItem href="/debug-email-logs">
+                            <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
+                            Debug Email Logs
+                          </RouteNavItem>
+                          <RouteNavItem href="/automation-trigger-events">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Trigger Events
+                          </RouteNavItem>
+                          <RouteNavItem href="/automation-processing-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Processing Status
+                          </RouteNavItem>
+                          <RouteNavItem href="/automation-segment-trigger-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Segment Trigger Status
+                          </RouteNavItem>
+                        </NavDropdown>
+                      }
                     </Nav>
                   :
                   <Nav className="nav-left">
