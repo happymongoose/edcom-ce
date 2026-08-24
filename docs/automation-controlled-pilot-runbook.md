@@ -49,6 +49,33 @@ This runbook is for enabling automations for one selected customer account in a 
 6. Verify no unexpected trigger events, duplicate sends, retries, or stale claims were created.
 7. Continue one node at a time until the expected branch/action/completion is observed.
 
+## Completed Debug-Route Pilot Result
+
+The Test Frontend Company pilot completed successfully using the debug email
+route. This validated the controlled automation flow without live provider
+delivery; it was not live provider validation.
+
+- Preflight was ready with a `debug_route` warning and `suppression_behavior`
+  info.
+- The one-node processor sequence worked as expected:
+  - `send_email`
+  - `add_tag`
+  - `exit`
+- Diagnostics checked:
+  - Automation Processing Status.
+  - Contact Automation Status.
+  - Automation Debug History.
+  - Debug Email Logs and source metadata.
+- Suppressed contact test passed:
+  - unsubscribed contact skipped send,
+  - no debug log was created for the suppressed send,
+  - step-run was marked succeeded/suppressed,
+  - no retry metadata was set,
+  - enrolment advanced normally.
+- Cleanup verified zero smoke-created automation, email, enrolment, step-run,
+  debug log, and contact records remained.
+- No product code changes were needed.
+
 ## 5. Background Processing Pilot
 
 - Enable scheduled processing only after the manual smoke passes.
