@@ -336,6 +336,19 @@ Recovery actions should preserve audit/history where possible. `automation_step_
   idempotency per contact/link/action, bot/replay protection, audit/history,
   account scoping, source metadata, rate limiting, and interaction with
   automation trigger emission when a clicked-link action mutates tags or lists.
+- Automation A/B subject-line testing is important after live-server readiness
+  and practical editor polish. The first version should be a simple subject-line
+  test for automation emails: same email body, different subject/preheader
+  variants, variant assigned per enrolment/contact deterministically or
+  randomly, selected variant stored in step-run/send metadata, and sends,
+  opens, and clicks reported by variant. The first slice should not include
+  automatic winner selection. Later versions can add automatic winner
+  selection, sending remaining contacts to the winner, body/content variants,
+  and multi-arm tests. Suppression and preflight must still apply, variant
+  choice must remain stable within an enrolment/pass, copied emails/templates
+  must not accidentally copy old test stats, and reporting must stay
+  account-scoped and bounded. Do not mix this into preflight/route visibility
+  work.
 - Broader list/import/API mutation hooks for list triggers.
 - Production tuning for segment scanner cadence, caps, and expensive segment definitions.
 - Admin throttle/kill-switch UI for automation processing.
