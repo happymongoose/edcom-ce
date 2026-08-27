@@ -2,6 +2,52 @@
 
 This runbook is for enabling automations for one selected customer account in a controlled pilot. Automations are suitable for selected-customer testing, not broad rollout.
 
+## Fresh-Install Deployment Notes
+
+This fork is expected to be installed on a fresh server using the normal
+EmailDelivery archive flow: unpack `edcom-install-*.tgz`, run `./ez_setup.sh`
+as root from the extracted `edcom-install` directory, then access the platform
+through the configured DNS hostname. The install still depends on the standard
+prerequisites: DNS A record/subdomain pointed at the server, Docker Compose
+available, required ports open, and HTTPS configured after first access using
+the existing project flow.
+
+The migration registration blocker identified during deployment planning was
+fixed in `fe3271d`. All automation migrations are now registered in
+`scripts/run_db_migrations.py`, so a fresh database should create the automation
+tables through the normal startup path.
+
+Expected fresh-install automation migration order:
+
+1. `add_automations_table`
+2. `add_automation_enrolments_table`
+3. `add_automation_step_runs_table`
+4. `add_automation_emails_table`
+5. `add_debug_email_tables`
+6. `add_automation_email_events_table`
+7. `add_automation_trigger_events_table`
+8. `add_automation_segment_trigger_baselines_table`
+
+Fresh install/startup paths call `/scripts/run_db_migrations.py` for the API,
+tasks, cron, and webhooks containers. The optional segments service also uses
+the same runner if enabled. The archive build path packages the corrected API
+image and migration runner; no separate archive script change was found
+necessary.
+
+Non-destructive verification after `fe3271d` completed:
+
+- Migration order was checked.
+- `/scripts/run_db_migrations.py` was rerun idempotently.
+- Expected automation tables existed.
+- Expected automation migration rows were present.
+- Focused automation execution, trigger, and segment scanner tests passed.
+- A destructive clean database rebuild was not run.
+
+Safe defaults remain suitable for first boot: global automation flags are off
+unless explicitly set, and customer settings
+`companies.data.automation_processing_enabled` and
+`companies.data.automation_diagnostics_visible` default to false/missing.
+
 ## 1. Preconditions
 
 - A specific customer account has been chosen for the pilot.
@@ -48,6 +94,32 @@ This runbook is for enabling automations for one selected customer account in a 
 5. Inspect the automation Debug history for the send/action/condition step-run and any engagement events.
 6. Verify no unexpected trigger events, duplicate sends, retries, or stale claims were created.
 7. Continue one node at a time until the expected branch/action/completion is observed.
+
+## First Live Deployment Sequence
+
+1. Build/package the fork with the `fe3271d` migration registration fix included
+   in the API image.
+2. Install on a fresh server using the standard archive flow:
+   `edcom-install-*.tgz`, `./ez_setup.sh`, root user, configured DNS hostname,
+   and Docker Compose.
+3. On first boot, confirm `/scripts/run_db_migrations.py` completed and the
+   automation migration rows/tables exist.
+4. Leave all automation runtime flags off and all customer automation settings
+   false initially.
+5. Confirm cron and Celery are running, but automation cron callables report
+   disabled/no work while flags are off.
+6. Create or select one internal/test customer and enable diagnostics visibility
+   only for that account.
+7. Configure a debug email route first if possible. Run automation preflight and
+   confirm the route is clearly shown as debug/no-live-send.
+8. Run the manual debug-route smoke sequence with one internal/test contact.
+9. Only after the debug-route smoke passes, configure exactly one assigned
+   published real provider route and verify sender/domain readiness through
+   preflight.
+10. Run one real-route smoke to one internal/test recipient only.
+11. Enable customer processing and global scheduled processing only after manual
+    smoke passes.
+12. Keep trigger emission and segment scanner flags off until separately piloted.
 
 ## Completed Debug-Route Pilot Result
 

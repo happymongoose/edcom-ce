@@ -8,6 +8,10 @@ Current status: automation is suitable for controlled selected-customer testing,
 
 - Retention cleanup test isolation has been fixed so retention tests no longer depend on global old debug or trigger rows created by other automation suites.
 - The broad focused backend automation suite now passes.
+- The fresh-install migration registration blocker was fixed in `fe3271d`.
+  All automation migrations are now registered in `scripts/run_db_migrations.py`;
+  see `docs/automation-controlled-pilot-runbook.md` for the fresh-install
+  deployment sequence and verification notes.
 - Segment trigger scanning remains selected-test/dev-only until real account performance has been observed.
 - Trigger emission and processing remain a deliberate flag-gated rollout.
 - The visual workflow preview is read-only and path-based; nested branches are not expanded yet.
