@@ -4,6 +4,7 @@ node_modules
 config/edcom.json
 config/linkcerts
 config/commercial_license.key
+config/logrotate.status
 machine-id
 .env
 .build

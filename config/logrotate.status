@@ -1,5 +1,0 @@
-logrotate state -- version 2
-"/logs/nginx/access.log" 2026-7-26-0:1:28
-"/logs/app.log" 2026-7-31-0:1:7
-"/logs/nginx/error.log" 2026-7-26-0:1:28
-"/logs/postgres/pgbouncer.log" 2026-7-26-0:1:28
