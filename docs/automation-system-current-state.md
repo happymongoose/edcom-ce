@@ -353,6 +353,16 @@ Recovery actions should preserve audit/history where possible. `automation_step_
   must not accidentally copy old test stats, and reporting must stay
   account-scoped and bounded. Do not mix this into preflight/route visibility
   work.
+- EDCOM toast/notification UX should be modernized. Current full-width
+  top-of-screen popups obscure the interface. The first safe slice should find
+  the existing notification/toaster component and replace presentation only,
+  keeping existing success/error call signatures and call sites working. The
+  target UI is compact stacked toasts: top-right on desktop, bottom or
+  top-safe-area on smaller screens, with success/error/warning/info states,
+  clear icon/status color, manual close buttons, auto-dismiss for success/info,
+  longer or sticky behavior for errors, sensible stack limits, and ARIA live
+  text where practical. Toasts should not cover primary navigation or form
+  controls.
 - Broader list/import/API mutation hooks for list triggers.
 - Production tuning for segment scanner cadence, caps, and expensive segment definitions.
 - Admin throttle/kill-switch UI for automation processing.
