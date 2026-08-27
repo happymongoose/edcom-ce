@@ -27,6 +27,9 @@ class TestAutomationExecution(test_base.TestBase):
         self.test_id = "automation_execution_%s" % shortuuid.uuid().lower()
         self.created_debug_backend_ids = []
         self.created_route_ids = []
+        self.created_mailgun_ids = []
+        self.created_policy_ids = []
+        self.created_sink_ids = []
         self.created_exclusion_items = []
         self.created_clientdkim_ids = []
         self.created_scheduler_cids = []
@@ -203,6 +206,24 @@ class TestAutomationExecution(test_base.TestBase):
                 self.created_route_ids,
             )
             self.created_route_ids = []
+        if self.created_policy_ids:
+            self.db.execute(
+                "delete from policies where id = any(%s)",
+                self.created_policy_ids,
+            )
+            self.created_policy_ids = []
+        if self.created_mailgun_ids:
+            self.db.execute(
+                "delete from mailgun where id = any(%s)",
+                self.created_mailgun_ids,
+            )
+            self.created_mailgun_ids = []
+        if self.created_sink_ids:
+            self.db.execute(
+                "delete from sinks where id = any(%s)",
+                self.created_sink_ids,
+            )
+            self.created_sink_ids = []
 
     def cleanup_clientdkim(self):
         if self.created_clientdkim_ids:
@@ -963,6 +984,126 @@ class TestAutomationExecution(test_base.TestBase):
         )
         self.created_route_ids.append(route_id)
         return route_id
+
+    def create_mailgun_backend(self):
+        backend_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into mailgun (id, cid, data) values (%s, %s, %s)",
+            backend_id,
+            self.backend_cid(),
+            {
+                "name": "Automation preflight Mailgun %s" % self.test_id,
+                "apikey": "secret-api-key-%s" % self.test_id,
+                "domain": "mg.example.com",
+            },
+        )
+        self.created_mailgun_ids.append(backend_id)
+        return backend_id
+
+    def create_sink_backend(self):
+        sink_id = shortuuid.uuid()
+        self.db.execute(
+            "insert into sinks (id, cid, data) values (%s, %s, %s)",
+            sink_id,
+            self.backend_cid(),
+            {
+                "name": "Automation preflight sink %s" % self.test_id,
+                "accesskey": "secret-access-key-%s" % self.test_id,
+            },
+        )
+        self.created_sink_ids.append(sink_id)
+        return sink_id
+
+    def create_delivery_policy(self, sink_id, published=True):
+        policy_id = shortuuid.uuid()
+        policy = {
+            "name": "Automation preflight policy %s" % self.test_id,
+            "domains": "*",
+            "sinks": [{"sink": sink_id, "pct": 100}],
+        }
+        data = {
+            "name": policy["name"],
+            "domains": policy["domains"],
+            "sinks": policy["sinks"],
+            "published": policy if published else None,
+            "dirty": not published,
+            "secret": "not-returned-%s" % self.test_id,
+        }
+        self.db.execute(
+            "insert into policies (id, cid, data) values (%s, %s, %s)",
+            policy_id,
+            self.backend_cid(),
+            data,
+        )
+        self.created_policy_ids.append(policy_id)
+        return policy_id
+
+    def create_route_with_splits(self, splits, name=None):
+        route_id = shortuuid.uuid()
+        now = datetime.utcnow().isoformat() + "Z"
+        route = {
+            "name": name or "Automation preflight route %s" % self.test_id,
+            "dirty": False,
+            "rules": [
+                {
+                    "splits": splits,
+                    "default": True,
+                    "domaingroup": "",
+                }
+            ],
+            "modified": now,
+            "published": {
+                "rules": [
+                    {
+                        "splits": splits,
+                        "default": True,
+                        "domaingroup": "",
+                    }
+                ],
+                "usedefault": False,
+            },
+            "usedefault": False,
+        }
+        self.db.execute(
+            "insert into routes (id, cid, data) values (%s, %s, %s)",
+            route_id,
+            self.backend_cid(),
+            route,
+        )
+        self.created_route_ids.append(route_id)
+        return route_id
+
+    def create_mailgun_route(self):
+        backend_id = self.create_mailgun_backend()
+        return self.create_route_with_splits(
+            [{"pct": 100, "policy": backend_id}],
+            "Mailgun automation route %s" % self.test_id,
+        )
+
+    def create_policy_sink_route(self):
+        sink_id = self.create_sink_backend()
+        policy_id = self.create_delivery_policy(sink_id)
+        return self.create_route_with_splits(
+            [{"pct": 100, "policy": policy_id}],
+            "Policy sink automation route %s" % self.test_id,
+        )
+
+    def create_mixed_debug_mailgun_route(self):
+        debug_backend_id = self.create_debug_backend()
+        mailgun_id = self.create_mailgun_backend()
+        return self.create_route_with_splits(
+            [
+                {"pct": 50, "policy": debug_backend_id},
+                {"pct": 50, "policy": mailgun_id},
+            ],
+            "Mixed automation route %s" % self.test_id,
+        )
+
+    def create_unresolved_route(self, policy_id="missing-policy"):
+        return self.create_route_with_splits(
+            [{"pct": 100, "policy": policy_id}],
+            "Unresolved automation route %s" % self.test_id,
+        )
 
     def create_drop_all_route(self):
         route_id = shortuuid.uuid()
@@ -2045,6 +2186,114 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result["route"]["status"], "drop_all")
         self.assertEqual(result["route"]["route_id"], route_id)
         self.assertEqual(result["route"]["errors"][0]["code"], "drop_all_route")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_projects_live_backend_details_without_secrets(self):
+        self.add_verified_sender_domain()
+        route_id = self.create_mailgun_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+        route = result["route"]
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(route["status"], "published_route")
+        self.assertEqual(route["route_id"], route_id)
+        self.assertTrue(route["assigned"])
+        self.assertTrue(route["published"])
+        self.assertFalse(route["debug"])
+        self.assertFalse(route["drop_all"])
+        self.assertEqual(route["backend_types"], ["mailgun"])
+        self.assertEqual(route["backends"][0]["type"], "mailgun")
+        self.assertIn("Automation preflight Mailgun", route["backends"][0]["name"])
+        serialized = json.dumps(route)
+        self.assertNotIn("secret-api-key", serialized)
+        self.assertNotIn("apikey", serialized)
+        self.assertNotIn("domain", serialized)
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_projects_policy_sink_backend_details(self):
+        self.add_verified_sender_domain()
+        route_id = self.create_policy_sink_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+        route = result["route"]
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(route["status"], "published_route")
+        self.assertEqual(route["route_id"], route_id)
+        self.assertEqual(route["backend_types"], ["mta_sink"])
+        self.assertEqual(route["backends"][0]["type"], "mta_sink")
+        self.assertEqual(route["backends"][0]["source"], "policy_sink")
+        self.assertIn("policy_id", route["backends"][0])
+        serialized = json.dumps(route)
+        self.assertNotIn("secret-access-key", serialized)
+        self.assertNotIn("accesskey", serialized)
+        self.assertNotIn("not-returned", serialized)
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_mixed_route_projects_backend_types(self):
+        self.add_verified_sender_domain()
+        route_id = self.create_mixed_debug_mailgun_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+        route = result["route"]
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(route["status"], "mixed_debug")
+        self.assertEqual(route["route_id"], route_id)
+        self.assertTrue(route["debug"])
+        self.assertTrue(route["mixed"])
+        self.assertEqual(set(route["backend_types"]), {"debug_log", "mailgun"})
+        self.assertEqual({backend["type"] for backend in route["backends"]}, {"debug_log", "mailgun"})
+        self.assertEqual(route["warnings"][0]["code"], "mixed_debug_route")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_unresolved_route_is_conservative(self):
+        self.add_verified_sender_domain()
+        route_id = self.create_unresolved_route()
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+        route = result["route"]
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(route["status"], "unresolved")
+        self.assertEqual(route["route_id"], route_id)
+        self.assertEqual(route["backend_types"], [])
+        self.assertEqual(route["warnings"][0]["code"], "unresolved_route_backend")
+        self.assertEqual(route["unresolved"][0]["reason"], "missing_policy_or_backend")
+
+        self.cleanup(automation["id"])
+
+    def test_send_email_preflight_unpublished_policy_is_conservative(self):
+        self.add_verified_sender_domain()
+        sink_id = self.create_sink_backend()
+        policy_id = self.create_delivery_policy(sink_id, published=False)
+        route_id = self.create_route_with_splits(
+            [{"pct": 100, "policy": policy_id}],
+            "Unpublished policy automation route %s" % self.test_id,
+        )
+        self.assign_company_routes([route_id])
+        automation = self.create_send_email_automation()
+
+        result = self.preflight(automation["id"], "published")
+        route = result["route"]
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(route["status"], "unresolved")
+        self.assertEqual(route["warnings"][0]["code"], "unresolved_route_backend")
+        self.assertEqual(route["unresolved"][0]["reason"], "unpublished_policy")
 
         self.cleanup(automation["id"])
 

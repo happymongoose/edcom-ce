@@ -1506,6 +1506,129 @@ class Automation extends Component {
     );
   }
 
+  preflightRouteStatusLabel(route) {
+    const status = route.status || '';
+    if (status === 'published_route') {
+      return 'Live provider route';
+    }
+    if (status === 'debug_log') {
+      return 'Debug route';
+    }
+    if (status === 'mixed_debug') {
+      return 'Mixed live/debug route';
+    }
+    if (status === 'drop_all' || status === 'mixed_drop_all') {
+      return 'Drop All / no-send route';
+    }
+    if (status === 'missing') {
+      return 'Missing route';
+    }
+    if (status === 'multiple') {
+      return 'Multiple routes';
+    }
+    if (status === 'unresolved' || status === 'mixed_unresolved') {
+      return 'Unresolved route';
+    }
+    return status || 'Unknown route';
+  }
+
+  preflightRouteStatusClass(route) {
+    const status = route.status || '';
+    if (status === 'published_route') {
+      return 'text-success';
+    }
+    if (status === 'debug_log' || status === 'mixed_debug' || status === 'unresolved' || status === 'mixed_unresolved') {
+      return 'text-warning';
+    }
+    if (status === 'drop_all' || status === 'mixed_drop_all' || status === 'missing' || status === 'multiple') {
+      return 'text-danger';
+    }
+    return 'text-muted';
+  }
+
+  preflightBackendTypeLabel(type) {
+    const labels = {
+      debug_log: 'Debug log',
+      easylink: 'Easylink',
+      mailgun: 'Mailgun',
+      mta_sink: 'MTA sink',
+      ses: 'Amazon SES',
+      smtprelay: 'SMTP relay',
+      sparkpost: 'SparkPost',
+    };
+    return labels[type] || type || 'Unknown';
+  }
+
+  renderPreflightRoute(route) {
+    if (!route || !route.status) {
+      return null;
+    }
+    const backends = route.backends || [];
+    const backendTypes = route.backend_types || [];
+    const unresolved = route.unresolved || [];
+    return (
+      <div className="well well-sm" style={{maxWidth: '1024px'}}>
+        <div>
+          <strong>Route:</strong>
+          {' '}
+          {route.route_name || route.route_id || this.preflightRouteStatusLabel(route)}
+          {' '}
+          <span className={this.preflightRouteStatusClass(route)}>
+            {this.preflightRouteStatusLabel(route)}
+          </span>
+        </div>
+        <div className="text-muted">
+          Assigned: {route.assigned ? 'yes' : 'no'}
+          {' | '}
+          Published: {route.published ? 'yes' : 'no'}
+          {
+            route.ready_for_debug ?
+              <span>{' | '}debug-ready only</span>
+            :
+              null
+          }
+        </div>
+        {
+          backendTypes.length ?
+            <div>
+              <strong>Backend types:</strong>
+              {' '}
+              {_.map(backendTypes, type => this.preflightBackendTypeLabel(type)).join(', ')}
+            </div>
+          :
+            null
+        }
+        {
+          backends.length ?
+            <div className="space-top-xs">
+              {_.map(backends, (backend, index) =>
+                <div key={(backend.type || 'backend') + '-' + (backend.id || index) + '-' + index} className="text-muted">
+                  {this.preflightBackendTypeLabel(backend.type)}
+                  {backend.name ? ': ' + backend.name : ''}
+                  {backend.pct !== undefined ? ' (' + backend.pct + '%)' : ''}
+                  {backend.source === 'policy_sink' ? ' via delivery policy' : ''}
+                </div>
+              )}
+            </div>
+          :
+            null
+        }
+        {
+          unresolved.length ?
+            <div className="space-top-xs text-warning">
+              {_.map(unresolved, (item, index) =>
+                <div key={(item.id || 'unresolved') + '-' + index}>
+                  Unresolved {item.source || 'route'}: {item.reason || 'unknown'}
+                </div>
+              )}
+            </div>
+          :
+            null
+        }
+      </div>
+    );
+  }
+
   renderPreflight() {
     const preflight = this.props.preflightData;
     if (!preflight) {
@@ -1554,16 +1677,7 @@ class Automation extends Component {
         <p className="text-muted">
           Checking saved {preflight.mode || 'draft'} send-email configuration.
         </p>
-        {
-          route.status ?
-            <p>
-              Route: {route.route_name || route.route_id || route.status}
-              {' '}
-              <span className="text-muted">({route.status})</span>
-            </p>
-          :
-            null
-        }
+        {this.renderPreflightRoute(route)}
         {this.renderPreflightMessages(errors, 'text-danger')}
         {this.renderPreflightMessages(warnings, 'text-warning')}
         {this.renderPreflightMessages(info, 'text-muted')}

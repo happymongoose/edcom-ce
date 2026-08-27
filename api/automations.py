@@ -13,7 +13,7 @@ from dateutil.tz import tzutc
 from html import unescape as html_unescape
 from html.parser import HTMLParser
 from jsonschema import validate
-from typing import Dict, List
+from typing import Any, Dict, List
 from urllib.parse import urlsplit, urlunsplit
 
 from .shared import config as _  # noqa: F401
@@ -2234,12 +2234,190 @@ def _route_policy_ids(route: JsonObj) -> list[str]:
     return policy_ids
 
 
+def _preflight_backend_row(
+    backend_type: str,
+    backend_id: str,
+    name: str,
+    source: str,
+    pct: Any = None,
+    policy_id: str | None = None,
+) -> JsonObj:
+    row: JsonObj = {
+        "type": backend_type,
+        "id": _bounded_error_text(backend_id or ""),
+        "name": _bounded_error_text(name or backend_id or ""),
+        "source": source,
+    }
+    if pct is not None:
+        row["pct"] = pct
+    if policy_id:
+        row["policy_id"] = _bounded_error_text(policy_id)
+    return row
+
+
+def _preflight_backend_maps(db: DB) -> tuple[dict[str, JsonObj], dict[str, dict[str, JsonObj]]]:
+    policies = {policy["id"]: policy for policy in db.policies.find()}
+    backends = {
+        "mailgun": {backend["id"]: backend for backend in db.mailgun.find()},
+        "ses": {backend["id"]: backend for backend in db.ses.find()},
+        "sparkpost": {backend["id"]: backend for backend in db.sparkpost.find()},
+        "easylink": {backend["id"]: backend for backend in db.easylink.find()},
+        "smtprelay": {backend["id"]: backend for backend in db.smtprelays.find()},
+        "mta_sink": {backend["id"]: backend for backend in db.sinks.find()},
+        "debug_log": {backend["id"]: backend for backend in db.debug_email_backends.find()},
+    }
+    return policies, backends
+
+
+def _preflight_direct_backend(
+    policy_id: str,
+    backends: dict[str, dict[str, JsonObj]],
+    pct: Any,
+) -> JsonObj | None:
+    for backend_type, backend_by_id in backends.items():
+        backend = backend_by_id.get(policy_id)
+        if backend is not None:
+            return _preflight_backend_row(
+                backend_type,
+                policy_id,
+                backend.get("name") or policy_id,
+                "route_split",
+                pct,
+            )
+    return None
+
+
+def _preflight_route_backend_details(db: DB, route: JsonObj) -> JsonObj:
+    details: JsonObj = {
+        "backend_types": [],
+        "backends": [],
+        "unresolved": [],
+        "has_debug": False,
+        "has_drop_all": False,
+        "has_live_provider": False,
+        "has_unresolved": False,
+    }
+    published = route.get("published") or {}
+    policies, backends = _preflight_backend_maps(db)
+
+    for rule_index, rule in enumerate(published.get("rules") or []):
+        for split_index, split in enumerate(rule.get("splits") or []):
+            policy_id = split.get("policy") or ""
+            pct = split.get("pct")
+            if not policy_id:
+                details["has_drop_all"] = True
+                continue
+
+            direct = _preflight_direct_backend(policy_id, backends, pct)
+            if direct is not None:
+                details["backends"].append(direct)
+                continue
+
+            policy = policies.get(policy_id)
+            if policy is None:
+                details["has_unresolved"] = True
+                details["unresolved"].append(
+                    {
+                        "id": _bounded_error_text(policy_id),
+                        "source": "route_split",
+                        "reason": "missing_policy_or_backend",
+                        "rule": rule_index + 1,
+                        "split": split_index + 1,
+                    }
+                )
+                continue
+
+            published_policy = policy.get("published")
+            if not published_policy:
+                details["has_unresolved"] = True
+                details["unresolved"].append(
+                    {
+                        "id": _bounded_error_text(policy_id),
+                        "source": "route_split",
+                        "reason": "unpublished_policy",
+                        "rule": rule_index + 1,
+                        "split": split_index + 1,
+                    }
+                )
+                continue
+
+            sinks = published_policy.get("sinks") or []
+            if not sinks:
+                details["has_unresolved"] = True
+                details["unresolved"].append(
+                    {
+                        "id": _bounded_error_text(policy_id),
+                        "source": "delivery_policy",
+                        "reason": "policy_has_no_sinks",
+                        "rule": rule_index + 1,
+                        "split": split_index + 1,
+                    }
+                )
+                continue
+
+            for sink in sinks:
+                sink_id = sink.get("sink") or ""
+                sink_obj = backends["mta_sink"].get(sink_id)
+                if sink_obj is None:
+                    details["has_unresolved"] = True
+                    details["unresolved"].append(
+                        {
+                            "id": _bounded_error_text(sink_id),
+                            "policy_id": _bounded_error_text(policy_id),
+                            "source": "policy_sink",
+                            "reason": "missing_sink",
+                            "rule": rule_index + 1,
+                            "split": split_index + 1,
+                        }
+                    )
+                    continue
+                details["backends"].append(
+                    _preflight_backend_row(
+                        "mta_sink",
+                        sink_id,
+                        sink_obj.get("name") or sink_id,
+                        "policy_sink",
+                        sink.get("pct"),
+                        policy_id,
+                    )
+                )
+
+    seen_types = []
+    seen_backend_keys = set()
+    deduped_backends = []
+    for backend in details["backends"]:
+        key = (backend.get("type"), backend.get("id"), backend.get("source"), backend.get("policy_id"))
+        if key in seen_backend_keys:
+            continue
+        seen_backend_keys.add(key)
+        deduped_backends.append(backend)
+        backend_type = backend.get("type")
+        if backend_type and backend_type not in seen_types:
+            seen_types.append(backend_type)
+
+    details["backends"] = deduped_backends[:25]
+    details["backend_types"] = seen_types
+    details["has_debug"] = "debug_log" in seen_types
+    details["has_live_provider"] = bool([t for t in seen_types if t != "debug_log"])
+    details["has_unresolved"] = bool(details["unresolved"])
+    details["unresolved"] = details["unresolved"][:25]
+    return details
+
+
 def _automation_preflight_route(db: DB, cid: str) -> JsonObj:
     result: JsonObj = {
         "status": "unknown",
         "route_id": None,
         "route_name": "",
+        "assigned": False,
+        "published": False,
         "ready_for_debug": False,
+        "debug": False,
+        "drop_all": False,
+        "mixed": False,
+        "backend_types": [],
+        "backends": [],
+        "unresolved": [],
         "errors": [],
         "warnings": [],
     }
@@ -2272,6 +2450,17 @@ def _automation_preflight_route(db: DB, cid: str) -> JsonObj:
             return result
         if len(published_routes) > 1:
             result["status"] = "multiple"
+            result["assigned"] = True
+            result["published"] = True
+            result["routes"] = [
+                {
+                    "route_id": route.get("id"),
+                    "route_name": route.get("name") or route.get("id") or "",
+                    "published": True,
+                    "assigned": True,
+                }
+                for route in published_routes[:10]
+            ]
             result["errors"].append(
                 _automation_preflight_message(
                     "error",
@@ -2284,9 +2473,12 @@ def _automation_preflight_route(db: DB, cid: str) -> JsonObj:
         route = published_routes[0]
         result["route_id"] = route.get("id")
         result["route_name"] = route.get("name") or route.get("id") or ""
+        result["assigned"] = True
+        result["published"] = True
         policy_ids = _route_policy_ids(route)
         if not policy_ids:
             result["status"] = "drop_all"
+            result["drop_all"] = True
             result["errors"].append(
                 _automation_preflight_message(
                     "error",
@@ -2297,11 +2489,42 @@ def _automation_preflight_route(db: DB, cid: str) -> JsonObj:
             return result
 
         db.set_cid(route["cid"])
-        debug_backend_ids = {backend["id"] for backend in db.debug_email_backends.find()}
-        debug_policy_ids = [policy_id for policy_id in policy_ids if policy_id in debug_backend_ids]
-        if debug_policy_ids and len(debug_policy_ids) == len(policy_ids):
+        details = _preflight_route_backend_details(db, route)
+        result["backend_types"] = details["backend_types"]
+        result["backends"] = details["backends"]
+        result["unresolved"] = details["unresolved"]
+        result["debug"] = details["has_debug"]
+        result["drop_all"] = details["has_drop_all"]
+        result["mixed"] = len(result["backend_types"]) > 1 or (
+            bool(result["backend_types"]) and (result["drop_all"] or details["has_unresolved"])
+        )
+
+        if details["has_drop_all"]:
+            result["status"] = "mixed_drop_all" if result["backend_types"] else "drop_all"
+            result["errors"].append(
+                _automation_preflight_message(
+                    "error",
+                    "drop_all_route",
+                    "The assigned postal route includes a no-backend split. Real automation execution may not send email.",
+                )
+            )
+            return result
+
+        if details["has_unresolved"]:
+            result["status"] = "mixed_unresolved" if result["backend_types"] else "unresolved"
+            result["warnings"].append(
+                _automation_preflight_message(
+                    "warning",
+                    "unresolved_route_backend",
+                    "The assigned postal route includes a policy or backend that could not be resolved. Confirm route configuration before production use.",
+                )
+            )
+            return result
+
+        if details["has_debug"] and not details["has_live_provider"]:
             result["status"] = "debug_log"
             result["ready_for_debug"] = True
+            result["mixed"] = False
             result["warnings"].append(
                 _automation_preflight_message(
                     "warning",
@@ -2310,8 +2533,9 @@ def _automation_preflight_route(db: DB, cid: str) -> JsonObj:
                 )
             )
             return result
-        if debug_policy_ids:
+        if details["has_debug"]:
             result["status"] = "mixed_debug"
+            result["mixed"] = True
             result["warnings"].append(
                 _automation_preflight_message(
                     "warning",
