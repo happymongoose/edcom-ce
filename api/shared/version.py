@@ -1,1 +1,1 @@
-VERSION = "dev"
+VERSION = '1.20260827.2219'
