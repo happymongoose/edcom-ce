@@ -8,6 +8,7 @@ import shortuuid
 import hashlib
 import requests
 import urllib
+import socket
 from typing import Any, Dict, List, cast
 from datetime import datetime, timedelta
 import dateutil.parser
@@ -20,6 +21,7 @@ import boto3
 
 from .falcon_swagger_ui import register_swaggerui_app  # type: ignore
 
+from .automation_subject_tests import SubjectTests
 from .shared import config
 
 from .shared.db import open_db, json_obj, DB, JsonObj
@@ -53,6 +55,7 @@ from . import campaigns
 from . import funnels
 from . import events
 from . import transactional
+from . import automations
 
 import logging
 
@@ -61,6 +64,26 @@ logging.getLogger("botocore").setLevel(logging.INFO)
 logging.getLogger("nose").setLevel(logging.INFO)
 
 log = get_logger()
+
+
+AUTOMATION_COMPANY_SETTING_FIELDS = (
+    "automation_processing_enabled",
+    "automation_diagnostics_visible",
+)
+
+
+def normalize_automation_company_settings(doc: JsonObj, include_defaults: bool = False) -> None:
+    for field in AUTOMATION_COMPANY_SETTING_FIELDS:
+        if include_defaults and field not in doc:
+            doc[field] = False
+        if field not in doc:
+            continue
+        if not isinstance(doc[field], bool):
+            raise falcon.HTTPBadRequest(
+                title="Invalid automation setting",
+                description="%s must be a boolean." % field,
+            )
+
 
 # nothing returned by the web app should be cached by a proxy
 class NoCache(object):
@@ -193,6 +216,7 @@ allowedpaths = [
     re.compile(r"^/api/trackform/"),
     re.compile(r"^/api/postform/"),
     re.compile(r"^/api/loginfrontend"),
+    re.compile(r"^/api/htmlpreviewimage$"),
     re.compile(r"^/signup/"),
     re.compile(r"^/api/signupaction/"),
 ]
@@ -267,6 +291,7 @@ class AuthMiddleware(object):
 
                 admin = cookie["admin"]
                 cid = cookie["cid"]
+                impersonating = False
 
                 impersonateid = req.get_header("X-Auth-Impersonate")
 
@@ -283,8 +308,11 @@ class AuthMiddleware(object):
                         )
 
                     cid = impersonateid
+                    impersonating = True
 
                     admin = False
+            if apikey:
+                impersonating = False
         except:
             db.close()
             raise
@@ -293,6 +321,7 @@ class AuthMiddleware(object):
         req.context["db"] = db
         req.context["uid"] = uid
         req.context["admin"] = admin
+        req.context["impersonating"] = impersonating
         req.context["api"] = bool(apikey)
 
     def process_response(
@@ -2107,6 +2136,8 @@ class Companies(CRUDCollection):
                     + timedelta(days=frontend.get("trialdays", TRIAL_DAYS))
                 ).isoformat() + "Z"
 
+        normalize_automation_company_settings(doc, include_defaults=True)
+
         if doc.get("exampletemplate", False):
             db.execute(
                 """update companies set data = data || '{"exampletemplate": false}' where cid = %s""",
@@ -2136,6 +2167,7 @@ class Company(CRUDSingle):
             )
 
         db = req.context["db"]
+        normalize_automation_company_settings(doc)
         if doc.get("exampletemplate", False):
             db.execute(
                 """update companies set data = data || '{"exampletemplate": false}' where cid = %s""",
@@ -2160,6 +2192,116 @@ class Company(CRUDSingle):
             """update users set data = data || jsonb_build_object('username', data->>'username' || 'xxxx') where cid = %s""",
             id,
         )
+
+
+class CompanyAutomationOperations(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        if not req.context["admin"]:
+            raise falcon.HTTPUnauthorized()
+
+        db = req.context["db"]
+        company = db.companies.get(id)
+        if company is None:
+            raise falcon.HTTPForbidden()
+
+        status = automations._automation_processing_status(db, id)
+        req.context["result"] = {
+            "company": {
+                "id": id,
+                "name": company.get("name") or "",
+                "automation_processing_enabled": company.get("automation_processing_enabled") is True,
+                "automation_diagnostics_visible": company.get("automation_diagnostics_visible") is True,
+            },
+            "flags": {
+                key: value is True
+                for key, value in (status.get("flags") or {}).items()
+            },
+            "summary": status.get("summary") or {},
+        }
+
+
+class CompanyAutomationRecovery(object):
+
+    ACTIONS = {
+        "clear-stale-enrolment-claims": (
+            "clear_stale_enrolment_claims",
+            automations.recover_stale_automation_enrolment_claims,
+        ),
+        "clear-stale-trigger-event-claims": (
+            "clear_stale_trigger_event_claims",
+            automations.recover_stale_automation_trigger_event_claims,
+        ),
+        "clear-stale-segment-scanner-claims": (
+            "clear_stale_segment_scanner_claims",
+            automations.recover_stale_automation_segment_scanner_claims,
+        ),
+    }
+
+    def on_post(self, req: falcon.Request, resp: falcon.Response, id: str, action: str) -> None:
+        if not req.context["admin"]:
+            raise falcon.HTTPUnauthorized()
+
+        action_config = self.ACTIONS.get(action)
+        if action_config is None:
+            raise falcon.HTTPBadRequest(
+                title="Unknown automation recovery action",
+                description="The requested automation recovery action is not supported.",
+            )
+        confirmation_token, handler = action_config
+
+        db = req.context["db"]
+        company = db.companies.get(id)
+        if company is None or company.get("admin"):
+            raise falcon.HTTPForbidden()
+
+        doc = req.context.get("doc") or {}
+        if not isinstance(doc, dict):
+            raise falcon.HTTPBadRequest(
+                title="Not JSON",
+                description="A valid JSON document is required.",
+            )
+
+        dry_run = doc.get("dry_run", True) is not False
+        if not dry_run and doc.get("confirm") != confirmation_token:
+            raise falcon.HTTPBadRequest(
+                title="Automation recovery confirmation is required",
+                description="Set dry_run to false and provide confirm=%s to apply this recovery action." % confirmation_token,
+            )
+
+        kwargs = {
+            "db": db,
+            "cid": id,
+            "dry_run": dry_run,
+            "limit": doc.get("limit"),
+            "recovered_by_uid": req.context.get("uid"),
+        }
+        if action == "clear-stale-enrolment-claims":
+            automation_id = doc.get("automation_id")
+            if automation_id is not None and not isinstance(automation_id, str):
+                raise falcon.HTTPBadRequest(
+                    title="Invalid automation_id",
+                    description="automation_id must be a string.",
+                )
+            kwargs["automation_id"] = automation_id
+        elif action == "clear-stale-trigger-event-claims":
+            event_type = doc.get("event_type")
+            if event_type is not None and event_type not in automations.SUPPORTED_TRIGGER_EVENT_TYPES:
+                raise falcon.HTTPBadRequest(
+                    title="Invalid event_type",
+                    description="event_type must be a supported automation trigger event type.",
+                )
+            kwargs["event_type"] = event_type
+        elif action == "clear-stale-segment-scanner-claims":
+            segment_id = doc.get("segment_id")
+            if segment_id is not None and not isinstance(segment_id, str):
+                raise falcon.HTTPBadRequest(
+                    title="Invalid segment_id",
+                    description="segment_id must be a string.",
+                )
+            kwargs["segment_id"] = segment_id
+
+        req.context["result"] = handler(**kwargs)
 
 
 class CompanyCampaign(object):
@@ -3024,6 +3166,7 @@ class User(object):
                     fe.pop("bodydomain", None)
                     r["frontend"] = fe
             r["paid"] = pc.get("paid")
+            r["automation_diagnostics_visible"] = pc.get("automation_diagnostics_visible") is True
             r["hasmoderation"] = pc.get("moderation") is not None
             r["limit"] = fix_empty_limit(pc.get("daylimit"))
             r["inreview"] = pc.get("inreview")
@@ -3237,6 +3380,135 @@ class ImageImport(object):
         req.context["result"] = {
             "url": "%s/i/%s" % (get_webroot(), newkey),
         }
+
+
+class HTMLPreviewImage(object):
+
+    MAX_BYTES = 5 * 1024 * 1024
+
+    def _check_auth(self, req: falcon.Request) -> None:
+        uid = req.get_param("uid")
+        cookieid = req.get_param("cookieid")
+        impersonateid = req.get_param("impersonate")
+
+        if not uid or not cookieid:
+            raise falcon.HTTPUnauthorized(
+                title="Invalid login", description="Please log in again"
+            )
+
+        db = DB()
+        cookie = db.cookies.get(cookieid)
+        if cookie is None or cookie["uid"] != uid:
+            raise falcon.HTTPUnauthorized(
+                title="Invalid login", description="Please log in again"
+            )
+
+        if impersonateid:
+            if not cookie["admin"]:
+                raise falcon.HTTPUnauthorized(
+                    title="Invalid login", description="Please log in again"
+                )
+            customer = db.companies.get(impersonateid)
+            if (
+                customer is None
+                or customer["admin"]
+                or customer["cid"] != cookie["cid"]
+            ):
+                raise falcon.HTTPUnauthorized(
+                    title="Invalid login", description="User not found"
+                )
+
+    def _validate_url(self, url: str) -> None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL",
+                description="Only http and https image URLs can be previewed.",
+            )
+
+        try:
+            infos = socket.getaddrinfo(parsed.hostname, parsed.port or None)
+        except socket.gaierror:
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL",
+                description="Image host could not be resolved.",
+            )
+
+        for info in infos:
+            ip = IPAddress(info[4][0])
+            if (
+                ip.is_private()
+                or ip.is_loopback()
+                or ip.is_link_local()
+                or ip.is_multicast()
+                or ip.is_reserved()
+            ):
+                raise falcon.HTTPBadRequest(
+                    title="Invalid image URL",
+                    description="Private network image URLs cannot be previewed.",
+                )
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        self._check_auth(req)
+
+        url = req.get_param("url")
+        if not url:
+            raise falcon.HTTPBadRequest(
+                title="Missing image URL", description="No image URL was provided."
+            )
+
+        current_url = url
+        response = None
+        for _ in range(4):
+            self._validate_url(current_url)
+            response = requests.get(
+                current_url,
+                headers={"User-Agent": "EmailDelivery.com HTML preview image proxy"},
+                timeout=10,
+                stream=True,
+                allow_redirects=False,
+            )
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    break
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+            break
+
+        if response is None:
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL", description="Image URL could not be loaded."
+            )
+
+        content_type = response.headers.get("Content-Type", "")
+        if response.status_code < 200 or response.status_code >= 300:
+            resp.status = falcon.HTTP_502
+            resp.text = "Image preview request failed."
+            response.close()
+            return
+        if not content_type.lower().startswith("image/"):
+            response.close()
+            raise falcon.HTTPBadRequest(
+                title="Invalid image URL", description="Preview URL did not return an image."
+            )
+
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > self.MAX_BYTES:
+                response.close()
+                raise falcon.HTTPBadRequest(
+                    title="Image too large",
+                    description="Preview images must be 5 MB or smaller.",
+                )
+            chunks.append(chunk)
+        response.close()
+
+        resp.content_type = content_type
+        resp.data = b"".join(chunks)
 
 
 class OpenTicket(object):
@@ -3645,6 +3917,7 @@ app.add_route("/api/routes/{id}", backends.Route())
 app.add_route("/api/routes/{id}/publish", backends.RoutePublish())
 app.add_route("/api/routes/{id}/revert", backends.RouteRevert())
 app.add_route("/api/routes/{id}/duplicate", backends.RouteDuplicate())
+app.add_route("/api/debug-email-logs", backends.DebugEmailLogs())
 app.add_route("/api/domaingroups", backends.DomainGroups())
 app.add_route("/api/domaingroups/{id}", backends.DomainGroup())
 app.add_route("/api/sinks", backends.Sinks())
@@ -3696,6 +3969,8 @@ app.add_route("/api/pollresthooks/{event}", PollRestHook())
 app.add_route("/api/companylimits", CompanyLimits())
 app.add_route("/api/companies", Companies())
 app.add_route("/api/companies/{id}", Company())
+app.add_route("/api/companies/{id}/automation-operations", CompanyAutomationOperations())
+app.add_route("/api/companies/{id}/automation-recovery/{action}", CompanyAutomationRecovery())
 app.add_route("/api/companies/{id}/users", CompanyUsers())
 app.add_route("/api/companies/{id}/pendinglists", CompanyPendingLists())
 app.add_route(
@@ -3716,6 +3991,7 @@ app.add_route("/api/uploadfile", UploadFile())
 app.add_route("/api/uploadlogfile", UploadLogFile())
 app.add_route("/api/imageimport", ImageImport())
 app.add_route("/api/imageupload", ImageUpload())
+app.add_route("/api/htmlpreviewimage", HTMLPreviewImage())
 app.add_route("/api/beefreeauth", BeeFreeAuth())
 app.add_route("/api/beefreemerge", BeeFreeMerge())
 app.add_route("/api/lists/{id}/import", lists.ListImport())
@@ -3734,6 +4010,10 @@ app.add_route("/api/listfind/{id}", lists.ListFindStatus())
 app.add_route("/api/domainthrottles", DomainThrottles())
 app.add_route("/api/domainthrottles/{id}", DomainThrottle())
 app.add_route("/api/contactexport", lists.ContactExport())
+app.add_route("/api/contacts", lists.ContactsAll())
+app.add_route("/api/contactdata/{email}/email-history", lists.ContactEmailHistory())
+app.add_route("/api/contactdata/{email}/automation-enrolments", lists.ContactAutomationEnrolments())
+app.add_route("/api/contactdata/{email}/memberships", lists.ContactMemberships())
 app.add_route("/api/contactdata/{email}", lists.ContactData())
 app.add_route("/api/recenttags", lists.RecentTags())
 app.add_route("/api/supplists", lists.SuppLists())
@@ -3745,6 +4025,7 @@ app.add_route("/api/exclusion/{id}/add", lists.ExclusionListAdd())
 app.add_route("/api/exports", lists.Exports())
 app.add_route("/api/segments", lists.Segments())
 app.add_route("/api/segments/{id}", lists.Segment())
+app.add_route("/api/segments/{id}/contacts", lists.SegmentContacts())
 app.add_route("/api/segments/{id}/export", lists.SegmentExport())
 app.add_route("/api/segments/{id}/duplicate", lists.SegmentDuplicate())
 app.add_route("/api/segments/{id}/tag", lists.SegmentTag())
@@ -3786,6 +4067,41 @@ app.add_route("/api/funnels", funnels.Funnels())
 app.add_route("/api/funnels/{id}", funnels.Funnel())
 app.add_route("/api/funnels/{id}/messages", funnels.FunnelMessages())
 app.add_route("/api/funnels/{id}/duplicate", funnels.FunnelDuplicate())
+app.add_route("/api/automations", automations.Automations())
+app.add_route("/api/automations/{id}", automations.Automation())
+app.add_route("/api/automations/{id}/emails", automations.AutomationEmails())
+app.add_route("/api/automations/{id}/email-copy-sources", automations.AutomationEmailCopySources())
+app.add_route("/api/automations/{id}/emails/from-source", automations.AutomationEmailFromSource())
+app.add_route("/api/automations/{id}/emails/{email_id}/duplicate", automations.AutomationEmailDuplicate())
+app.add_route("/api/automations/{id}/emails/{email_id}/test", automations.AutomationEmailTest())
+app.add_route("/api/automations/{id}/emails/{email_id}/links", automations.AutomationEmailLinks())
+app.add_route("/api/automations/{id}/emails/{email_id}", automations.AutomationEmail())
+app.add_route("/api/automations/{id}/emails/{email_id}/subject-tests", SubjectTests())
+app.add_route("/api/automations/{id}/preflight", automations.AutomationPreflight())
+app.add_route("/api/automations/{id}/publish", automations.AutomationPublish())
+app.add_route("/api/automations/{id}/publish-impact", automations.AutomationPublishImpact())
+app.add_route("/api/automations/{id}/pause", automations.AutomationPause())
+app.add_route("/api/automations/{id}/resume", automations.AutomationResume())
+app.add_route("/api/automations/{id}/enrolments", automations.AutomationEnrolments())
+app.add_route("/api/automation-enrolments/process", automations.AutomationEnrolmentProcessor())
+app.add_route("/api/automation-processing-status", automations.AutomationProcessingStatus())
+app.add_route("/api/automation-segment-trigger-status", automations.AutomationSegmentTriggerStatus())
+app.add_route("/api/automation-trigger-events", automations.AutomationTriggerEvents())
+app.add_route("/api/automation-trigger-events/process", automations.AutomationTriggerEventProcessor())
+app.add_route("/api/automation-segment-trigger-baselines", automations.AutomationSegmentTriggerBaselines())
+app.add_route("/api/automations/{id}/enrolments/list", automations.AutomationListEnrolments())
+app.add_route("/api/automation-list-enrolments/{id}", automations.AutomationListEnrolmentStatus())
+app.add_route("/api/automations/{id}/enrolments/segment", automations.AutomationSegmentEnrolments())
+app.add_route("/api/automation-segment-enrolments/{id}", automations.AutomationSegmentEnrolmentStatus())
+app.add_route("/api/automations/{id}/history", automations.AutomationHistory())
+app.add_route(
+    "/api/automations/{id}/enrolments/{enrolment_id}/run-next",
+    automations.AutomationEnrolmentRunNext(),
+)
+app.add_route(
+    "/api/automations/{id}/enrolments/{enrolment_id}/cancel",
+    automations.AutomationEnrolmentCancel(),
+)
 app.add_route("/api/messages", funnels.Messages())
 app.add_route("/api/messages/{id}", funnels.Message())
 app.add_route("/api/messages/{id}/duplicate", funnels.MessageDuplicate())

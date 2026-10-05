@@ -207,6 +207,11 @@ func (session *session) handleMAIL(cmd command) {
 		return
 	}
 
+	if session.server.Authenticator != nil && !session.server.AllowUnauthenticated && !session.authenticated {
+		session.reply(530, "Authentication required")
+		return
+	}
+
 	if session.envelope != nil {
 		session.reply(502, "Duplicate MAIL")
 		return
@@ -303,8 +308,11 @@ func (session *session) handleSTARTTLS(cmd command) {
 		return
 	}
 
-	// Reset envelope as a new EHLO/HELO is required after STARTTLS
+	// Reset envelope and authentication after STARTTLS.
 	session.reset()
+	session.authenticated = false
+	session.peer.Username = ""
+	session.peer.Password = ""
 
 	// Reset deadlines on the underlying connection before I replace it
 	// with a TLS connection
@@ -417,6 +425,11 @@ func (session *session) handleAUTH(cmd command) {
 		return
 	}
 
+	if session.server.ForceTLS && !session.tls {
+		session.reply(502, "Please turn on TLS by issuing a STARTTLS command.")
+		return
+	}
+
 	mechanism := strings.ToUpper(cmd.fields[1])
 
 	username := ""
@@ -506,6 +519,7 @@ func (session *session) handleAUTH(cmd command) {
 		return
 	}
 
+	session.authenticated = true
 	session.peer.Username = username
 	session.peer.Password = password
 

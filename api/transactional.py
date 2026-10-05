@@ -9,7 +9,7 @@ import traceback
 import csv
 import zipfile
 from datetime import datetime, timedelta
-from dateutil.tz import tzutc
+from dateutil.tz import tzutc, tzlocal
 from email.utils import formataddr, parseaddr
 from jinja2 import Template
 
@@ -29,11 +29,13 @@ from .shared.send import (
     check_send_limit,
     check_test_limit,
     load_domain_throttles,
+    validate_sender_domains,
 )
 from .shared.db import json_iter, open_db, JsonObj
 from .shared.tasks import tasks, LOW_PRIORITY, HIGH_PRIORITY
 from .shared.s3 import s3_write, s3_read, s3_write_stream, s3_delete
 from .shared.log import get_logger
+from .transactional_search import log_matches_search
 
 log = get_logger()
 
@@ -45,30 +47,99 @@ class Log(object):
     def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
         check_noadmin(req)
 
-        page = int(req.get_param("page", default=1))
+        page = max(int(req.get_param("page", default=1)), 1)
+        search = req.get_param("search", default="").strip()
+        start = req.get_param("start", default="").strip()
+        end = req.get_param("end", default="").strip()
 
         PAGE_SIZE = 10
 
         db = req.context["db"]
 
-        ret = []
-        for id, ts, data in db.execute(
+        start_dt = None
+        end_dt = None
+        def parse_datetime(value: str, label: str):
+            if not value:
+                return None
+            try:
+                dt = dateutil.parser.parse(value)
+            except Exception:
+                raise falcon.HTTPBadRequest(
+                    title="Invalid parameter",
+                    description=f"The {label} date/time is invalid.",
+                )
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=tzlocal())
+            return dt.astimezone(tzutc()).replace(tzinfo=None)
+
+        if start:
+            start_dt = parse_datetime(start, "start")
+        if end:
+            end_dt = parse_datetime(end, "end")
+        if start_dt is not None and end_dt is not None and start_dt > end_dt:
+            raise falcon.HTTPBadRequest(
+                title="Invalid parameter",
+                description="The start date/time must be before the end date/time.",
+            )
+
+        query = """
+            select id, ts, data from txnsends
+            where cid = %s
+        """
+        params = [db.get_cid()]
+
+        if search:
+            search_term = "%" + search.lower() + "%"
+            query += """
+                and (
+                    lower(coalesce(data->>'to', '')) like %s or
+                    lower(coalesce(data->>'fromemail', '')) like %s or
+                    lower(coalesce(data->>'subject', '')) like %s
+                )
             """
-                select id, ts, data from txnsends
-                where cid = %s
-                order by ts desc
-                limit %s
-                offset %s
-        """,
-            db.get_cid(),
-            PAGE_SIZE,
-            PAGE_SIZE * (page - 1),
-        ):
+            params.extend([search_term, search_term, search_term])
+        if start_dt is not None:
+            query += " and ts >= %s"
+            params.append(start_dt)
+        if end_dt is not None:
+            query += " and ts <= %s"
+            params.append(end_dt)
+
+        query += """
+            order by ts desc
+            limit %s
+            offset %s
+        """
+        params.extend([PAGE_SIZE, PAGE_SIZE * (page - 1)])
+
+        ret = []
+        for id, ts, data in db.execute(query, *params):
+            if search and not log_matches_search(data, search):
+                continue
             data["ts"] = ts.isoformat() + "Z"
             data["id"] = id
             ret.append(data)
 
-        total = db.single("select count(id) from txnsends where cid = %s", db.get_cid())
+        count_query = "select count(id) from txnsends where cid = %s"
+        count_params = [db.get_cid()]
+        if search:
+            count_query += """
+                and (
+                    lower(coalesce(data->>'to', '')) like %s or
+                    lower(coalesce(data->>'fromemail', '')) like %s or
+                    lower(coalesce(data->>'subject', '')) like %s
+                )
+            """
+            count_params.extend([search_term, search_term, search_term])
+        if start_dt is not None:
+            count_query += " and ts >= %s"
+            count_params.append(start_dt)
+        if end_dt is not None:
+            count_query += " and ts <= %s"
+            count_params.append(end_dt)
+
+        total = db.single(count_query, *count_params)
 
         req.context["result"] = {
             "records": ret,
@@ -142,6 +213,9 @@ def export_transactional_log(cid: str, exportid: str, path: str) -> None:
                 cid,
             ):
                 formatted_ts = ts.isoformat() + "Z"
+                status = data.get("status", "")
+                if data.get("event") == "Injection" and status == "Accepted":
+                    status = "Queued"
                 writer.writerow(
                     {
                         "Event": data.get("event") or "Delivery",
@@ -152,7 +226,7 @@ def export_transactional_log(cid: str, exportid: str, path: str) -> None:
                         "Subject": data.get("subject", ""),
                         "Tag": data.get("tag") or "untagged",
                         "Date": formatted_ts,
-                        "Status": data.get("status", ""),
+                        "Status": status,
                         "Error": data.get("error", ""),
                         "Opened": "true" if data.get("open") else "",
                         "Clicked": "true" if data.get("click") else "",
@@ -500,6 +574,10 @@ class Send(object):
                 title="Missing parameter", description="No subject specified."
             )
 
+        validate_sender_domains(
+            db, db.get_cid(), doc.get("fromemail"), doc.get("returnpath")
+        )
+
         txnsettings = db.txnsettings.get_singleton()
 
         mycid = db.get_cid()
@@ -609,7 +687,7 @@ class Send(object):
             txnmsgid,
             {
                 "event": "Injection",
-                "status": "Accepted",
+                "status": "Queued",
                 "subject": doc["subject"],
                 "tag": tag,
                 "fromname": doc.get("fromname", ""),
@@ -693,16 +771,44 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
 
             email = addr.strip().lower()
             d = email.split("@")[1]
+            subject = remove_newlines(data["subject"])
+            if variables is not None:
+                subject = replace_vars(subject, variables)
+
+            def log_suppressed(reason: str) -> None:
+                db.execute(
+                    "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+                    shortuuid.uuid(),
+                    mycid,
+                    datetime.utcnow(),
+                    txnmsgid,
+                    {
+                        "event": "Error",
+                        "status": "Suppressed",
+                        "error": reason,
+                        "subject": subject,
+                        "tag": tag,
+                        "fromname": data.get("fromname", ""),
+                        "fromemail": data.get("fromemail", "")
+                        or data.get("returnpath", ""),
+                        "toname": data.get("toname"),
+                        "to": addr,
+                    },
+                )
+
             if db.single(
                 "select email from unsublogs where cid = %s and email = %s and (unsubscribed or complained or bounced)",
                 mycid,
                 email,
             ):
+                reason = "Suppressed because this recipient is unsubscribed, complained, or bounced"
                 log.info(
-                    "Suppressing transactional message to %s for %s due to unsub",
+                    "Suppressing transactional message to %s for %s: %s",
                     email,
                     mycid,
+                    reason,
                 )
+                log_suppressed(reason)
                 return
             if db.single(
                 "select item from exclusions where cid = %s and item in (%s, %s)",
@@ -710,11 +816,14 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 email,
                 d,
             ):
+                reason = "Suppressed because this recipient or domain is excluded"
                 log.info(
-                    "Suppressing transactional message to %s for %s due to exclusion",
+                    "Suppressing transactional message to %s for %s: %s",
                     email,
                     mycid,
+                    reason,
                 )
+                log_suppressed(reason)
                 return
 
             fromname = remove_newlines(data["fromname"])
@@ -724,6 +833,8 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 fromname = replace_vars(fromname, variables)
                 fromemail = replace_vars(fromemail, variables)
                 returnpath = replace_vars(returnpath, variables)
+
+            validate_sender_domains(db, mycid, fromemail, returnpath)
 
             fromdomain = ""
             if "@" in returnpath:
@@ -746,10 +857,7 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
             else:
                 replyto = remove_newlines(data["fromemail"] or data["returnpath"])
 
-            subject = remove_newlines(data["subject"])
-
             if variables is not None:
-                subject = replace_vars(subject, variables)
                 replyto = replace_vars(replyto, variables)
 
                 if bodytemplate.get("type") != "raw":
@@ -774,6 +882,12 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 campid=campid,
                 toname=data["toname"],
                 raise_err=True,
+            )
+            log.info(
+                "Transactional message %s for customer %s processed by backend; delivered=%s",
+                campid,
+                mycid,
+                delivered,
             )
 
             if delivered:
@@ -910,6 +1024,45 @@ def replace_vars(html: str, variables: JsonObj) -> str:
     return html
 
 
+def add_test_txn_log(
+    db,
+    cid: str,
+    to: str,
+    subject: str,
+    tag: str,
+    fromname: str,
+    fromemail: str,
+    toname: str | None,
+    route: str | None,
+    msgid: str | None,
+    event: str = "Injection",
+    status: str = "Queued",
+    error: str | None = None,
+) -> None:
+    data = {
+        "event": event,
+        "status": status,
+        "subject": subject,
+        "tag": tag or "untagged",
+        "fromname": fromname,
+        "fromemail": fromemail,
+        "toname": toname,
+        "to": to,
+        "route": route,
+    }
+    if error:
+        data["error"] = error
+
+    db.execute(
+        "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+        shortuuid.uuid(),
+        cid,
+        datetime.utcnow(),
+        msgid,
+        data,
+    )
+
+
 class TxnTemplateTest(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
@@ -1002,12 +1155,6 @@ class TxnTemplateTest(object):
         if not returnpath:
             returnpath = fromemail
 
-        if "@" in returnpath:
-            fromdomain = returnpath.split("@")[-1].strip().lower()
-        elif "@" in fromemail:
-            fromdomain = fromemail.split("@")[-1].strip().lower()
-        frm = formataddr((remove_newlines(t["fromname"]), remove_newlines(fromemail)))
-
         if t.get("replyto", ""):
             replyto = remove_newlines(t["replyto"])
         else:
@@ -1017,11 +1164,20 @@ class TxnTemplateTest(object):
 
         if jsonvars:
             subject = replace_vars(subject, jsonvars)
-            frm = replace_vars(frm, jsonvars)
+            fromemail = replace_vars(fromemail, jsonvars)
             replyto = replace_vars(replyto, jsonvars)
+            returnpath = replace_vars(returnpath, jsonvars)
 
             if t.get("type") != "raw":
                 html = replace_vars(html, jsonvars)
+
+        validate_sender_domains(db, t["cid"], fromemail, returnpath)
+
+        if "@" in returnpath:
+            fromdomain = returnpath.split("@")[-1].strip().lower()
+        elif "@" in fromemail:
+            fromdomain = fromemail.split("@")[-1].strip().lower()
+        frm = formataddr((remove_newlines(t["fromname"]), remove_newlines(fromemail)))
 
         try:
             send_backend_mail(
@@ -1039,9 +1195,46 @@ class TxnTemplateTest(object):
             )
         except Exception as e:
             traceback.print_exc()
+            if doc.get("include_in_log", False):
+                try:
+                    add_test_txn_log(
+                        db,
+                        t["cid"],
+                        remove_newlines(doc["to"]),
+                        subject,
+                        t.get("tag") or "untagged",
+                        remove_newlines(t.get("fromname", "")),
+                        remove_newlines(fromemail),
+                        None,
+                        doc.get("route"),
+                        None,
+                        event="Error",
+                        status="Error",
+                        error=str(e),
+                    )
+                except Exception:
+                    log.exception("error logging transactional test send failure")
             raise falcon.HTTPBadRequest(
                 title="Error sending test", description="Error sending test: %s" % e
             )
+
+        if doc.get("include_in_log", False):
+            try:
+                add_test_txn_log(
+                    db,
+                    t["cid"],
+                    remove_newlines(doc["to"]),
+                    subject,
+                    t.get("tag") or "untagged",
+                    remove_newlines(t.get("fromname", "")),
+                    remove_newlines(fromemail),
+                    None,
+                    doc.get("route"),
+                    None,
+                    status="Sent",
+                )
+            except Exception:
+                log.exception("error logging transactional test send")
 
 
 class RecentTags(object):
@@ -1096,7 +1289,8 @@ def check_txns() -> None:
                         ):
                             requesting = min(cnt, 1000)
                             cnt = check_send_limit(
-                                company, route, domain, domainthrottles, requesting
+                                company, route, domain, domainthrottles, requesting,
+                                transactional=True,
                             )
                             if cnt > 0:
                                 log.debug(

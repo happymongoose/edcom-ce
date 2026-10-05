@@ -2849,3 +2849,6 @@ ALTER TABLE ONLY public.sinkdomainqueues
 --
 -- PostgreSQL database dump complete
 --
+
+-- Automation tables, including subject experiments, are created in dependency
+-- order by scripts/run_db_migrations.py after this base schema is imported.

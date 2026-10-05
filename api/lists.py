@@ -489,6 +489,366 @@ builtin_props = [
 ]
 
 
+def _iso_datetime(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat() + ("Z" if value.tzinfo is None else "")
+    return str(value)
+
+
+class ContactEmailHistory(object):
+
+    PAGE_SIZE = 10
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        page = max(req.get_param_as_int("page") or 1, 1)
+        offset = self.PAGE_SIZE * (page - 1)
+
+        contact_id = db.single(
+            f"""
+            select contact_id
+            from contacts."contacts_{cid}"
+            where email = %s
+            """,
+            email,
+        )
+        if contact_id is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found", description="Contact not found"
+            )
+
+        rows = db.execute(
+            """
+            with automation_sends as (
+                select
+                    'automation:' || sr.id as id,
+                    (sr.data->>'created')::timestamptz as sent_at,
+                    'automation' as source_type,
+                    coalesce(sr.data->>'automation_email_name', a.data->>'name', sr.automation_id) as source_name,
+                    coalesce(sr.data->>'subject', '') as subject,
+                    case
+                        when coalesce(sr.data->>'sent', '') = 'true' then 'sent'
+                        else coalesce(sr.data->>'status', '')
+                    end as status,
+                    jsonb_build_object(
+                        'automation_id', sr.automation_id,
+                        'automation_email_id', sr.data->>'automation_email_id',
+                        'enrolment_id', sr.enrolment_id,
+                        'node_id', sr.node_id,
+                        'step_run_id', sr.id,
+                        'published_revision', sr.data->'published_revision',
+                        'route_id', sr.data->>'route_id'
+                    ) as metadata
+                from automation_step_runs sr
+                left join automations a on a.cid = sr.cid and a.id = sr.automation_id
+                where sr.cid = %s
+                  and sr.contact_id = %s
+                  and sr.node_type = 'send_email'
+                  and coalesce(sr.data->>'sent', '') = 'true'
+                  and sr.data->>'created' is not null
+            ), transactional_sends as (
+                select
+                    'transactional:' || t.id as id,
+                    t.ts::timestamptz as sent_at,
+                    'transactional' as source_type,
+                    coalesce(t.data->>'tag', 'untagged') as source_name,
+                    coalesce(t.data->>'subject', '') as subject,
+                    coalesce(t.data->>'error', t.data->>'status', t.data->>'event', '') as status,
+                    jsonb_build_object(
+                        'transactional_send_id', t.id,
+                        'msgid', t.msgid,
+                        'tag', t.data->>'tag',
+                        'event', t.data->>'event',
+                        'route', t.data->>'route'
+                    ) as metadata
+                from txnsends t
+                where t.cid = %s
+                  and lower(coalesce(t.data->>'to', '')) = lower(%s)
+            ), combined as (
+                select * from automation_sends
+                union all
+                select * from transactional_sends
+            )
+            select id, sent_at, source_type, source_name, subject, status, metadata, count(*) over() as total
+            from combined
+            order by sent_at desc, id desc
+            limit %s
+            offset %s
+            """,
+            cid,
+            contact_id,
+            cid,
+            email,
+            self.PAGE_SIZE,
+            offset,
+        ).fetchall()
+
+        records = []
+        total = 0
+        for row in rows:
+            (
+                history_id,
+                sent_at,
+                source_type,
+                source_name,
+                subject,
+                status,
+                metadata,
+                total,
+            ) = row
+            records.append(
+                {
+                    "id": history_id,
+                    "sent_at": _iso_datetime(sent_at),
+                    "source_type": source_type,
+                    "source_name": source_name or "",
+                    "subject": subject or "",
+                    "status": status or "",
+                    "metadata": metadata or {},
+                }
+            )
+
+        if not rows:
+            total = db.single(
+                """
+                with automation_sends as (
+                    select sr.id
+                    from automation_step_runs sr
+                    where sr.cid = %s
+                      and sr.contact_id = %s
+                      and sr.node_type = 'send_email'
+                      and coalesce(sr.data->>'sent', '') = 'true'
+                      and sr.data->>'created' is not null
+                ), transactional_sends as (
+                    select t.id
+                    from txnsends t
+                    where t.cid = %s
+                      and lower(coalesce(t.data->>'to', '')) = lower(%s)
+                )
+                select count(*) from (
+                    select id from automation_sends
+                    union all
+                    select id from transactional_sends
+                ) combined
+                """,
+                cid,
+                contact_id,
+                cid,
+                email,
+            )
+
+        req.context["result"] = {
+            "records": records,
+            "page": page,
+            "page_size": self.PAGE_SIZE,
+            "total": total or 0,
+        }
+
+
+CONTACT_AUTOMATION_ACTIVE_STATUSES = {
+    "ready",
+    "waiting",
+    "held",
+    "paused_ready",
+    "paused_waiting",
+    "running",
+}
+
+CONTACT_AUTOMATION_CANCELLABLE_STATUSES = {
+    "ready",
+    "waiting",
+    "held",
+    "paused_ready",
+    "paused_waiting",
+}
+
+
+def _automation_enrolment_progress(
+    status: str,
+    current_node_id: str | None,
+    published: JsonObj | None,
+) -> Tuple[int | None, str, str]:
+    nodes = (published or {}).get("nodes") or []
+    if status in ("completed", "exited"):
+        return 100, "", ""
+    if not current_node_id:
+        return None, "", ""
+
+    for index, node in enumerate(nodes):
+        if node.get("id") == current_node_id:
+            count = len(nodes)
+            progress = int(index * 100 / count) if count else None
+            return progress, node.get("label") or "", node.get("type") or ""
+    return None, "Unknown step", ""
+
+
+class ContactAutomationEnrolments(object):
+
+    DEFAULT_LIMIT = 25
+    MAX_LIMIT = 100
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        limit = max(1, min(req.get_param_as_int("limit") or self.DEFAULT_LIMIT, self.MAX_LIMIT))
+
+        contact_id = db.single(
+            f"""
+            select contact_id
+            from contacts."contacts_{cid}"
+            where email = %s
+            """,
+            email,
+        )
+        if contact_id is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found", description="Contact not found"
+            )
+
+        records = []
+        for (
+            enrolment_id,
+            automation_id,
+            automation_name,
+            automation_status,
+            contact_email,
+            enrolment_data,
+            published,
+        ) in db.execute(
+            """
+            select
+                e.id,
+                e.automation_id,
+                a.data->>'name',
+                a.data->>'status',
+                e.contact_email,
+                e.data,
+                a.data->'published'
+            from automation_enrolments e
+            join automations a on a.cid = e.cid and a.id = e.automation_id
+            where e.cid = %s and e.contact_id = %s
+            order by
+                case when e.data->>'status' = any(%s) then 0 else 1 end,
+                coalesce(
+                    nullif(e.data->>'modified', '')::timestamptz,
+                    nullif(e.data->>'created', '')::timestamptz
+                ) desc nulls last,
+                e.id desc
+            limit %s
+            """,
+            cid,
+            contact_id,
+            list(CONTACT_AUTOMATION_ACTIVE_STATUSES),
+            limit,
+        ):
+            status = enrolment_data.get("status") or ""
+            current_node_id = enrolment_data.get("current_node_id")
+            progress, node_label, node_type = _automation_enrolment_progress(
+                status,
+                current_node_id,
+                published,
+            )
+            records.append(
+                {
+                    "id": enrolment_id,
+                    "automation_id": automation_id,
+                    "automation_name": automation_name or automation_id,
+                    "automation_status": automation_status or "",
+                    "contact_email": contact_email,
+                    "status": status,
+                    "progress": progress,
+                    "current_node_id": current_node_id,
+                    "current_node_label": node_label,
+                    "current_node_type": node_type,
+                    "started_at": enrolment_data.get("created"),
+                    "updated_at": enrolment_data.get("modified") or enrolment_data.get("created"),
+                    "source": enrolment_data.get("source") or "",
+                    "cancellable": status in CONTACT_AUTOMATION_CANCELLABLE_STATUSES,
+                }
+            )
+
+        req.context["result"] = {
+            "records": records,
+            "limit": limit,
+        }
+
+
+class ContactsAll(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        page = max(req.get_param_as_int("page") or 1, 1)
+        page_size = max(1, min(req.get_param_as_int("page_size") or 50, 100))
+        search = (req.get_param("search") or "").strip().lower()[:255]
+        include_unlisted = req.get_param_as_bool("include_unlisted") or False
+
+        params = []
+        filters = []
+        if search:
+            filters.append("""(lower(email) like %s or lower(concat_ws(' ',
+                props->>'First Name', props->>'Last Name', props->>'Name', props->>'Full Name')) like %s)""")
+            pattern = "%%%s%%" % search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.extend([pattern, pattern])
+        filter_clause = ("and " + " and ".join(filters)) if filters else ""
+        membership_clause = "true" if include_unlisted else f"""exists (
+            select 1 from contacts."contact_lists_{cid}" cl
+            join lists l on l.cid = %s and l.id = cl.list_id
+            where cl.contact_id = c.contact_id
+        )"""
+        scope_params = [] if include_unlisted else [cid]
+
+        total = db.single(
+            f"""
+            select count(*)
+            from contacts."contacts_{cid}" c
+            where {membership_clause}
+            {filter_clause}
+            """,
+            *(scope_params + params),
+        ) or 0
+
+        rows = [
+            {
+                "contact_id": contact_id,
+                "email": email,
+                "name": name,
+                "added": datetime.utcfromtimestamp(added).isoformat() + "Z" if added else None,
+            }
+            for contact_id, email, added, name in db.execute(
+                f"""
+                select contact_id, email, added,
+                    coalesce(nullif(concat_ws(' ', nullif(props->>'First Name', ''),
+                        nullif(props->>'Last Name', '')), ''), props->>'Full Name', props->>'Name', '')
+                from contacts."contacts_{cid}" c
+                where {membership_clause}
+                {filter_clause}
+                order by lower(email), contact_id
+                limit %s offset %s
+                """,
+                *(scope_params + params + [page_size, (page - 1) * page_size]),
+            )
+        ]
+
+        req.context["result"] = {
+            "contacts": rows,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "search": search,
+        }
+
+
 class ContactData(object):
 
     def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
@@ -2376,6 +2736,254 @@ class Segment(CRUDSingle):
                     title="Segment in use",
                     description="This segment is in use by one or more draft broadcasts",
                 )
+
+
+class SegmentContacts(object):
+
+    def _get_page_param(self, req: falcon.Request, name: str, default: int, maximum: int) -> int:
+        value = req.get_param_as_int(name) or default
+        return max(1, min(value, maximum))
+
+    def _evaluate_contacts(
+        self,
+        db: DB,
+        cid: str,
+        segment: JsonObj,
+        search: str,
+        update_count: bool = False,
+    ) -> List[JsonObj]:
+        segments: Dict[str, JsonObj | None] = {}
+        segment_get_segments(db, segment.get("parts", []), segments)
+        campaignids = segment_get_campaignids(segment, list(segments.values()))
+        hashlimit, listfactors = segment_get_params(db, cid, segment)
+
+        rowset = None
+        if search:
+            rowset = {
+                email
+                for (email,) in db.execute(
+                    f"""
+                    select email
+                    from contacts."contacts_{cid}"
+                    where lower(email) like %s
+                    """,
+                    "%%%s%%" % search,
+                )
+            }
+            if not rowset:
+                return []
+
+        emails = set()
+        cache = Cache()
+        for hashval in range(hashlimit):
+            sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+            rows = get_segment_rows(db, cid, hashval, listfactors, hashlimit, rowset=rowset)
+            segcounts: Dict[str, int] = {}
+            numrows = len(rows)
+            for row in rows:
+                email = row.get("Email", [""])[0]
+                if search and search not in email.lower():
+                    continue
+                if segment_eval_parts(
+                    segment.get("parts", []),
+                    segment.get("operator", "and"),
+                    row,
+                    segcounts,
+                    numrows,
+                    segments,
+                    sentrows,
+                    segment,
+                    hashlimit,
+                    cache,
+                ):
+                    emails.add(email)
+
+        if not emails:
+            if update_count and segment.get("count") != 0:
+                db.segments.patch(
+                    segment["id"],
+                    {
+                        "count": 0,
+                        "last_update": datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+            return []
+
+        contacts = [
+            {
+                "contact_id": contact_id,
+                "email": email,
+                "added": datetime.utcfromtimestamp(added).isoformat() + "Z" if added else None,
+            }
+            for contact_id, email, added in db.execute(
+                f"""
+                select contact_id, email, added
+                from contacts."contacts_{cid}"
+                where email = any(%s)
+                order by lower(email), contact_id
+                """,
+                list(emails),
+            )
+        ]
+        if update_count and segment.get("count") != len(contacts):
+            db.segments.patch(
+                segment["id"],
+                {
+                    "count": len(contacts),
+                    "last_update": datetime.utcnow().isoformat() + "Z",
+                },
+            )
+        return contacts
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+
+        segment = db.segments.get(id)
+        if segment is None or segment.get("cid") != cid:
+            raise falcon.HTTPForbidden()
+
+        page = self._get_page_param(req, "page", 1, 1000000)
+        page_size = self._get_page_param(req, "page_size", 50, 100)
+        search = (req.get_param("search") or "").strip().lower()[:255]
+
+        try:
+            contacts = self._evaluate_contacts(db, cid, segment, search, update_count=True)
+        except Exception as exc:
+            raise falcon.HTTPBadRequest(
+                title="Unable to evaluate segment",
+                description=str(exc),
+            )
+
+        total = len(contacts)
+        offset = (page - 1) * page_size
+        req.context["result"] = {
+            "segment": {
+                "id": segment["id"],
+                "name": segment.get("name", segment["id"]),
+                "count": segment.get("count"),
+            },
+            "contacts": contacts[offset:offset + page_size],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "search": search,
+        }
+
+
+class ContactMemberships(object):
+
+    def _segment_matches_contact(
+        self,
+        db: DB,
+        cid: str,
+        segment: JsonObj,
+        contact_id: int,
+        email: str,
+    ) -> bool:
+        segments: Dict[str, JsonObj | None] = {}
+        segment_get_segments(db, segment.get("parts", []), segments)
+        campaignids = segment_get_campaignids(segment, list(segments.values()))
+        hashlimit, listfactors = segment_get_params(db, cid, segment)
+        cache = Cache()
+        for hashval in range(hashlimit):
+            sentrows = get_segment_sentrows(db, cid, campaignids, hashval, hashlimit)
+            rows = get_segment_rows(
+                db,
+                cid,
+                hashval,
+                listfactors,
+                hashlimit,
+                rowset={email},
+            )
+            if not rows:
+                continue
+            segcounts: Dict[str, int] = {}
+            numrows = len(rows)
+            for row in rows:
+                if row.get("Email", [""])[0].lower() != email.lower():
+                    continue
+                if segment_eval_parts(
+                    segment.get("parts", []),
+                    segment.get("operator", "and"),
+                    row,
+                    segcounts,
+                    numrows,
+                    segments,
+                    sentrows,
+                    segment,
+                    hashlimit,
+                    cache,
+                ):
+                    return True
+        return False
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, email: str) -> None:
+        check_noadmin(req, True)
+
+        db = req.context["db"]
+        cid = db.get_cid()
+        contact_id = db.single(
+            f"""
+            select contact_id
+            from contacts."contacts_{cid}"
+            where email = %s
+            """,
+            email,
+        )
+        if contact_id is None:
+            raise falcon.HTTPNotFound(
+                title="Contact not found", description="Contact not found"
+            )
+
+        lists = [
+            {
+                "id": list_id,
+                "name": name,
+                "count": count,
+            }
+            for list_id, name, count in db.execute(
+                f"""
+                select l.id, l.data->>'name', l.data->'count'
+                from lists l
+                join contacts."contact_lists_{cid}" cl on cl.list_id = l.id
+                where l.cid = %s and cl.contact_id = %s
+                order by lower(l.data->>'name'), l.id
+                """,
+                cid,
+                contact_id,
+            )
+        ]
+
+        matching_segments = []
+        segments = list(json_iter(
+            db.execute(
+                "select id, cid, data - 'rawText' from segments where cid = %s order by lower(data->>'name'), id",
+                cid,
+            )
+        ))
+        for segment in segments:
+            try:
+                if self._segment_matches_contact(db, cid, segment, contact_id, email):
+                    matching_segments.append(
+                        {
+                            "id": segment["id"],
+                            "name": segment.get("name", segment["id"]),
+                            "count": segment.get("count"),
+                        }
+                    )
+            except Exception as exc:
+                log.info("skipping segment membership evaluation for %s: %s", segment.get("id"), exc)
+
+        req.context["result"] = {
+            "contact_id": contact_id,
+            "email": email,
+            "lists": lists,
+            "segments": matching_segments,
+        }
 
 
 class SegmentExport(object):

@@ -41,9 +41,12 @@ type Server struct {
 	SenderChecker     func(peer Peer, addr string) error // Called after MAIL FROM.
 	RecipientChecker  func(peer Peer, addr string) error // Called after each RCPT TO.
 
-	// Enable PLAIN/LOGIN authentication, only available after STARTTLS.
+	// Enable PLAIN/LOGIN authentication; ForceTLS requires STARTTLS first.
 	// Can be left empty for no authentication support.
 	Authenticator func(peer Peer, username, password string) error
+
+	// Permit MAIL without SMTP AUTH only when Handler validates credentials itself.
+	AllowUnauthenticated bool
 
 	EnableXCLIENT       bool // Enable XCLIENT support (default: false)
 	EnableProxyProtocol bool // Enable proxy protocol support (default: false)
@@ -109,7 +112,8 @@ type session struct {
 	writer  *bufio.Writer
 	scanner *bufio.Scanner
 
-	tls bool
+	tls           bool
+	authenticated bool
 }
 
 func (srv *Server) newSession(c net.Conn) (s *session) {
@@ -373,8 +377,12 @@ func (session *session) flush() {
 }
 
 func (session *session) error(err error) {
-	if smtpdError, ok := err.(Error); ok {
-		session.reply(smtpdError.Code, smtpdError.Message)
+	var pointer *Error
+	var value Error
+	if errors.As(err, &pointer) && pointer != nil {
+		session.reply(pointer.Code, pointer.Message)
+	} else if errors.As(err, &value) {
+		session.reply(value.Code, value.Message)
 	} else {
 		session.reply(502, fmt.Sprintf("%s", err))
 	}
@@ -412,7 +420,7 @@ func (session *session) extensions() []string {
 		extensions = append(extensions, "STARTTLS")
 	}
 
-	if session.server.Authenticator != nil {
+	if session.server.Authenticator != nil && (!session.server.ForceTLS || session.tls) {
 		extensions = append(extensions, "AUTH PLAIN LOGIN")
 	}
 

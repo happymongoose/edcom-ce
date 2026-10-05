@@ -3,20 +3,77 @@ import axios from "axios";
 import LoaderPanel from "../components/LoaderPanel";
 import LoaderButton from "../components/LoaderButton";
 import withLoadSave from "../components/LoadSave";
-import { FormControlLabel } from "../components/FormControls";
-import { Row, Col } from "react-bootstrap";
+import { FormControlLabel, SelectLabel } from "../components/FormControls";
+import { Button, Row, Col, Table, Modal } from "react-bootstrap";
 import SaveNavbar from "../components/SaveNavbar";
 import { EDFormSection, EDFormBox } from "../components/EDDOM";
 import parse from "../utils/parse";
 import Select2 from 'react-select2-wrapper';
 import _ from 'lodash';
 import notify from "../utils/notify";
+import moment from "moment";
+import { automationImpersonatedHref } from "./Automation";
 
 const builtIn = ['Email', 'Opened', 'Clicked', 'Unsubscribed', 'Bounced', 'Complained', 'Soft Bounced'];
 
+function errorMessage(error, fallback) {
+  const data = error && error.response && error.response.data;
+  if (data) {
+    return data.description || data.title || fallback;
+  }
+  return fallback;
+}
+
+function automationIsEnrollable(automation) {
+  return automation.status === 'published' || (automation.status === 'paused' && (automation.published || automation.published_at));
+}
+
 class ContactEdit extends Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      automationId: '',
+      isEnrolling: false,
+      emailHistory: null,
+      emailHistoryPage: 1,
+      isEmailHistoryLoading: false,
+      memberships: null,
+      isMembershipsLoading: false,
+      automationEnrolments: null,
+      isAutomationEnrolmentsLoading: false,
+      cancellingEnrolment: null,
+      isCancellingAutomation: false,
+    };
+    this.emailHistoryRequest = 0;
+    this.membershipsRequest = 0;
+    this.automationEnrolmentsRequest = 0;
+  }
+
+  componentDidMount() {
+    if (this.props.data && this.props.data.email) {
+      this.loadEmailHistory(1);
+      this.loadMemberships();
+      this.loadAutomationEnrolments();
+    }
+  }
+
+  componentWillReceiveProps(nextProps) {
+    const currentEmail = this.props.data && this.props.data.email;
+    const nextEmail = nextProps.data && nextProps.data.email;
+    if (nextEmail && nextEmail !== currentEmail) {
+      this.loadEmailHistory(1, nextEmail);
+      this.loadMemberships(nextEmail);
+      this.loadAutomationEnrolments(nextEmail);
+    }
+  }
+
   handleChange = event => {
     this.props.update({properties: {[event.target.id]: {$set: event.target.value}}})
+  }
+
+  handleAutomationChange = event => {
+    this.setState({automationId: event.target.value});
   }
 
   handleSubmit = async event => {
@@ -84,9 +141,383 @@ class ContactEdit extends Component {
     return field && !this.props.data.properties.hasOwnProperty(trimmed) && !builtIn.includes(trimmed) && !trimmed.includes('!') && !trimmed.includes(',');
   }
 
+  automationOptions() {
+    return _.map(
+      _.sortBy(
+        _.filter(this.props.automations || [], automationIsEnrollable),
+        automation => (automation.name || '').toLowerCase()
+      ),
+      automation => ({
+        id: automation.id,
+        name: automation.name || automation.id,
+      })
+    );
+  }
+
+  enrolInAutomation = async () => {
+    const automationId = this.state.automationId;
+    if (!automationId || !this.props.data.email) {
+      return;
+    }
+
+    this.setState({isEnrolling: true});
+    try {
+      await axios.post('/api/automations/' + automationId + '/enrolments', {
+        email: this.props.data.email,
+      });
+      notify.show('Contact added to automation', 'success');
+      this.loadAutomationEnrolments();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to add contact to automation'), 'error');
+    } finally {
+      this.setState({isEnrolling: false});
+    }
+  }
+
+  loadAutomationEnrolments = async email => {
+    const contactEmail = email || (this.props.data && this.props.data.email);
+    if (!contactEmail) {
+      return;
+    }
+
+    const requestId = ++this.automationEnrolmentsRequest;
+    this.setState({isAutomationEnrolmentsLoading: true});
+    try {
+      const response = await axios.get('/api/contactdata/' + encodeURIComponent(contactEmail) + '/automation-enrolments');
+      if (requestId === this.automationEnrolmentsRequest) {
+        this.setState({automationEnrolments: response.data});
+      }
+    } catch (error) {
+      if (requestId === this.automationEnrolmentsRequest) {
+        notify.show(errorMessage(error, 'Unable to load automation enrolments'), 'error');
+      }
+    } finally {
+      if (requestId === this.automationEnrolmentsRequest) {
+        this.setState({isAutomationEnrolmentsLoading: false});
+      }
+    }
+  }
+
+  confirmCancelAutomation = enrolment => {
+    this.setState({cancellingEnrolment: enrolment});
+  }
+
+  closeCancelAutomation = () => {
+    if (!this.state.isCancellingAutomation) {
+      this.setState({cancellingEnrolment: null});
+    }
+  }
+
+  cancelAutomation = async () => {
+    const enrolment = this.state.cancellingEnrolment;
+    if (!enrolment) {
+      return;
+    }
+
+    this.setState({isCancellingAutomation: true});
+    try {
+      await axios.post('/api/automations/' + enrolment.automation_id + '/enrolments/' + enrolment.id + '/cancel');
+      notify.show('Automation pass ended', 'success');
+      this.setState({cancellingEnrolment: null});
+      this.loadAutomationEnrolments();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to end automation'), 'error');
+    } finally {
+      this.setState({isCancellingAutomation: false});
+    }
+  }
+
+  loadEmailHistory = async (page, email) => {
+    const contactEmail = email || (this.props.data && this.props.data.email);
+    if (!contactEmail) {
+      return;
+    }
+
+    const requestId = ++this.emailHistoryRequest;
+    this.setState({isEmailHistoryLoading: true, emailHistoryPage: page});
+    try {
+      const response = await axios.get('/api/contactdata/' + encodeURIComponent(contactEmail) + '/email-history', {
+        params: {page},
+      });
+      if (requestId === this.emailHistoryRequest) {
+        this.setState({emailHistory: response.data});
+      }
+    } catch (error) {
+      if (requestId === this.emailHistoryRequest) {
+        notify.show(errorMessage(error, 'Unable to load email history'), 'error');
+      }
+    } finally {
+      if (requestId === this.emailHistoryRequest) {
+        this.setState({isEmailHistoryLoading: false});
+      }
+    }
+  }
+
+  emailHistoryMaxPage() {
+    const history = this.state.emailHistory;
+    if (!history || !history.total) {
+      return 1;
+    }
+    return Math.ceil(history.total / history.page_size);
+  }
+
+  previousEmailHistoryPage = () => {
+    if (this.state.emailHistoryPage <= 1) {
+      return;
+    }
+    this.loadEmailHistory(this.state.emailHistoryPage - 1);
+  }
+
+  nextEmailHistoryPage = () => {
+    if (this.state.emailHistoryPage >= this.emailHistoryMaxPage()) {
+      return;
+    }
+    this.loadEmailHistory(this.state.emailHistoryPage + 1);
+  }
+
+  loadMemberships = async email => {
+    const contactEmail = email || (this.props.data && this.props.data.email);
+    if (!contactEmail) {
+      return;
+    }
+
+    const requestId = ++this.membershipsRequest;
+    this.setState({isMembershipsLoading: true});
+    try {
+      const response = await axios.get('/api/contactdata/' + encodeURIComponent(contactEmail) + '/memberships');
+      if (requestId === this.membershipsRequest) {
+        this.setState({memberships: response.data});
+      }
+    } catch (error) {
+      if (requestId === this.membershipsRequest) {
+        notify.show(errorMessage(error, 'Unable to load contact memberships'), 'error');
+      }
+    } finally {
+      if (requestId === this.membershipsRequest) {
+        this.setState({isMembershipsLoading: false});
+      }
+    }
+  }
+
+  renderMembershipList(items, emptyText, hrefForItem) {
+    if (!items || !items.length) {
+      return <p>{emptyText}</p>;
+    }
+    return (
+      <ul className="list-unstyled">
+        {
+          _.map(items, item =>
+            <li key={item.id} style={{marginBottom: '6px'}}>
+              <a href={hrefForItem(item)} target="_blank" rel="noopener noreferrer">
+                {item.name || item.id}
+              </a>
+              {
+                _.isNumber(item.count) &&
+                <span className="text-muted"> ({item.count.toLocaleString()} contacts)</span>
+              }
+            </li>
+          )
+        }
+      </ul>
+    );
+  }
+
+  renderMemberships() {
+    const memberships = this.state.memberships;
+    if (this.state.isMembershipsLoading && !memberships) {
+      return <p>Loading contact memberships...</p>;
+    }
+
+    const impersonateId = this.props.loggedInImpersonate;
+    return (
+      <div>
+        <Row>
+          <Col xs={12} md={6}>
+            <h5>Contact lists</h5>
+            {this.renderMembershipList(
+              (memberships && memberships.lists) || [],
+              'This contact is not currently in any contact lists.',
+              item => automationImpersonatedHref('/contacts/find?id=' + item.id, impersonateId)
+            )}
+          </Col>
+          <Col xs={12} md={6}>
+            <h5>Segments</h5>
+            {this.renderMembershipList(
+              (memberships && memberships.segments) || [],
+              'This contact is not currently in any segments.',
+              item => automationImpersonatedHref('/segments/' + item.id + '/contacts?search=' + encodeURIComponent(this.props.data.email), impersonateId)
+            )}
+          </Col>
+        </Row>
+        {
+          this.state.isMembershipsLoading &&
+          <p>Refreshing contact memberships...</p>
+        }
+      </div>
+    );
+  }
+
+  renderEmailHistory() {
+    const history = this.state.emailHistory;
+    const records = (history && history.records) || [];
+    const maxPage = this.emailHistoryMaxPage();
+
+    if (this.state.isEmailHistoryLoading && !history) {
+      return <p>Loading email history...</p>;
+    }
+
+    if (!records.length) {
+      return (
+        <div>
+          <p>No recent automation or transactional emails found for this contact.</p>
+          {
+            this.state.isEmailHistoryLoading &&
+            <p>Refreshing email history...</p>
+          }
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <Table responsive className="space15">
+          <thead>
+            <tr>
+              <th>Sent</th>
+              <th>Type</th>
+              <th>Name / Source</th>
+              <th>Subject</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              _.map(records, record =>
+                <tr key={record.id}>
+                  <td>{record.sent_at ? moment(record.sent_at).format('l LTS') : ''}</td>
+                  <td>{record.source_type}</td>
+                  <td>{record.source_name}</td>
+                  <td>{record.subject}</td>
+                  <td>{record.status}</td>
+                </tr>
+              )
+            }
+          </tbody>
+        </Table>
+        {
+          maxPage > 1 &&
+          <div className="form-inline space-bottom" style={{display: 'flex', gap: '16px', alignItems: 'center'}}>
+            <Button
+              type="button"
+              style={{width: '120px'}}
+              onClick={this.previousEmailHistoryPage}
+              disabled={this.state.isEmailHistoryLoading || this.state.emailHistoryPage <= 1}
+            >
+              Previous
+            </Button>
+            <span>Page {this.state.emailHistoryPage} of {maxPage}</span>
+            <Button
+              type="button"
+              style={{width: '120px'}}
+              onClick={this.nextEmailHistoryPage}
+              disabled={this.state.isEmailHistoryLoading || this.state.emailHistoryPage >= maxPage}
+            >
+              Next
+            </Button>
+          </div>
+        }
+        {
+          this.state.isEmailHistoryLoading &&
+          <p>Refreshing email history...</p>
+        }
+      </div>
+    );
+  }
+
+  renderAutomationEnrolments() {
+    const data = this.state.automationEnrolments;
+    const records = (data && data.records) || [];
+
+    if (this.state.isAutomationEnrolmentsLoading && !data) {
+      return <p>Loading automation enrolments...</p>;
+    }
+
+    if (!records.length) {
+      return (
+        <div>
+          <p>This contact is not currently or recently enrolled in any automations.</p>
+          {
+            this.state.isAutomationEnrolmentsLoading &&
+            <p>Refreshing automation enrolments...</p>
+          }
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <Table responsive className="space15">
+          <thead>
+            <tr>
+              <th>Automation</th>
+              <th>Status</th>
+              <th>Progress</th>
+              <th>Current step</th>
+              <th>Started</th>
+              <th>Updated</th>
+              <th>Source</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              _.map(records, enrolment => {
+                const currentStep = enrolment.current_node_label ?
+                  enrolment.current_node_label + (enrolment.current_node_type ? ' (' + enrolment.current_node_type + ')' : '')
+                  :
+                  '';
+                const terminal = _.includes(['completed', 'exited'], enrolment.status);
+                return (
+                  <tr key={enrolment.id}>
+                    <td>{enrolment.automation_name}</td>
+                    <td>{enrolment.status}</td>
+                    <td>{_.isNumber(enrolment.progress) ? enrolment.progress + '%' : 'Unknown'}</td>
+                    <td>{currentStep || (terminal ? 'Complete' : 'Unknown')}</td>
+                    <td>{enrolment.started_at ? moment(enrolment.started_at).format('l LTS') : ''}</td>
+                    <td>{enrolment.updated_at ? moment(enrolment.updated_at).format('l LTS') : ''}</td>
+                    <td>{enrolment.source}</td>
+                    <td>
+                      {
+                        enrolment.cancellable ?
+                          <Button
+                            type="button"
+                            bsStyle="danger"
+                            onClick={this.confirmCancelAutomation.bind(null, enrolment)}
+                          >
+                            End automation
+                          </Button>
+                        :
+                          null
+                      }
+                    </td>
+                  </tr>
+                );
+              })
+            }
+          </tbody>
+        </Table>
+        {
+          this.state.isAutomationEnrolmentsLoading &&
+          <p>Refreshing automation enrolments...</p>
+        }
+      </div>
+    );
+  }
+
   render() {
     var tagitems = _.map(_.filter(this.props.tags, l => !_.find(this.props.data.tags, id => id === l)), t => ({id: t, text: t}));
     var fields = _.filter(this.props.allfields, f => this.isValidNewField(f));
+    var automationOptions = this.automationOptions();
 
     return (
       <SaveNavbar onBack={this.goBack} id={this.props.id} user={this.props.user}
@@ -184,7 +615,77 @@ class ContactEdit extends Component {
                 </Row>
               </div>
             </EDFormBox>
+            <EDFormBox space>
+              <h4>List and Segment Memberships</h4>
+              {this.renderMemberships()}
+            </EDFormBox>
+            <EDFormBox space>
+              <h4>Automation Enrolment</h4>
+              {
+                automationOptions.length ?
+                  <div className="form-inline">
+                    <SelectLabel
+                      id="automationId"
+                      label="Automation"
+                      obj={this.state}
+                      onChange={this.handleAutomationChange}
+                      options={automationOptions}
+                      emptyVal="Select automation"
+                      inline
+                    />
+                    {' '}
+                    <Button
+                      type="button"
+                      bsStyle="primary"
+                      disabled={this.state.isEnrolling || !this.state.automationId || !this.props.data.email}
+                      onClick={this.enrolInAutomation}
+                    >
+                      {this.state.isEnrolling ? 'Adding...' : 'Add to automation'}
+                    </Button>
+                  </div>
+                :
+                  <p>No published or paused automations are available.</p>
+              }
+            </EDFormBox>
+            <EDFormBox space>
+              <h4>Automation Status</h4>
+              {this.renderAutomationEnrolments()}
+            </EDFormBox>
+            <EDFormBox space>
+              <h4>Recent automation and transactional emails</h4>
+              {this.renderEmailHistory()}
+            </EDFormBox>
           </EDFormSection>
+          <Modal show={!!this.state.cancellingEnrolment} onHide={this.closeCancelAutomation}>
+            <Modal.Header closeButton>
+              <Modal.Title>End automation?</Modal.Title>
+            </Modal.Header>
+            <Modal.Body>
+              {
+                this.state.cancellingEnrolment &&
+                <p>
+                  This will cancel this contact&apos;s current pass through {this.state.cancellingEnrolment.automation_name}. History will be kept.
+                </p>
+              }
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                type="button"
+                bsStyle="danger"
+                disabled={this.state.isCancellingAutomation}
+                onClick={this.cancelAutomation}
+              >
+                {this.state.isCancellingAutomation ? 'Ending...' : 'End automation'}
+              </Button>
+              <Button
+                type="button"
+                disabled={this.state.isCancellingAutomation}
+                onClick={this.closeCancelAutomation}
+              >
+                Cancel
+              </Button>
+            </Modal.Footer>
+          </Modal>
         </LoaderPanel>
       </SaveNavbar>
     );
@@ -202,5 +703,6 @@ export default withLoadSave({
   extra: {
     tags: async() => (await axios.get('/api/recenttags')).data,
     allfields: async () => (await axios.get('/api/allfields')).data,
+    automations: async () => (await axios.get('/api/automations')).data,
   },
 });

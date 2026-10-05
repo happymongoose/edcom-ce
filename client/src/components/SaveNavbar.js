@@ -61,6 +61,12 @@ export default class SaveNavbar extends Component {
             }
           </div>
         </Navbar>
+        {
+          props.loggedInImpersonate &&
+          <div className="alert alert-info alert-server" role="alert">
+            This is the customer data view. <strong>Close this browser tab to exit.</strong>
+          </div>
+        }
         {props.children}
       </div>
     );

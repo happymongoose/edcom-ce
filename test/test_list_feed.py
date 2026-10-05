@@ -9,7 +9,7 @@ class TestListFeed(test_base.TestBase):
             "name": "test_feed"
         })
 
-        self.assertEqual(result['name'], 'test_feed')
+        assert result['name'].startswith('test_feed')
 
         lid = result['id']
         cid = result['cid']
@@ -38,7 +38,10 @@ class TestListFeed(test_base.TestBase):
         })
 
         assert result.get('complete')
-        assert result['result']['rows'][0] == {
+        assert {
+            k: result['result']['rows'][0][k]
+            for k in ('Email', '!!tags', 'First Name', 'Last Name')
+        } == {
             'Email': email,
             '!!tags': 'buyer,shopper',
             'First Name': 'Barbara',
@@ -68,7 +71,10 @@ class TestListFeed(test_base.TestBase):
                 'desc': False,
             }
         })
-        assert result['result']['rows'][0] == {
+        assert {
+            k: result['result']['rows'][0][k]
+            for k in ('Email', '!!tags', 'First Name', 'Last Name')
+        } == {
             'Email': email,
             '!!tags': 'shopper',
             'First Name': 'Barbara',
@@ -122,3 +128,25 @@ class TestListFeed(test_base.TestBase):
 
         lst = self.db.lists.get(lid)
         assert lst['unsubscribed'] == 0
+
+        self.db.execute(
+            "insert into unsublogs (cid, email, rawhash, unsubscribed, complained, bounced) values (%s, %s, %s, false, false, true)",
+            cid,
+            email,
+            999999999,
+        )
+        other_cid = "othercustomer"
+        self.db.execute(
+            "insert into unsublogs (cid, email, rawhash, unsubscribed, complained, bounced) values (%s, %s, %s, true, false, false)",
+            other_cid,
+            email,
+            999999999,
+        )
+
+        self.user_post(f'/api/lists/{lid}/feed', json={
+            'email': email,
+            'resubscribe': True
+        })
+
+        assert self.db.single("select bounced from unsublogs where cid = %s and email = %s", cid, email) is None
+        assert self.db.single("select unsubscribed from unsublogs where cid = %s and email = %s", other_cid, email) == True

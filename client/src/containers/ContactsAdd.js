@@ -316,6 +316,12 @@ class ContactsAdd extends Component {
     this.doParse();
   }
 
+  handleCreateEmpty = async () => {
+    await this.props.save();
+    notify.show("Contact list created", "success");
+    this.goBack();
+  }
+
   handleSubmit2 = async event => {
     sendGA4Event('Contacts', 'Uploaded Contact List', 'Added Contact List Data');
     event.preventDefault();
@@ -534,6 +540,17 @@ class ContactsAdd extends Component {
                       </EDFormGroup>
                   }
                   <EDFormGroup className="text-center">
+                    {
+                      this.props.id === 'new' &&
+                      <Button
+                        bsSize="large"
+                        disabled={this.props.isSaving || !this.props.data.name}
+                        onClick={this.handleCreateEmpty}
+                        style={{marginRight: '40px'}}
+                      >
+                        Create Empty List
+                      </Button>
+                    }
                     <Button bsStyle="primary" bsSize="large" type="submit">Next</Button>
                   </EDFormGroup>
                 </EDFormBox>

@@ -3,7 +3,7 @@ import { withRouter } from "react-router-dom";
 import Routes from "./Routes";
 import axios from "axios";
 import qs from "qs";
-import Notifications from "react-notify-toast";
+import Notifications from "./components/Notifications";
 import notify from "./utils/notify";
 import _ from "underscore";
 import parse from "./utils/parse";
@@ -211,7 +211,7 @@ class App extends Component {
     return (
       <LoaderPanel isLoading={this.state.loggedInUID && !this.state.user}>
         <div className="App">
-          <Notifications timeout={7500} />
+          <Notifications />
           <Routes childProps={childProps} />
         </div>
       </LoaderPanel>

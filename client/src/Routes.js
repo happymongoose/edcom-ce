@@ -65,9 +65,11 @@ import ContactsAddUnsubs from "./containers/ContactsAddUnsubs";
 import ContactsFind from "./containers/ContactsFind";
 import ContactsDomains from "./containers/ContactsDomains";
 import ContactsAllTags from "./containers/ContactsAllTags";
+import ContactsAll from "./containers/ContactsAll";
 import ContactsRetrieval from "./containers/ContactsRetrieval";
 import Segments from "./containers/Segments";
 import Segment from "./containers/Segment";
+import SegmentContacts from "./containers/SegmentContacts";
 import Suppression from "./containers/Suppression";
 import SuppressionNew from "./containers/SuppressionNew";
 import SuppressionEdit from "./containers/SuppressionEdit";
@@ -91,6 +93,14 @@ import FunnelSettings from "./containers/FunnelSettings";
 import FunnelMessage from "./containers/FunnelMessage";
 import FunnelMessageEdit from "./containers/FunnelMessageEdit";
 import FunnelMessageStats from "./containers/FunnelMessageStats";
+import Automations from "./containers/Automations";
+import Automation from "./containers/Automation";
+import AutomationEnrolments from "./containers/AutomationEnrolments";
+import AutomationEmail from "./containers/AutomationEmail";
+import AutomationProcessingStatus from "./containers/AutomationProcessingStatus";
+import AutomationSegmentTriggerStatus from "./containers/AutomationSegmentTriggerStatus";
+import AutomationTriggerEvents from "./containers/AutomationTriggerEvents";
+import DebugEmailLogs from "./containers/DebugEmailLogs";
 import Transactional from "./containers/Transactional";
 import TransactionalTag from "./containers/TransactionalTag";
 import TransactionalDomains from "./containers/TransactionalDomains";
@@ -180,11 +190,13 @@ export default ({ childProps }) => {
     <AppliedRoute path="/contacts/add" exact component={ContactsAdd} props={childProps} />
     <AppliedRoute path="/contacts/addunsubs" exact component={ContactsAddUnsubs} props={childProps} />
     <AppliedRoute path="/contacts/find" exact component={ContactsFind} props={childProps} />
+    <AppliedRoute path="/contacts/all" exact component={ContactsAll} props={childProps} />
     <AppliedRoute path="/contacts/alltags" exact component={ContactsAllTags} props={childProps} />
     <AppliedRoute path="/contacts/retrieval" exact component={ContactsRetrieval} props={childProps} />
     <AppliedRoute path="/contacts/editcontact" exact component={ContactEdit} props={childProps} />
     <AppliedRoute path="/segments" exact component={Segments} props={childProps} />
     <AppliedRoute path="/segments/edit" exact component={Segment} props={childProps} />
+    <AppliedRoute path="/segments/:id/contacts" exact component={SegmentContacts} props={childProps} />
     <AppliedRoute path="/suppression" exact component={Suppression} props={childProps} />
     <AppliedRoute path="/suppression/new" exact component={SuppressionNew} props={childProps} />
     <AppliedRoute path="/suppression/edit" exact component={SuppressionEdit} props={childProps} />
@@ -208,6 +220,14 @@ export default ({ childProps }) => {
     <AppliedRoute path="/funnels/message" exact component={FunnelMessage} props={childProps} />
     <AppliedRoute path="/funnels/message/edit" exact component={FunnelMessageEdit} props={childProps} />
     <AppliedRoute path="/funnels/message/stats" exact component={FunnelMessageStats} props={childProps} />
+    <AppliedRoute path="/automations" exact component={Automations} props={childProps} />
+    <AppliedRoute path="/automations/:automation_id/emails/:email_id" exact component={AutomationEmail} props={childProps} />
+    <AppliedRoute path="/automations/:id/enrolments" exact component={AutomationEnrolments} props={childProps} />
+    <AppliedRoute path="/automations/:id" exact component={Automation} props={childProps} />
+    <AppliedRoute path="/automation-processing-status" exact component={AutomationProcessingStatus} props={childProps} />
+    <AppliedRoute path="/automation-segment-trigger-status" exact component={AutomationSegmentTriggerStatus} props={childProps} />
+    <AppliedRoute path="/automation-trigger-events" exact component={AutomationTriggerEvents} props={childProps} />
+    <AppliedRoute path="/debug-email-logs" exact component={DebugEmailLogs} props={childProps} />
     <AppliedRoute path="/transactional" exact component={Transactional} props={childProps} />
     <AppliedRoute path="/transactional/tag" exact component={TransactionalTag} props={childProps} />
     <AppliedRoute path="/transactional/domains" exact component={TransactionalDomains} props={childProps} />

@@ -31,6 +31,7 @@ import FrontendNavigationCCIcon from '-!svg-react-loader!../svg/menu-icons/front
 import FrontendNavigationIntegrateIcon from '-!svg-react-loader!../svg/menu-icons/frontend-navigation-integrate.svg';
 import FrontendDropdownMenuBroadcastsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-broadcasts.svg';
 import FrontendDropdownMenuFunnelsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-funnels.svg';
+import FrontendDropdownMenuAutomationsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-automations.svg';
 import FrontendDropdownMenuTransactionalIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-transactional.svg';
 import FrontendDropdownMenuContactsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-contacts.svg';
 import FrontendDropdownMenuSegmentsIcon from '-!svg-react-loader!../svg/menu-icons/frontend-dropdown-menu-segments.svg';
@@ -46,6 +47,7 @@ import UserDropdownMenuPasswordIcon from '-!svg-react-loader!../svg/menu-icons/u
 import UserDropdownMenuLogOffIcon from '-!svg-react-loader!../svg/menu-icons/user-dropdown-menu-log-off.svg';
 import BackendDropdownMenuMailgunIcon from '-!svg-react-loader!../svg/menu-icons/backend-dropdown-menu-mailgun.svg';
 import BackendDropdownMenuSESIcon from '-!svg-react-loader!../svg/menu-icons/backend-dropdown-menu-ses.svg';
+import { canViewAutomationDiagnostics } from "../utils/automationDiagnostics";
 
 export default class MenuNavbar extends Component {
   constructor(props) {
@@ -165,6 +167,8 @@ export default class MenuNavbar extends Component {
     var props = this.props;
 
     var daysleft = this.daysLeft();
+    var showAutomationDiagnostics = canViewAutomationDiagnostics(this.props);
+    var showImpersonationAdminMenu = props.loggedInImpersonate && showAutomationDiagnostics;
 
     return (
       <div>
@@ -366,6 +370,38 @@ export default class MenuNavbar extends Component {
                           <FrontendDropdownMenuFunnelsIcon className="dropdown-icon"/>
                           Funnels
                         </RouteNavItem>
+                        <RouteNavItem href="/automations">
+                          <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                          Automations
+                        </RouteNavItem>
+                        {
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
+                          <RouteNavItem href="/debug-email-logs">
+                            <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
+                            Debug Email Logs
+                          </RouteNavItem>
+                        }
+                        {
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
+                          <RouteNavItem href="/automation-trigger-events">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Trigger Events
+                          </RouteNavItem>
+                        }
+                        {
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
+                          <RouteNavItem href="/automation-processing-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Processing Status
+                          </RouteNavItem>
+                        }
+                        {
+                          showAutomationDiagnostics && !showImpersonationAdminMenu &&
+                          <RouteNavItem href="/automation-segment-trigger-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Segment Trigger Status
+                          </RouteNavItem>
+                        }
                         <RouteNavItem href="/transactional">
                           <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
                           Transactional
@@ -404,6 +440,10 @@ export default class MenuNavbar extends Component {
                           <FrontendDropdownMenuAPISMTPIcon className="dropdown-icon"/>
                           API &amp; SMTP
                         </RouteNavItem>
+                        <RouteNavItem href="/customdomains">
+                          <FrontendDropdownMenuAPISMTPIcon className="dropdown-icon"/>
+                          Custom Domains
+                        </RouteNavItem>
                         <RouteNavItem href="/webhooks">
                           <FrontendDropdownMenuWebhooksIcon className="dropdown-icon"/>
                           Webhooks
@@ -417,6 +457,30 @@ export default class MenuNavbar extends Component {
                           Pabbly
                         </RouteNavItem>
                       </NavDropdown>
+                      {
+                        showImpersonationAdminMenu &&
+                        <NavDropdown id="impersonation-admin" noCaret title={<span>
+                          <BackendNavigationCustomersIcon className="nav-icon tie-guy"/>
+                          Admin
+                        </span>}>
+                          <RouteNavItem href="/debug-email-logs">
+                            <FrontendDropdownMenuTransactionalIcon className="dropdown-icon"/>
+                            Debug Email Logs
+                          </RouteNavItem>
+                          <RouteNavItem href="/automation-trigger-events">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Trigger Events
+                          </RouteNavItem>
+                          <RouteNavItem href="/automation-processing-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Automation Processing Status
+                          </RouteNavItem>
+                          <RouteNavItem href="/automation-segment-trigger-status">
+                            <FrontendDropdownMenuAutomationsIcon className="dropdown-icon"/>
+                            Segment Trigger Status
+                          </RouteNavItem>
+                        </NavDropdown>
+                      }
                     </Nav>
                   :
                   <Nav className="nav-left">

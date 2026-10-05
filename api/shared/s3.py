@@ -48,12 +48,65 @@ def s3_delete(bucket: str, key: str) -> None:
     #    path = os.path.dirname(path)
 
 
-def s3_delete_all(bucket: str, before_ts: float) -> None:
-    for root, _, files in os.walk(bucket):
+# These namespaces cross database, Celery and asynchronous MTA boundaries.
+# No age or instantaneous database-reference check proves their consumers done.
+# Keep them until a separate ownership/completion protocol permits reclamation.
+SEND_FILE_NAMESPACES = frozenset({
+    "lists", "templates", "sessend", "sphtml", "smtphtml", "elhtml", "mghtml",
+})
+
+
+def s3_delete_all(bucket: str, before_ts: float, *, dry_run: bool = False,
+                  limit: int = 10000) -> dict:
+    """Bounded legacy age cleanup, excluding every supported send-file namespace.
+
+    Report partial inventories explicitly; protected is not synonymous with
+    currently referenced. Direct consumer-owned s3_delete calls are unchanged.
+    """
+    if not 1 <= limit <= 1000000:
+        raise ValueError("limit must be between 1 and 1000000")
+    result = {"scanned": 0, "protected": 0, "protected_bytes": 0,
+              "old_candidates": 0, "deleted": 0, "errors": 0,
+              "truncated": False, "dry_run": dry_run}
+    if os.path.islink(bucket) or not os.path.isdir(bucket):
+        result["errors"] += 1
+        return result
+    visited = 0
+
+    def onerror(_error):
+        result["errors"] += 1
+
+    for root, _, files in os.walk(bucket, followlinks=False, onerror=onerror):
+        visited += 1
+        if visited > limit:
+            result["truncated"] = True
+            break
         for file in files:
-            file_path = os.path.join(root, file)
-            if os.path.getmtime(file_path) < before_ts:
-                os.unlink(file_path)
+            if result["scanned"] >= limit:
+                result["truncated"] = True
+                return result
+            result["scanned"] += 1
+            path = os.path.join(root, file)
+            namespace = os.path.relpath(path, bucket).split(os.sep)[0]
+            try:
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if namespace in SEND_FILE_NAMESPACES:
+                    result["protected"] += 1
+                    result["protected_bytes"] += info.st_size
+                    continue
+                if info.st_mtime < before_ts:
+                    result["old_candidates"] += 1
+                    if not dry_run:
+                        os.unlink(path)
+                        result["deleted"] += 1
+            except FileNotFoundError:
+                # A consumer may have completed and removed its own file.
+                continue
+            except OSError:
+                result["errors"] += 1
+    return result
 
 
 def s3_write(bucket: str, key: str, data: bytes) -> None:

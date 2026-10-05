@@ -25,6 +25,7 @@ from .db import json_iter, json_obj, JsonObj, DB
 from .s3 import s3_write, s3_size
 from . import jsnotify
 from . import foundation
+from .html_sanitizer import sanitize_email_html
 from .log import get_logger
 
 log = get_logger()
@@ -1185,10 +1186,29 @@ def parts_to_html(
             % (html_escape(preheader, quote=True),)
         )
 
+    def part_contains_html(part: JsonObj) -> bool:
+        if part.get("type") == "HTML":
+            return True
+        if part.get("type") != "Columns":
+            return False
+        for subparts in part.get("parts", []):
+            if not subparts:
+                continue
+            if isinstance(subparts, list):
+                for subpart in subparts:
+                    if subpart and part_contains_html(subpart):
+                        return True
+            elif part_contains_html(subparts):
+                return True
+        return False
+
     for part in parts:
         if part["type"] == "Invisible":
             continue
-        html.write("%s\n" % part["html"])
+        part_html = part["html"]
+        if part_contains_html(part):
+            part_html = sanitize_email_html(part_html)
+        html.write("%s\n" % part_html)
 
     basehtml = html.getvalue()
 
@@ -1521,6 +1541,29 @@ def user_log(
             "user_name": user.get("fullname", user.get("username")),
         }
     )
+
+
+def can_view_automation_diagnostics(req: falcon.Request) -> bool:
+    if req.context.get("admin") or req.context.get("impersonating"):
+        return True
+
+    db = req.context["db"]
+    cid = db.get_cid()
+    oldcid = db.get_cid()
+    db.set_cid(None)
+    try:
+        company = db.companies.get(cid)
+    finally:
+        db.set_cid(oldcid)
+    return bool(company and company.get("automation_diagnostics_visible") is True)
+
+
+def check_automation_diagnostics(req: falcon.Request) -> None:
+    if not can_view_automation_diagnostics(req):
+        raise falcon.HTTPForbidden(
+            title="Automation diagnostics are hidden",
+            description="Automation diagnostics are not enabled for this customer account.",
+        )
 
 
 def run_task(f: Any, *args: Any, **kwargs: Any) -> str | None:

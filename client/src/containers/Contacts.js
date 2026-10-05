@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { Button, MenuItem, Nav, NavItem, Tooltip, OverlayTrigger } from "react-bootstrap";
+import { Button, DropdownButton, FormControl, MenuItem, Modal, Nav, NavItem, Tooltip, OverlayTrigger } from "react-bootstrap";
 import { Link } from "react-router-dom";
 import axios from "axios";
 import _ from "underscore";
@@ -11,13 +11,42 @@ import MenuNavbar from "../components/MenuNavbar";
 import notify from "../utils/notify";
 import { EDTableSection, EDTable, EDTableRow, EDTabs } from "../components/EDDOM";
 import TablePie from "../components/TablePie";
+import ContactsAll from './ContactsAll';
 
 import "./Contacts.css";
 
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function errorMessage(error, fallback) {
+  const data = error && error.response && error.response.data;
+  if (data) {
+    return data.description || data.title || fallback;
+  }
+  return fallback;
+}
+
+function automationIsEnrollable(automation) {
+  return automation.status === 'published' || (automation.status === 'paused' && (automation.published || automation.published_at));
+}
+
 class Contacts extends Component {
+  constructor(props) {
+    super(props);
+
+    this.state = {
+      bulkList: null,
+      bulkAutomationId: '',
+      bulkEnrolling: false,
+      bulkResult: null,
+      showingSearchResults: false,
+    };
+  }
+
   createClicked = () => {
     this.props.history.push("/contacts/add?id=new");
   }
+
+  searchVisibilityChange = showingSearchResults => this.setState({showingSearchResults});
 
   deleteConfirmClicked = async id => {
     await axios.delete('/api/lists/' + id);
@@ -46,7 +75,99 @@ class Contacts extends Component {
     notify.show('Download your export file from the Data Exports page', "success");
   }
 
+  automationOptions = () => {
+    return _.map(
+      _.sortBy(
+        _.filter(this.props.automations || [], automationIsEnrollable),
+        automation => (automation.name || '').toLowerCase()
+      ),
+      automation => ({
+        id: automation.id,
+        name: automation.name || automation.id,
+      })
+    );
+  }
+
+  addToAutomationClicked = list => {
+    const options = this.automationOptions();
+    this.setState({
+      bulkList: list,
+      bulkAutomationId: options.length ? options[0].id : '',
+      bulkEnrolling: false,
+      bulkResult: null,
+    });
+  }
+
+  closeBulkEnrolmentModal = () => {
+    if (this.state.bulkEnrolling) {
+      return;
+    }
+
+    this.setState({
+      bulkList: null,
+      bulkAutomationId: '',
+      bulkResult: null,
+    });
+  }
+
+  handleBulkAutomationChange = event => {
+    this.setState({bulkAutomationId: event.target.value});
+  }
+
+  pollBulkEnrolment = async gatherId => {
+    while (!this._unmounted) {
+      await delay(2000);
+      const response = (await axios.get('/api/automation-list-enrolments/' + gatherId)).data;
+      if (response.error) {
+        throw new Error(response.error);
+      }
+      if (response.complete) {
+        return response.result;
+      }
+    }
+    return null;
+  }
+
+  bulkEnrolmentResultText = result => {
+    if (!result) {
+      return '';
+    }
+    return this.num(result.enrolled_count) + ' enrolled, ' +
+      this.num(result.skipped_count) + ' skipped, ' +
+      this.num(result.error_count) + ' errors';
+  }
+
+  confirmBulkEnrolment = async () => {
+    const list = this.state.bulkList;
+    const automationId = this.state.bulkAutomationId;
+    if (!list || !automationId) {
+      return;
+    }
+
+    this.setState({bulkEnrolling: true, bulkResult: null});
+    try {
+      const response = (await axios.post('/api/automations/' + automationId + '/enrolments/list', {
+        list_id: list.id,
+      })).data;
+      const result = response.result || (response.id ? await this.pollBulkEnrolment(response.id) : null);
+      if (!result) {
+        return;
+      }
+
+      this.setState({bulkResult: result});
+      notify.show('Automation enrolment complete: ' + this.bulkEnrolmentResultText(result), result.error_count ? 'warning' : 'success', 15000);
+      await this.props.reload();
+    } catch (error) {
+      notify.show(errorMessage(error, 'Unable to add list to automation'), 'error');
+    } finally {
+      if (!this._unmounted) {
+        this.setState({bulkEnrolling: false});
+      }
+    }
+  }
+
   componentDidMount() {
+    this._unmounted = false;
     this._interval = setInterval(() => {
       if (_.find(this.props.data, l => l.processing)) {
         this.props.reload();
@@ -55,6 +176,7 @@ class Contacts extends Component {
   }
 
   componentWillUnmount() {
+    this._unmounted = true;
     clearInterval(this._interval);
   }
 
@@ -90,15 +212,124 @@ class Contacts extends Component {
     this.props.history.push(url);
   }
 
+  viewAllContactsClicked = () => {
+    this.props.history.push('/contacts/all');
+  }
+
   render() {
     let minWidth = '600px';
     let maxWidth = '1200px';
+    const automationOptions = this.automationOptions();
+    const bulkList = this.state.bulkList;
+    const bulkResult = this.state.bulkResult;
 
     return (
       <div className="contacts">
         <MenuNavbar {...this.props}>
+          <Modal show={!!bulkList} onHide={this.closeBulkEnrolmentModal}>
+            <Modal.Header closeButton={!this.state.bulkEnrolling}>
+              <Modal.Title>Add Contact List to Automation</Modal.Title>
+            </Modal.Header>
+            <Modal.Body>
+              {
+                bulkList &&
+                <div>
+                  <p>
+                    <strong>Contact list:</strong> {bulkList.name}
+                  </p>
+                  <p>
+                    <strong>Estimated contacts:</strong> {this.num(bulkList.count)}
+                  </p>
+                  {
+                    automationOptions.length ?
+                      <div>
+                        <label className="control-label" htmlFor="bulkAutomationId">Automation</label>
+                        {' '}
+                        <FormControl
+                          id="bulkAutomationId"
+                          componentClass="select"
+                          value={this.state.bulkAutomationId}
+                          onChange={this.handleBulkAutomationChange}
+                          disabled={this.state.bulkEnrolling}
+                        >
+                          {
+                            _.map(automationOptions, automation =>
+                              <option key={automation.id} value={automation.id}>{automation.name}</option>
+                            )
+                          }
+                        </FormControl>
+                        <p className="help-block">
+                          Re-entry rules may skip contacts that have already entered this automation or already have an active pass.
+                        </p>
+                      </div>
+                    :
+                      <p>No published or paused automations are available.</p>
+                  }
+                  {
+                    this.state.bulkEnrolling &&
+                    <p className="text-info">Adding contacts to automation...</p>
+                  }
+                  {
+                    bulkResult &&
+                    <div>
+                      <hr />
+                      <h4>Result</h4>
+                      <p>{this.bulkEnrolmentResultText(bulkResult)}</p>
+                      {
+                        bulkResult.skipped && bulkResult.skipped.length > 0 &&
+                        <div>
+                          <h5>Skipped</h5>
+                          <ul>
+                            {
+                              _.map(bulkResult.skipped.slice(0, 5), (skipped, index) =>
+                                <li key={index}>{skipped.contact_email || skipped.contact_id}: {skipped.description || skipped.reason}</li>
+                              )
+                            }
+                          </ul>
+                        </div>
+                      }
+                      {
+                        bulkResult.errors && bulkResult.errors.length > 0 &&
+                        <div>
+                          <h5>Errors</h5>
+                          <ul>
+                            {
+                              _.map(bulkResult.errors.slice(0, 5), (error, index) =>
+                                <li key={index}>{error.contact_email || error.contact_id || 'Error'}: {error.description || error.reason || error.message}</li>
+                              )
+                            }
+                          </ul>
+                        </div>
+                      }
+                    </div>
+                  }
+                </div>
+              }
+            </Modal.Body>
+            <Modal.Footer>
+              <Button onClick={this.closeBulkEnrolmentModal} disabled={this.state.bulkEnrolling}>
+                {bulkResult ? 'Close' : 'Cancel'}
+              </Button>
+              {
+                !bulkResult &&
+                <Button
+                  bsStyle="primary"
+                  onClick={this.confirmBulkEnrolment}
+                  disabled={this.state.bulkEnrolling || !this.state.bulkAutomationId || !automationOptions.length}
+                >
+                  {this.state.bulkEnrolling ? 'Adding...' : 'Add to automation'}
+                </Button>
+              }
+            </Modal.Footer>
+          </Modal>
           <TitlePage title="Contact Lists" leftsize={9} rightsize={3} button={
-            <Button bsStyle="primary" onClick={this.createClicked}>Create Contact List</Button>
+            <div className="form-inline">
+              <DropdownButton id="contacts-actions-dropdown" title="Actions" pullRight>
+                <MenuItem onClick={this.viewAllContactsClicked}>View All Contacts</MenuItem>
+              </DropdownButton>
+              {' '}
+              <Button bsStyle="primary" onClick={this.createClicked}>Create Contact List</Button>
+            </div>
           } tabs={
             <EDTabs>
               <Nav className="nav-tabs space15" activeKey="1">
@@ -111,7 +342,8 @@ class Contacts extends Component {
               </Nav>
             </EDTabs>
           }/>
-          <LoaderPanel isLoading={this.props.isLoading}>
+          <ContactsAll embedded loggedInImpersonate={this.props.loggedInImpersonate} onResultsVisibilityChange={this.searchVisibilityChange} />
+          {!this.state.showingSearchResults && <LoaderPanel isLoading={this.props.isLoading}>
             <EDTableSection>
             {
               this.props.data.length ?
@@ -257,6 +489,7 @@ class Contacts extends Component {
                             >
                               <MenuItem onClick={() => {this.props.history.push('/contacts/find?id=' + l.id)}}>View Contacts</MenuItem>
                               <MenuItem disabled={(l.processing||l.unapproved)?true:false} onClick={this.addDataClicked.bind(this, l.id)}>Add Contacts</MenuItem>
+                              <MenuItem disabled={(l.processing||l.unapproved)?true:false} onClick={this.addToAutomationClicked.bind(this, l)}>Add to Automation</MenuItem>
                               <MenuItem disabled={(l.processing||l.unapproved)?true:false} onClick={this.addUnsubsClicked.bind(this, l.id)}>Unsubscribe Contacts</MenuItem>
                               <MenuItem onClick={this.editNameClicked.bind(this, l.id)}>Edit Name</MenuItem>
                               {
@@ -276,7 +509,7 @@ class Contacts extends Component {
                 </div>
             }
             </EDTableSection>
-          </LoaderPanel>
+          </LoaderPanel>}
         </MenuNavbar>
       </div>
     );
@@ -286,5 +519,8 @@ class Contacts extends Component {
 export default withLoadSave({
   extend: Contacts,
   initial: [],
-  get: async () => _.sortBy((await axios.get('/api/lists')).data, l => l.name.toLowerCase())
+  get: async () => _.sortBy((await axios.get('/api/lists')).data, l => l.name.toLowerCase()),
+  extra: {
+    automations: async () => (await axios.get('/api/automations')).data,
+  },
 });

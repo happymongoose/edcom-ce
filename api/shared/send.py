@@ -86,6 +86,40 @@ def client_domain(db: DB, fromdomain: str, cid: str, objid: str) -> str | None:
     )
 
 
+def sender_domain(value: str | None) -> str:
+    if not value:
+        return ""
+
+    _, addr = parseaddr(value)
+    if not addr:
+        addr = value
+
+    if "@" not in addr:
+        return ""
+
+    return addr.rsplit("@", 1)[1].strip().lower()
+
+
+def validate_sender_domains(db: DB, cid: str, *addresses: str | None) -> None:
+    domains = {sender_domain(address) for address in addresses}
+    domains.discard("")
+
+    for domain in domains:
+        verified = db.single(
+            """select true from clientdkim
+               where cid = %s and data->>'name' = %s
+               and coalesce((data->>'verified')::boolean, false)
+               limit 1""",
+            cid,
+            domain,
+        )
+        if not verified:
+            raise falcon.HTTPBadRequest(
+                title="Sender domain is not verified",
+                description="Add and verify this domain in Custom Domains before sending email from it.",
+            )
+
+
 def send_rate(company: JsonObj) -> Tuple[int, bytes | None]:
     rdb = redis_connect()
 
@@ -165,7 +199,14 @@ def check_send_limit(
     domain: str,
     domainthrottles: List[JsonObj],
     requested: int,
+    *,
+    transactional: bool = False,
 ) -> int:
+    # Static headroom inside the existing limits, never additional allowance.
+    # Reject bad configuration rather than silently disabling protection.
+    reserve_pct = int(os.environ.get("transactional_reserve_percent", "0"))
+    if not 0 <= reserve_pct <= 100:
+        raise ValueError("transactional_reserve_percent must be between 0 and 100")
     cid = company["id"]
     minlimit = fix_empty_limit(company.get("minlimit"))
     hourlimit = fix_empty_limit(company.get("hourlimit"))
@@ -407,8 +448,25 @@ def check_send_limit(
                 if persendlimit is not None:
                     allowed = min(allowed, persendlimit)
 
+                if reserve_pct and not transactional:
+                    # Shared counters are WATCHed above: concurrent schedulers cannot
+                    # spend the protected headroom or exceed the underlying cap.
+                    # Count transactional usage too; do not reclaim its headroom.
+                    for limit, count in (
+                        (minlimit, mincnt), (hourlimit, hourcnt),
+                        (daylimit, daycnt), (monthlimit, monthcnt),
+                        (domainminlimit, domainmincnt),
+                        (domainhourlimit, domainhourcnt),
+                        (domaindaylimit, domaindaycnt),
+                    ):
+                        if limit is not None and count is not None:
+                            reserved = (limit * reserve_pct + 99) // 100
+                            allowed = min(allowed, max(0, limit - reserved - count))
+
                 log.debug("requested = %s, allowed = %s", requested, allowed)
                 result = min(requested, allowed)
+                if result <= 0:
+                    return 0
 
                 if paid:
                     creditcnt -= result
@@ -593,6 +651,7 @@ def choose_backend(
     sparkpost: Dict[str, JsonObj],
     easylink: Dict[str, JsonObj],
     smtprelays: Dict[str, JsonObj],
+    debuglogs: Dict[str, JsonObj],
 ) -> Tuple[JsonObj | None, str | None]:
     obj = None
     settingsid = None
@@ -645,7 +704,11 @@ def choose_backend(
                                 if s is None:
                                     s = smtprelays.get(split["policy"], None)
                                     if s is None:
-                                        continue
+                                        s = debuglogs.get(split["policy"], None)
+                                        if s is None:
+                                            continue
+                                        else:
+                                            return s, "debug_log"
                                     else:
                                         return s, "smtprelay"
                                 else:
@@ -705,6 +768,60 @@ def choose_backend(
             break
 
     return obj, settingsid
+
+
+def record_debug_email(
+    db: DB,
+    usercid: str,
+    route: JsonObj,
+    backend: JsonObj,
+    to: str,
+    toaddr: str,
+    fromaddr: str,
+    returnpath: str,
+    replyto: str,
+    subject: str,
+    html: str,
+    text: str | None = None,
+    source_type: str | None = None,
+    source_id: str | None = None,
+    source_ids: JsonObj | None = None,
+    metadata: JsonObj | None = None,
+) -> str:
+    now = datetime.utcnow()
+    data: JsonObj = {
+        "timestamp": now.isoformat() + "Z",
+        "recipient": to,
+        "recipient_email": toaddr,
+        "from": fromaddr,
+        "returnpath": returnpath,
+        "replyto": replyto,
+        "subject": subject,
+        "html": html,
+        "route_id": route["id"],
+        "backend_id": backend["id"],
+    }
+
+    if text is not None:
+        data["text"] = text
+    if source_type is not None:
+        data["source_type"] = source_type
+    if source_id is not None:
+        data["source_id"] = source_id
+    if source_ids is not None:
+        data["source_ids"] = source_ids
+    if metadata is not None:
+        data["metadata"] = metadata
+
+    log_id = shortuuid.uuid()
+    db.execute(
+        "insert into debug_email_logs (id, cid, ts, data) values (%s, %s, %s, %s)",
+        log_id,
+        usercid,
+        now,
+        data,
+    )
+    return log_id
 
 
 def get_frontend_params(
@@ -848,6 +965,10 @@ def update_sink_camp(db: DB, sinkid: str, camp: JsonObj, html: str) -> None:
     r.raise_for_status()
 
 
+class MailNotSentError(Exception):
+    """A definite local rejection before a delivery backend was invoked."""
+
+
 def send_backend_mail(
     db: DB,
     usercid: str,
@@ -863,12 +984,21 @@ def send_backend_mail(
     campid: str = "test",
     toname: str | None = None,
     raise_err: bool = False,
+    text: str | None = None,
+    source_type: str | None = None,
+    source_id: str | None = None,
+    source_ids: JsonObj | None = None,
+    metadata: JsonObj | None = None,
 ) -> bool:
     demo, imagebucket, bodydomain, headers, fromencoding, subjectencoding, usedkim = (
         get_frontend_params(db, usercid)
     )
 
     if demo:
+        log.info(
+            "Skipping backend send for customer %s because parent company is in demo mode",
+            usercid,
+        )
         return True
 
     domaingroups = {}
@@ -879,6 +1009,7 @@ def send_backend_mail(
     sparkpost = {}
     easylink = {}
     smtprelays = {}
+    debuglogs = {}
     oldcid = db.get_cid()
     db.set_cid(route["cid"])
     try:
@@ -898,6 +1029,8 @@ def send_backend_mail(
             easylink[s["id"]] = s
         for s in db.smtprelays.find():
             smtprelays[s["id"]] = s
+        for d in db.debug_email_backends.find():
+            debuglogs[d["id"]] = d
         obj, settingsid = choose_backend(
             route,
             toaddr,
@@ -909,14 +1042,36 @@ def send_backend_mail(
             sparkpost,
             easylink,
             smtprelays,
+            debuglogs,
         )
     finally:
         db.set_cid(oldcid)
 
     if obj is None:
-        raise Exception(
+        raise MailNotSentError(
             "You must delete Drop All Mail from your postal route to send this message"
         )
+
+    if settingsid == "debug_log":
+        record_debug_email(
+            db,
+            usercid,
+            route,
+            obj,
+            to,
+            toaddr,
+            fromaddr,
+            returnpath,
+            replyto,
+            subject,
+            html,
+            text=text,
+            source_type=source_type,
+            source_id=source_id,
+            source_ids=source_ids,
+            metadata=metadata,
+        )
+        return True
 
     if settingsid == "mailgun":
         clientdomain = db.single(
@@ -987,6 +1142,12 @@ def send_backend_mail(
         )
         return True
     elif settingsid == "smtprelay":
+        log.info(
+            "Sending message %s for customer %s through SMTP relay backend %s",
+            campid,
+            usercid,
+            obj["id"],
+        )
         smtprelay_send(
             obj,
             fromaddr,
@@ -1003,6 +1164,13 @@ def send_backend_mail(
         return True
     else:
         url = fix_sink_url(obj["url"])
+        log.info(
+            "Sending message %s for customer %s to local MTA sink %s at %s",
+            campid,
+            usercid,
+            obj["id"],
+            url,
+        )
 
         if obj.get("failed_update", False):
             mtasettings, pauses, warmups, dkim, allips, allsinks = get_settings(db, obj)
@@ -1088,6 +1256,13 @@ def send_backend_mail(
                 timeout=MTA_TIMEOUT,
             )
         r.raise_for_status()
+        log.info(
+            "Local MTA sink %s accepted message %s for customer %s with HTTP %s",
+            obj["id"],
+            campid,
+            usercid,
+            r.status_code,
+        )
 
         return False
 
@@ -1775,6 +1950,13 @@ def do_smtprelay_send(
                 if state["conn"] is not None:
                     return
 
+                log.info(
+                    "Opening SMTP relay connection to %s:%s for backend %s",
+                    smtp["hostname"].strip(),
+                    smtp["port"],
+                    smtp["id"],
+                )
+
                 cls: Type[smtplib.SMTP] | Type[smtplib.SMTP_SSL]
                 if smtp["ssltype"] == "ssl":
                     cls = smtplib.SMTP_SSL
@@ -1796,6 +1978,12 @@ def do_smtprelay_send(
 
                 state["conn"] = newconn
                 state["conn_sent"] = 0
+                log.info(
+                    "SMTP relay connection established to %s:%s for backend %s",
+                    smtp["hostname"].strip(),
+                    smtp["port"],
+                    smtp["id"],
+                )
 
             def do_send() -> None:
                 for info in tolist:
@@ -1840,11 +2028,22 @@ List-Unsubscribe-Post: List-Unsubscribe=One-Click{headers}
                         state["conn"].sendmail(
                             fromaddr, info["address"], msg.getvalue()
                         )
+                        log.info(
+                            "SMTP relay backend %s accepted message %s for %s",
+                            smtp["id"],
+                            campid,
+                            info["address"],
+                        )
 
                         state["conn_sent"] += 1
                         send += 1
                     except Exception as e:
-                        log.error("SMTP Relay Error: %s", e)
+                        log.exception(
+                            "SMTP relay backend %s failed message %s for %s",
+                            smtp["id"],
+                            campid,
+                            info["address"],
+                        )
                         if campid == "test":
                             add_test_log(db, campcid, info["address"], str(e))
                             raise

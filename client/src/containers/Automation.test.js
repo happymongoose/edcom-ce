@@ -1,0 +1,1286 @@
+import _ from 'underscore';
+
+import {
+  automationEnrolmentAction,
+  filterAutomationHistoryContacts,
+  automationHistoryContacts,
+  automationHistoryLogForEnrolment,
+  automationHistoryLog,
+  automationEnrolmentCounts,
+  automationImpersonatedHref,
+  automationNodeContactCount,
+  automationNodeContactFilterId,
+  automationNodeContactFilterParam,
+  paginateAutomationHistoryContacts,
+  sortAutomationHistoryContacts,
+  canReEnrolAutomation,
+  displayAutomationEnrolments,
+  entryPayload,
+  entryTriggers,
+} from './Automation';
+import {
+  automationAddNodeMenuItems,
+  appendAutomationNode,
+  automationClickMatchValue,
+  createAutomationConditionItem,
+  automationNodeSummary,
+  automationNodeSummaryWarning,
+  automationNodeTargetOptions,
+  automationWorkflowPreviewFlow,
+  automationWorkflowPreviewItems,
+  automationWorkflowPreviewSummaryInline,
+  insertAutomationNodeAfter,
+  moveAutomationNode,
+} from './AutomationWorkflowEditor';
+import { enrolmentQueryParams } from '../utils/automationEnrolments';
+import { canViewAutomationDiagnostics } from '../utils/automationDiagnostics';
+
+describe('automation enrolment display helpers', () => {
+  it('appends workflow nodes with a new stable id', () => {
+    const nodes = [
+      {id: 'node-1', type: 'add_tag', label: 'Existing node'},
+    ];
+
+    const updated = appendAutomationNode(nodes, 'wait_duration', {generateId: () => 'new-node'});
+
+    expect(_.pluck(updated, 'id')).toEqual(['node-1', 'new-node']);
+    expect(updated[1].duration).toEqual({days: 0, hours: 0, minutes: 5});
+    expect(nodes).toHaveLength(1);
+  });
+
+  it('creates clicked-email condition nodes as any-link by default', () => {
+    const updated = appendAutomationNode([], 'if_clicked_email', {
+      generateId: () => 'clicked-node',
+      emails: [{id: 'email-1'}],
+    });
+
+    expect(updated[0].click_match).toBe('any');
+    expect(updated[0].link_url).toBe('');
+    expect(updated[0].automation_email_id).toBe('email-1');
+  });
+
+  ['add_to_list', 'remove_from_list'].forEach(type => {
+    it('creates ' + type + ' with the supplied list or an empty selection', () => {
+      expect(appendAutomationNode([], type, {lists: [{id: 'list-1'}]})[0].list_id).toBe('list-1');
+      expect(appendAutomationNode([], type, {lists: []})[0].list_id).toBe('');
+      expect(appendAutomationNode([], type)[0].list_id).toBe('');
+    });
+  });
+
+  it('keeps add-node menu options alphabetical and descriptive', () => {
+    const items = automationAddNodeMenuItems(true, true);
+    const labels = _.pluck(items, 'label');
+
+    expect(labels).toEqual(labels.slice().sort((a, b) => a.localeCompare(b)));
+    expect(labels).toEqual(['Add tag', 'Add to list', 'Enrol in another automation', 'Exit automation', 'Go to', 'If conditions', 'Remove from another automation', 'Remove from list', 'Remove tag', 'Send email', 'Wait']);
+    expect(items.filter(item => item.type.indexOf('if_') === 0).map(item => item.type)).toEqual(['if_conditions']);
+  });
+
+  it('creates missing-tag condition nodes with branch targets', () => {
+    const updated = appendAutomationNode([], 'if_missing_tag', {generateId: () => 'missing-tag-node'});
+
+    expect(updated[0]).toEqual({
+      id: 'missing-tag-node',
+      type: 'if_missing_tag',
+      label: 'If contact does not have tag',
+      draft_tag: '',
+      yes_node_id: '',
+      no_node_id: '',
+    });
+  });
+
+  it('creates compound condition nodes with a flat all group by default', () => {
+    const updated = appendAutomationNode([], 'if_conditions', {generateId: () => 'compound-node'});
+
+    expect(updated[0]).toEqual({
+      id: 'compound-node',
+      type: 'if_conditions',
+      label: 'If conditions',
+      condition: {
+        mode: 'all',
+        items: [
+          {type: 'has_tag', tags: []},
+        ],
+      },
+      yes_node_id: '',
+      no_node_id: '',
+    });
+  });
+
+  it('creates compound condition items for tag email click and list conditions', () => {
+    const options = {
+      emails: [{id: 'email-1'}],
+      lists: [{id: 'list-1'}],
+    };
+
+    expect(createAutomationConditionItem('missing_tag', options)).toEqual({type: 'missing_tag', tags: []});
+    expect(createAutomationConditionItem('has_tag', options)).toEqual({type: 'has_tag', tags: []});
+    expect(createAutomationConditionItem('in_list', options)).toEqual({type: 'in_list', list_ids: []});
+    expect(createAutomationConditionItem('opened_email', options)).toEqual({type: 'opened_email', automation_email_id: 'email-1'});
+    expect(createAutomationConditionItem('clicked_email', options)).toEqual({
+      type: 'clicked_email',
+      automation_email_id: 'email-1',
+      click_match: 'any',
+      link_url: '',
+    });
+    expect(createAutomationConditionItem('not_in_list', options)).toEqual({type: 'not_in_list', list_ids: []});
+    expect(createAutomationConditionItem('not_opened_email', options)).toEqual({type: 'not_opened_email', automation_email_id: 'email-1'});
+    expect(createAutomationConditionItem('not_clicked_email', options)).toEqual({
+      type: 'not_clicked_email', automation_email_id: 'email-1', click_match: 'any', link_url: '',
+    });
+  });
+
+  it('inserts workflow nodes after a step without rewriting branch targets', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const updated = insertAutomationNodeAfter(nodes, 0, 'wait_duration', {generateId: () => 'inserted'});
+
+    expect(_.pluck(updated, 'id')).toEqual(['condition', 'inserted', 'target', 'exit']);
+    expect(updated[0].yes_node_id).toBe('target');
+    expect(updated[0].no_node_id).toBe('exit');
+  });
+
+  it('updates target dropdown step labels after insertion while preserving target ids', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+    const updated = insertAutomationNodeAfter(nodes, 0, 'wait_duration', {generateId: () => 'inserted'});
+
+    const options = automationNodeTargetOptions(updated, updated[0]);
+    const target = _.findWhere(options, {id: 'target'});
+
+    expect(target.id).toBe('target');
+    expect(target.name).toBe('Step 3 - Target tag (Add tag)');
+  });
+
+  it('moves workflow nodes up and down while preserving node ids', () => {
+    const nodes = [
+      {id: 'first', type: 'add_tag', label: 'First'},
+      {id: 'second', type: 'wait_duration', label: 'Second'},
+      {id: 'third', type: 'exit', label: 'Third'},
+    ];
+
+    expect(_.pluck(moveAutomationNode(nodes, 1, -1), 'id')).toEqual(['second', 'first', 'third']);
+    expect(_.pluck(moveAutomationNode(nodes, 1, 1), 'id')).toEqual(['first', 'third', 'second']);
+    expect(_.pluck(nodes, 'id')).toEqual(['first', 'second', 'third']);
+  });
+
+  it('does not move the first node up or the last node down', () => {
+    const nodes = [
+      {id: 'first', type: 'add_tag', label: 'First'},
+      {id: 'second', type: 'exit', label: 'Second'},
+    ];
+
+    expect(_.pluck(moveAutomationNode(nodes, 0, -1), 'id')).toEqual(['first', 'second']);
+    expect(_.pluck(moveAutomationNode(nodes, 1, 1), 'id')).toEqual(['first', 'second']);
+  });
+
+  it('moves workflow nodes without rewriting branch or go-to target ids', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'go', type: 'go_to', label: 'Go forward', target_node_id: 'target'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const updated = moveAutomationNode(nodes, 2, -1);
+
+    expect(_.pluck(updated, 'id')).toEqual(['condition', 'target', 'go', 'exit']);
+    expect(updated[0].yes_node_id).toBe('target');
+    expect(updated[0].no_node_id).toBe('exit');
+    expect(updated[2].target_node_id).toBe('target');
+  });
+
+  it('moves workflow nodes without rewriting email list tag or wait configuration', () => {
+    const nodes = [
+      {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},
+      {id: 'list', type: 'add_to_list', label: 'List', list_id: 'list-1'},
+      {id: 'tag', type: 'add_tag', label: 'Tag', draft_tag: 'vip'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait', duration: {days: 1, hours: 2, minutes: 3}},
+    ];
+
+    const updated = moveAutomationNode(nodes, 3, -1);
+
+    expect(_.pluck(updated, 'id')).toEqual(['send', 'list', 'wait', 'tag']);
+    expect(updated[0].automation_email_id).toBe('email-1');
+    expect(updated[1].list_id).toBe('list-1');
+    expect(updated[2].duration).toEqual({days: 1, hours: 2, minutes: 3});
+    expect(updated[3].draft_tag).toBe('vip');
+  });
+
+  it('updates target dropdown step labels after moving nodes', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', label: 'Check tag', yes_node_id: 'target', no_node_id: 'exit'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait'},
+      {id: 'target', type: 'add_tag', label: 'Target tag'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const updated = moveAutomationNode(nodes, 2, -1);
+    const options = automationNodeTargetOptions(updated, updated[0]);
+    const target = _.findWhere(options, {id: 'target'});
+
+    expect(target.id).toBe('target');
+    expect(target.name).toBe('Step 2 - Target tag (Add tag)');
+  });
+
+  it('summarizes major workflow node types', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const lists = [{id: 'list-1', name: 'Customers', count: 42}];
+    const nodes = [
+      {id: 'send', type: 'send_email', automation_email_id: 'email-1'},
+      {id: 'add-tag', type: 'add_tag', draft_tag: 'vip'},
+      {id: 'remove-tag', type: 'remove_tag', draft_tag: 'old'},
+      {id: 'add-list', type: 'add_to_list', list_id: 'list-1'},
+      {id: 'remove-list', type: 'remove_from_list', list_id: 'list-1'},
+      {id: 'wait', type: 'wait_duration', duration: {days: 1, hours: 2, minutes: 3}},
+      {id: 'missing-tag', type: 'if_missing_tag', draft_tag: 'inactive', yes_node_id: 'exit', no_node_id: 'add-tag'},
+      {id: 'exit', type: 'exit'},
+    ];
+    const options = {nodes: nodes, emails: emails, lists: lists};
+
+    expect(automationNodeSummary(nodes[0], options)).toBe('Send email: Welcome - Hello (HTML)');
+    expect(automationNodeSummary(nodes[1], options)).toBe('Add tag: vip');
+    expect(automationNodeSummary(nodes[2], options)).toBe('Remove tag: old');
+    expect(automationNodeSummary(nodes[3], options)).toBe('Add to list: Customers (42 contacts)');
+    expect(automationNodeSummary(nodes[4], options)).toBe('Remove from list: Customers (42 contacts)');
+    expect(automationNodeSummary(nodes[5], options)).toBe('Wait: 1 day 2 hours 3 minutes');
+    expect(automationNodeSummary(nodes[6], options)).toBe('If missing tag: inactive | Yes -> Step 8 - Exit (Exit) | No -> Step 2 - Add tag (Add tag)');
+    expect(automationNodeSummary(nodes[7], options)).toBe('Exit automation');
+  });
+
+  it('summarizes missing workflow references clearly', () => {
+    expect(automationNodeSummary({id: 'send', type: 'send_email'}, {})).toBe('No email selected');
+    expect(automationNodeSummary({id: 'send', type: 'send_email', automation_email_id: 'missing'}, {})).toBe('Send email: Selected email not found');
+    expect(automationNodeSummary({id: 'list', type: 'add_to_list'}, {})).toBe('No list selected');
+    expect(automationNodeSummary({id: 'list', type: 'add_to_list', list_id: 'missing'}, {})).toBe('Add to list: Selected list not found');
+    expect(automationNodeSummary({id: 'wait', type: 'wait_duration', duration: {}}, {})).toBe('Wait: Wait duration incomplete');
+    expect(automationNodeSummary({id: 'go', type: 'go_to'}, {nodes: []})).toBe('Go to: Target missing');
+  });
+
+  it('only marks actual incomplete summaries as warnings', () => {
+    expect(automationNodeSummaryWarning('If missing tag: inactive | Yes -> Step 8 - Exit (Exit) | No -> Step 2 - Add tag (Add tag)')).toBe(false);
+    expect(automationNodeSummaryWarning('No email selected')).toBe(true);
+    expect(automationNodeSummaryWarning('Send email: Selected email not found')).toBe(true);
+    expect(automationNodeSummaryWarning('Go to: Target missing')).toBe(true);
+    expect(automationNodeSummaryWarning('Wait: Wait duration incomplete')).toBe(true);
+  });
+
+  it('summarizes condition targets and updates target step labels after reorder', () => {
+    const nodes = [
+      {id: 'condition', type: 'if_has_tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target'},
+      {id: 'no', type: 'exit', label: 'No target'},
+    ];
+    const moved = moveAutomationNode(nodes, 2, -1);
+
+    expect(automationNodeSummary(moved[0], {nodes: moved})).toBe(
+      'If has tag: vip | Yes -> Step 2 - Yes target (Add tag) | No -> Step 4 - No target (Exit)'
+    );
+  });
+
+  it('summarizes email engagement conditions', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'beefree'}];
+    const nodes = [
+      {id: 'opened', type: 'if_opened_email', automation_email_id: 'email-1', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'clicked', type: 'if_clicked_email', automation_email_id: 'email-1', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
+      'If opened: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+    );
+    expect(automationNodeSummary(nodes[1], {nodes: nodes, emails: emails})).toBe(
+      'If clicked any link: Welcome - Hello (BeeFree) | Yes -> Step 3 - Yes (Add tag) | No -> Step 4 - No (Exit)'
+    );
+  });
+
+  it('summarizes compound conditions compactly', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const lists = [{id: 'list-1', name: 'Customers', count: 2}];
+    const nodes = [
+      {
+        id: 'compound',
+        type: 'if_conditions',
+        condition: {
+          mode: 'all',
+          items: [
+            {type: 'has_tag', tag: 'vip'},
+            {type: 'clicked_email', automation_email_id: 'email-1', click_match: 'url_prefix', link_url: 'https://example.com/offer'},
+            {type: 'not_in_list', list_id: 'list-1'},
+          ],
+        },
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails, lists: lists})).toBe(
+      'All of 3 conditions: has any of these tags: vip | clicked URL starts with https://example.com/offer in Welcome - Hello (HTML) | ... | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
+    );
+  });
+
+  it('summarizes specific-url clicked email conditions', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const nodes = [
+      {
+        id: 'clicked',
+        type: 'if_clicked_email',
+        automation_email_id: 'email-1',
+        click_match: 'url',
+        link_url: 'https://example.com/offer',
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
+      'If clicked exact URL: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
+    );
+  });
+
+  it('treats legacy clicked-email url match as exact URL mode', () => {
+    expect(automationClickMatchValue({click_match: 'url'})).toBe('url_exact');
+    expect(automationClickMatchValue({click_match: 'url_exact'})).toBe('url_exact');
+    expect(automationClickMatchValue({click_match: 'url_prefix'})).toBe('url_prefix');
+    expect(automationClickMatchValue({})).toBe('any');
+  });
+
+  it('summarizes prefix-url clicked email conditions', () => {
+    const emails = [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}];
+    const nodes = [
+      {
+        id: 'clicked',
+        type: 'if_clicked_email',
+        automation_email_id: 'email-1',
+        click_match: 'url_prefix',
+        link_url: 'https://example.com/offer',
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails})).toBe(
+      'If clicked URL starts with: https://example.com/offer: Welcome - Hello (HTML) | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
+    );
+  });
+
+  it('derives visual preview connections for linear branch go-to and exit nodes', () => {
+    const nodes = [
+      {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'exit'},
+      {id: 'yes', type: 'go_to', label: 'Go to exit', target_node_id: 'exit'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {
+      emails: [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}],
+    });
+
+    expect(items[0].connections).toEqual([
+      {
+        kind: 'linear',
+        label: 'Next',
+        target: {
+          id: 'branch',
+          missing: false,
+          label: 'Step 2 - Check tag',
+          step: 2,
+          type_label: 'If has tag',
+        },
+      },
+    ]);
+    expect(items[0].linear_continuation).toBe(true);
+    expect(_.pluck(items[1].connections, 'label')).toEqual(['Yes', 'No']);
+    expect(items[1].linear_continuation).toBe(false);
+    expect(items[1].connections[0].target.label).toBe('Step 3 - Go to exit');
+    expect(items[1].connections[1].target.label).toBe('Step 4 - Exit');
+    expect(items[2].connections[0].kind).toBe('go_to');
+    expect(items[2].connections[0].label).toBe('Go to');
+    expect(items[2].connections[0].target.label).toBe('Step 4 - Exit');
+    expect(items[2].linear_continuation).toBe(false);
+    expect(items[3].connections).toEqual([]);
+    expect(items[3].terminal_label).toBe('Terminal exit');
+    expect(items[3].linear_continuation).toBe(false);
+  });
+
+  it('keeps branch-to-next-step as a labelled branch instead of linear continuation', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'later'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target', draft_tag: 'yes'},
+      {id: 'wait', type: 'wait_duration', label: 'Wait'},
+      {id: 'later', type: 'exit', label: 'No target'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {});
+
+    expect(items[0].connections).toHaveLength(2);
+    expect(_.pluck(items[0].connections, 'kind')).toEqual(['branch', 'branch']);
+    expect(items[0].connections[0].label).toBe('Yes');
+    expect(items[0].connections[0].target.label).toBe('Step 2 - Yes target');
+    expect(items[0].connections[1].label).toBe('No');
+    expect(items[0].connections[1].target.label).toBe('Step 4 - No target');
+    expect(items[0].linear_continuation).toBe(false);
+  });
+
+  it('marks final non-exit preview nodes as completion without continuation', () => {
+    const nodes = [
+      {id: 'tag', type: 'add_tag', label: 'Add tag', draft_tag: 'done'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {});
+
+    expect(items[0].connections).toEqual([]);
+    expect(items[0].terminal_label).toBe('Completes automation');
+    expect(items[0].linear_continuation).toBe(false);
+  });
+
+  it('marks missing visual preview targets as warnings', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_missing_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'missing', no_node_id: ''},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const items = automationWorkflowPreviewItems(nodes, {});
+
+    expect(items[0].warning).toBe(true);
+    expect(items[0].connections[0].target).toEqual({
+      id: 'missing',
+      missing: true,
+      label: 'Target missing',
+      step: null,
+      type_label: '',
+    });
+    expect(items[0].connections[1].target.missing).toBe(true);
+  });
+
+  it('derives visual preview data without mutating workflow nodes', () => {
+    const nodes = [
+      {id: 'one', type: 'add_tag', label: 'Add', draft_tag: 'vip'},
+      {id: 'two', type: 'exit', label: 'Exit'},
+    ];
+    const before = JSON.stringify(nodes);
+
+    automationWorkflowPreviewItems(nodes, {});
+
+    expect(JSON.stringify(nodes)).toBe(before);
+  });
+
+  it('includes contact counts in visual preview items', () => {
+    const nodes = [
+      {id: 'one', type: 'add_tag', label: 'Add', draft_tag: 'vip'},
+      {id: 'two', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {
+      nodeContactCount: node => node.id === 'one' ? 7 : 0,
+    });
+
+    expect(flow.main[0].item.contact_count).toBe(7);
+    expect(flow.main[1].item.contact_count).toBe(0);
+  });
+
+  it('derives a path-based preview with a single path before the first branch', () => {
+    const nodes = [
+      {id: 'send', type: 'send_email', label: 'Send', automation_email_id: 'email-1'},
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target', draft_tag: 'yes'},
+      {id: 'no', type: 'exit', label: 'No target'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {
+      emails: [{id: 'email-1', name: 'Welcome', subject: 'Hello', type: 'raw'}],
+    });
+
+    expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['send', 'branch']);
+    expect(flow.main[0].item.type_label).toBe('Send email');
+    expect(flow.main[0].item.summary).toBe('Welcome');
+    expect(flow.main[1].item.summary).toBe('vip');
+    expect(flow.branch.item.id).toBe('branch');
+    expect(_.pluck(flow.branch.lanes, 'label')).toEqual(['Yes', 'No']);
+  });
+
+  it('renders branch target cards inside separate preview lanes', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes target', draft_tag: 'yes'},
+      {id: 'yes-exit', type: 'exit', label: 'Yes exit'},
+      {id: 'no', type: 'remove_tag', label: 'No target', draft_tag: 'no'},
+      {id: 'no-exit', type: 'exit', label: 'No exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['yes', 'yes-exit']);
+    expect(_.pluck(_.map(flow.branch.lanes[1].blocks, block => block.item), 'id')).toEqual(['no', 'no-exit']);
+    expect(flow.branch.lanes[0].blocks[0].item.summary).toBe('yes');
+    expect(flow.branch.lanes[1].blocks[0].item.summary).toBe('no');
+    expect(flow.branch.lanes[0].blocks[1].item.type_label).toBe('Exit automation');
+    expect(flow.branch.lanes[0].blocks[1].item.terminal_label).toBe('');
+    expect(flow.branch.lanes[1].blocks[1].item.type_label).toBe('Exit automation');
+    expect(flow.branch.lanes[1].blocks[1].item.terminal_label).toBe('');
+  });
+
+  it('stops a preview lane at go-to without continuing to the next array node', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'go', no_node_id: 'exit'},
+      {id: 'go', type: 'go_to', label: 'Jump back', target_node_id: 'branch'},
+      {id: 'should-not-render', type: 'add_tag', label: 'Should not render', draft_tag: 'wrong'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['go']);
+    expect(flow.branch.lanes[0].blocks[0].item.connections[0].kind).toBe('go_to');
+    expect(flow.branch.lanes[0].blocks[0].item.connections[0].target.label).toBe('Step 1 - Check tag');
+    expect(flow.branch.lanes[0].blocks[0].item.summary).toBe('Step 1');
+  });
+
+  it('stops a preview lane at exit without continuing', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'exit', no_node_id: 'after'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+      {id: 'after', type: 'add_tag', label: 'After exit', draft_tag: 'after'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.branch.lanes[0].blocks, block => block.item), 'id')).toEqual(['exit']);
+    expect(flow.branch.lanes[0].blocks[0].item.type_label).toBe('Exit automation');
+    expect(flow.branch.lanes[0].blocks[0].item.terminal_label).toBe('');
+  });
+
+  it('keeps single compound condition preview summaries compact', () => {
+    const nodes = [
+      {
+        id: 'compound',
+        type: 'if_conditions',
+        label: 'Check one',
+        condition: {
+          mode: 'all',
+          items: [{type: 'has_tag', tag: 'vip'}],
+        },
+        yes_node_id: 'yes',
+        no_node_id: 'no',
+      },
+      {id: 'yes', type: 'add_tag', label: 'Yes', draft_tag: 'yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(flow.main[0].item.summary).toBe('has any of these tags: vip');
+    expect(flow.main[0].item.summary).not.toContain('All of 1 condition');
+    expect(flow.main[0].item.summary).not.toContain('Yes ->');
+  });
+
+  it('uses inline visual preview summaries for simple action nodes only', () => {
+    expect(automationWorkflowPreviewSummaryInline('add_tag')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('remove_tag')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('add_to_list')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('remove_from_list')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('wait_duration')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('go_to')).toBe(true);
+    expect(automationWorkflowPreviewSummaryInline('send_email')).toBe(false);
+    expect(automationWorkflowPreviewSummaryInline('if_has_tag')).toBe(false);
+    expect(automationWorkflowPreviewSummaryInline('if_conditions')).toBe(false);
+  });
+
+  it('shows missing branch targets as warning lane blocks', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_missing_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'missing', no_node_id: ''},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(flow.branch.lanes[0].blocks[0].kind).toBe('missing');
+    expect(flow.branch.lanes[0].blocks[0].warning).toBe(true);
+    expect(flow.branch.lanes[1].blocks[0].kind).toBe('missing');
+  });
+
+  it('protects path-based preview lanes from cycles', () => {
+    const nodes = [
+      {id: 'pre', type: 'add_tag', label: 'Pre', draft_tag: 'pre'},
+      {id: 'branch', type: 'if_has_tag', label: 'Check tag', draft_tag: 'vip', yes_node_id: 'pre', no_node_id: 'exit'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['pre', 'branch']);
+    expect(flow.branch.lanes[0].blocks[0].kind).toBe('reference');
+    expect(flow.branch.lanes[0].blocks[0].label).toBe('Continues at');
+    expect(flow.branch.lanes[0].blocks[0].target.label).toBe('Step 1 - Pre');
+  });
+
+  it('expands nested branches and references a shared downstream node without duplicating it', () => {
+    const nodes = [
+      {id: 'branch', type: 'if_has_tag', label: 'Outer', draft_tag: 'vip', yes_node_id: 'nested', no_node_id: 'exit'},
+      {id: 'nested', type: 'if_missing_tag', label: 'Nested', draft_tag: 'cold', yes_node_id: 'yes', no_node_id: 'no'},
+      {id: 'yes', type: 'add_tag', label: 'Yes', draft_tag: 'yes'},
+      {id: 'no', type: 'exit', label: 'No'},
+      {id: 'exit', type: 'exit', label: 'Exit'},
+    ];
+
+    const flow = automationWorkflowPreviewFlow(nodes, {});
+
+    expect(flow.branch.lanes[0].blocks[0].item.id).toBe('nested');
+    const nested = flow.branch.lanes[0].blocks[0];
+    expect(nested.item.nested_branch_stop).toBe(false);
+    expect(nested.branch.lanes[0].blocks.map(block => block.item.id)).toEqual(['yes', 'no']);
+    expect(nested.branch.lanes[1].blocks[0].kind).toBe('reference');
+    expect(nested.branch.lanes[1].blocks[0].target.id).toBe('no');
+    expect(flow.branch.lanes[0].blocks).toHaveLength(1);
+  });
+
+  it('shows automation diagnostics only for admin, impersonation or enabled accounts', () => {
+    expect(canViewAutomationDiagnostics({user: {admin: true}})).toBe(true);
+    expect(canViewAutomationDiagnostics({loggedInImpersonate: true, user: {}})).toBe(true);
+    expect(canViewAutomationDiagnostics({user: {automation_diagnostics_visible: true}})).toBe(true);
+    expect(canViewAutomationDiagnostics({user: {automation_diagnostics_visible: false}})).toBe(false);
+    expect(canViewAutomationDiagnostics({user: {}})).toBe(false);
+  });
+
+  it('only allows rerun UI when published reentry is multiple', () => {
+    expect(canReEnrolAutomation({published: {reentry: 'multiple'}})).toBe(true);
+    expect(canReEnrolAutomation({published: {reentry: 'once'}})).toBe(false);
+    expect(canReEnrolAutomation({reentry: 'multiple'})).toBe(true);
+  });
+
+  it('loads old single entry triggers as one trigger row', () => {
+    expect(entryTriggers({type: 'tag_added', tag: 'vip'})).toEqual([
+      {type: 'tag_added', tag: 'vip'},
+    ]);
+  });
+
+  it('saves one entry trigger as the existing single shape', () => {
+    expect(entryPayload({type: 'multi', triggers: [{type: 'tag_removed', tag: 'old'}]})).toEqual({
+      type: 'tag_removed',
+      tag: 'old',
+    });
+  });
+
+  it('saves multiple entry triggers as multi shape', () => {
+    expect(entryPayload({
+      type: 'multi',
+      triggers: [
+        {type: 'manual'},
+        {type: 'list_left', list_id: 'list-1'},
+      ],
+    })).toEqual({
+      type: 'multi',
+      triggers: [
+        {type: 'manual'},
+        {type: 'list_left', list_id: 'list-1'},
+      ],
+    });
+  });
+
+  it('omits empty optional enrolment query parameters', () => {
+    expect(enrolmentQueryParams({
+      view: 'all',
+      page: 1,
+      pageSize: 50,
+      appliedSearch: '',
+      nodeId: '',
+      nodePosition: '',
+    })).toEqual({
+      view: 'all',
+      page: 1,
+      page_size: 50,
+    });
+  });
+
+  it('counts active and ever-enrolled automation contacts', () => {
+    const counts = automationEnrolmentCounts([
+      {id: 'ready-1', contact_id: 1, contact_email: 'one@example.com', status: 'ready'},
+      {id: 'waiting-1', contact_id: 2, contact_email: 'two@example.com', status: 'waiting'},
+      {id: 'completed-1', contact_id: 3, contact_email: 'three@example.com', status: 'completed'},
+      {id: 'completed-2', contact_id: 1, contact_email: 'one@example.com', status: 'completed'},
+      {id: 'failed-1', contact_id: 4, contact_email: 'four@example.com', status: 'failed'},
+    ]);
+
+    expect(counts).toEqual({
+      active: 2,
+      enrolled: 4,
+    });
+  });
+
+  it('preserves impersonation when opening automation enrolment pages in new tabs', () => {
+    expect(automationImpersonatedHref('/automations/abc/enrolments?view=active', 'customer-1')).toBe(
+      '/automations/abc/enrolments?view=active&impersonate=customer-1'
+    );
+    expect(automationImpersonatedHref('/automations/abc/enrolments', 'customer 1')).toBe(
+      '/automations/abc/enrolments?impersonate=customer%201'
+    );
+    expect(automationImpersonatedHref('/automations/abc/enrolments', '')).toBe('/automations/abc/enrolments');
+  });
+
+  it('maps live contact counts and links by the exact stable node ID', () => {
+    const draftNodes = [
+      {id: 'send', label: 'Send email'},
+      {id: 'tag', label: 'Add tag'},
+    ];
+    const publishedNodes = [
+      {id: 'send', label: 'Send email'},
+      {id: 'tag', label: 'Add tag'},
+    ];
+    const summary = {
+      nodes: {
+        send: 1,
+        tag: 3,
+      },
+    };
+
+    expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(1);
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(3);
+    expect(automationNodeContactFilterId(draftNodes[0], draftNodes, publishedNodes)).toBe('send');
+    expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id',
+      value: 'send',
+    });
+  });
+
+  it('does not transfer a deleted published step occupancy to the next draft row', () => {
+    const draftNodes = [
+      {id: 'exit', label: 'Exit'},
+      {id: 'wait-two', label: 'Wait'},
+    ];
+    const publishedNodes = [
+      {id: 'wait-one', label: 'Wait'},
+      {id: 'exit', label: 'Exit'},
+      {id: 'wait-two', label: 'Wait'},
+    ];
+    const summary = {
+      nodes: {
+        'wait-one': 1,
+      },
+      node_positions: {
+        '1': 1,
+      },
+    };
+
+    expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(0);
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(0);
+    expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id',
+      value: 'exit',
+    });
+  });
+
+  it('keeps counts and view targets with their IDs when draft nodes are reordered', () => {
+    const draftNodes = [
+      {id: 'exit', label: 'Exit'},
+      {id: 'wait', label: 'Wait'},
+    ];
+    const publishedNodes = [
+      {id: 'wait', label: 'Wait'},
+      {id: 'exit', label: 'Exit'},
+    ];
+    const summary = {nodes: {wait: 2, exit: 1}, node_positions: {'1': 2, '2': 1}};
+
+    expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(1);
+    expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id', value: 'exit',
+    });
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(2);
+    expect(automationNodeContactFilterParam(draftNodes[1], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id', value: 'wait',
+    });
+  });
+
+  it('collapses sessions by contact and prefers the latest ready session', () => {
+    const rows = displayAutomationEnrolments([
+      {
+        id: 'old-exited',
+        contact_id: 123,
+        contact_email: 'contact@example.com',
+        status: 'exited',
+        current_node_id: 'exit',
+        created: '2026-07-20T10:00:00Z',
+      },
+      {
+        id: 'new-ready',
+        contact_id: 123,
+        contact_email: 'contact@example.com',
+        status: 'ready',
+        current_node_id: 'first-node',
+        created: '2026-07-20T11:00:00Z',
+      },
+    ]);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe('new-ready');
+    expect(rows[0].current_node_id).toBe('first-node');
+  });
+
+  it('collapses sessions by contact and uses latest history when no session is ready', () => {
+    const rows = displayAutomationEnrolments([
+      {
+        id: 'first-exit',
+        contact_id: 123,
+        contact_email: 'contact@example.com',
+        status: 'exited',
+        created: '2026-07-20T10:00:00Z',
+      },
+      {
+        id: 'latest-exit',
+        contact_id: 123,
+        contact_email: 'contact@example.com',
+        status: 'exited',
+        created: '2026-07-20T11:00:00Z',
+      },
+    ]);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe('latest-exit');
+  });
+
+  it('formats automation history as copy-friendly text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'enrolment',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          status: 'paused_waiting',
+          source: 'manual',
+          current_node_id: 'node_add_tag_1',
+          paused_at: '2026-07-20T10:02:00Z',
+          remaining_seconds: 180,
+          published_revision: 3,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:01:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_add_tag_1',
+          node_type: 'add_tag',
+          node_label: 'Add history tag',
+          tag: 'history-tag',
+          status: 'succeeded',
+          published_revision: 3,
+        },
+      ],
+    });
+
+    expect(log).toContain('contact@example.com | enrolment enrolment-1 | enrolled');
+    expect(log).toContain('status=paused_waiting');
+    expect(log).toContain('paused_at=2026-07-20T10:02:00Z');
+    expect(log).toContain('remaining_seconds=180');
+    expect(log).toContain('step add_tag node_add_tag_1 | "Add history tag" | tag=history-tag');
+    expect(log).toContain('revision=3');
+  });
+
+  it('can format automation history newest first for the all-history log', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'enrolment',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'old-pass',
+          status: 'completed',
+          published_revision: 1,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T11:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'new-pass',
+          node_id: 'node_send_1',
+          node_type: 'send_email',
+          status: 'succeeded',
+          published_revision: 2,
+        },
+      ],
+    }, {newestFirst: true});
+
+    expect(log.indexOf('enrolment new-pass')).toBeLessThan(log.indexOf('enrolment old-pass'));
+  });
+
+  it('shows waiting and continue actions for waiting enrolments', () => {
+    const waiting = automationEnrolmentAction(
+      {
+        status: 'waiting',
+        wake_at: '2026-07-20T10:05:00Z',
+      },
+      {published: {reentry: 'multiple'}},
+      '2026-07-20T10:00:00Z'
+    );
+    expect(waiting.type).toBe('skip_wait');
+    expect(waiting.disabled).toBe(false);
+    expect(waiting.label).toBe('Move to next node');
+    expect(waiting.waitLabel).toContain('Waiting until');
+
+    const elapsed = automationEnrolmentAction(
+      {
+        status: 'waiting',
+        wake_at: '2026-07-20T10:05:00Z',
+      },
+      {published: {reentry: 'multiple'}},
+      '2026-07-20T10:06:00Z'
+    );
+    expect(elapsed.type).toBe('continue_wait');
+    expect(elapsed.label).toBe('Continue test');
+  });
+
+  it('shows rerun for terminal enrolments when reentry is multiple', () => {
+    _.each(['completed', 'exited', 'cancelled'], status => {
+      const action = automationEnrolmentAction(
+        {status: status},
+        {published: {reentry: 'multiple'}}
+      );
+      expect(action.type).toBe('reenrol');
+      expect(action.label).toBe('Run automation again');
+      expect(action.disabled).toBe(false);
+    });
+
+    expect(automationEnrolmentAction(
+      {status: 'completed'},
+      {reentry: 'multiple'}
+    ).type).toBe('reenrol');
+  });
+
+  it('does not show rerun for non-terminal enrolments when reentry is multiple', () => {
+    _.each(['held', 'paused_ready', 'paused_waiting', 'running', 'failed'], status => {
+      const action = automationEnrolmentAction(
+        {status: status, wake_at: '2026-07-20T10:05:00Z'},
+        {published: {reentry: 'multiple'}},
+        '2026-07-20T10:06:00Z'
+      );
+      expect(action.type).toBe('none');
+    });
+
+    expect(automationEnrolmentAction(
+      {status: 'ready'},
+      {published: {reentry: 'multiple'}}
+    ).type).toBe('run_next');
+    expect(automationEnrolmentAction(
+      {status: 'waiting', wake_at: '2026-07-20T10:05:00Z'},
+      {published: {reentry: 'multiple'}},
+      '2026-07-20T10:00:00Z'
+    ).type).toBe('skip_wait');
+  });
+
+  it('never shows rerun after terminal enrolments when reentry is once', () => {
+    _.each(['completed', 'exited', 'cancelled'], status => {
+      const action = automationEnrolmentAction(
+        {status: status},
+        {published: {reentry: 'once'}}
+      );
+      expect(action.type).toBe('none');
+      expect(action.disabled).toBe(true);
+    });
+  });
+
+  it('explains throttled and uncertain email deliveries in history', () => {
+    const log = automationHistoryLog({events: [
+      {type: 'step_run', action: 'send_email', sent: false, throttled: true, status: 'succeeded'},
+      {type: 'step_run', action: 'send_email', email_delivery_status: 'uncertain', status: 'failed'},
+    ]});
+    expect(log).toContain('Email skipped: already sent to this contact in the last 24 hours');
+    expect(log).toContain('delivery=uncertain');
+  });
+
+  it('shows all action tags and the exact deadline in history', () => {
+    const log = automationHistoryLog({events: [
+      {type: 'step_run', tags: ['customer', 'paid'], action: 'add_tag'},
+      {type: 'step_run', wait_until: '2030-06-12T08:30:00Z', action: 'wait_complete'},
+    ]});
+    expect(log).toContain('tags=customer, paid');
+    expect(log).toContain('wait_until=2030-06-12T08:30:00Z');
+  });
+
+  it('includes wait metadata in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_wait_1',
+          node_type: 'wait_duration',
+          node_label: 'Wait',
+          action: 'wait_start',
+          wake_at: '2026-07-20T10:05:00Z',
+          skipped: true,
+          status: 'waiting',
+          published_revision: 3,
+        },
+      ],
+    });
+
+    expect(log).toContain('action=wait_start');
+    expect(log).toContain('wake_at=2026-07-20T10:05:00Z');
+    expect(log).toContain('skipped=true');
+    expect(log).toContain('status=waiting');
+  });
+
+  it('includes branch and go to metadata in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_condition_1',
+          node_type: 'if_has_tag',
+          node_label: 'Check VIP tag',
+          action: 'branch',
+          tag: 'vip',
+          result: true,
+          branch: 'yes',
+          target_node_id: 'node_yes_1',
+          status: 'succeeded',
+          published_revision: 3,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:01:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_go_to_1',
+          node_type: 'go_to',
+          node_label: 'Go to shared step',
+          action: 'go_to',
+          target_node_id: 'node_shared_1',
+          status: 'succeeded',
+          published_revision: 3,
+        },
+      ],
+    });
+
+    expect(log).toContain('action=branch');
+    expect(log).toContain('tag=vip');
+    expect(log).toContain('result=true');
+    expect(log).toContain('branch=yes');
+    expect(log).toContain('target=node_yes_1');
+    expect(log).toContain('action=go_to');
+    expect(log).toContain('target=node_shared_1');
+  });
+
+  it('includes send email metadata in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'step_run',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'enrolment-1',
+          node_id: 'node_send_1',
+          node_type: 'send_email',
+          node_label: 'Send welcome',
+          action: 'send_email',
+          automation_email_id: 'email-1',
+          automation_email_name: 'Welcome email',
+          subject: 'Welcome',
+          recipient_email: 'contact@example.com',
+          route_id: 'route-1',
+          sent: true,
+          status: 'succeeded',
+          published_revision: 4,
+        },
+      ],
+    });
+
+    expect(log).toContain('action=send_email');
+    expect(log).toContain('automation_email=email-1');
+    expect(log).toContain('email_name="Welcome email"');
+    expect(log).toContain('subject="Welcome"');
+    expect(log).toContain('recipient=contact@example.com');
+    expect(log).toContain('route=route-1');
+    expect(log).toContain('sent=true');
+  });
+
+  it('includes engagement events in copy-friendly history text', () => {
+    const log = automationHistoryLog({
+      events: [
+        {
+          type: 'engagement',
+          event_type: 'open',
+          created: '2026-07-24T21:12:00Z',
+          contact_email: 'sarah@example.com',
+          enrolment_id: 'enrolment-1',
+          automation_email_id: 'email-1',
+          automation_email_name: 'Welcome email',
+          subject: 'Welcome',
+          send_step_run_id: 'step-run-1',
+          inferred: true,
+          inferred_from_event_type: 'click',
+        },
+        {
+          type: 'engagement',
+          event_type: 'click',
+          created: '2026-07-24T21:13:00Z',
+          contact_email: 'sarah@example.com',
+          enrolment_id: 'enrolment-1',
+          automation_email_id: 'email-1',
+          automation_email_name: 'Welcome email',
+          subject: 'Welcome',
+          send_step_run_id: 'step-run-1',
+          link_url: 'https://example.com/offer',
+          link_index: 2,
+        },
+      ],
+    });
+
+    expect(log).toContain('sarah@example.com | enrolment enrolment-1 | engagement open');
+    expect(log).toContain('email_name="Welcome email"');
+    expect(log).toContain('send_step=step-run-1');
+    expect(log).toContain('inferred=true');
+    expect(log).toContain('inferred_from=click');
+    expect(log).toContain('engagement click');
+    expect(log).toContain('link=https://example.com/offer');
+    expect(log).toContain('link_index=2');
+  });
+
+  it('groups debug history by contact email and sorts contacts by latest pass first', () => {
+    const contacts = automationHistoryContacts({
+      enrolments: [
+        {
+          id: 'older-pass',
+          contact_email: 'z-contact@example.com',
+          created: '2026-07-20T10:00:00Z',
+        },
+        {
+          id: 'newer-pass',
+          contact_email: 'z-contact@example.com',
+          created: '2026-07-20T11:00:00Z',
+        },
+        {
+          id: 'other-pass',
+          contact_email: 'a-other@example.com',
+          created: '2026-07-20T12:00:00Z',
+        },
+      ],
+    });
+
+    expect(contacts).toHaveLength(2);
+    expect(contacts[0].email).toBe('a-other@example.com');
+    expect(contacts[1].email).toBe('z-contact@example.com');
+    expect(_.pluck(contacts[1].enrolments, 'id')).toEqual(['newer-pass', 'older-pass']);
+  });
+
+  it('filters debug history contacts by email address', () => {
+    const contacts = [
+      {email: 'sarah@example.com'},
+      {email: 'simon@example.com'},
+      {email: 'admin@test.com'},
+    ];
+
+    expect(_.pluck(filterAutomationHistoryContacts(contacts, 'SIM'), 'email')).toEqual(['simon@example.com']);
+    expect(_.pluck(filterAutomationHistoryContacts(contacts, 'example.com'), 'email')).toEqual(['sarah@example.com', 'simon@example.com']);
+    expect(filterAutomationHistoryContacts(contacts, '')).toEqual(contacts);
+  });
+
+  it('paginates debug history contacts in groups of 50', () => {
+    const contacts = _.map(_.range(0, 121), index => ({email: 'contact-' + index + '@example.com'}));
+
+    const first = paginateAutomationHistoryContacts(contacts, 1, 50);
+    expect(first.total).toBe(121);
+    expect(first.totalPages).toBe(3);
+    expect(first.page).toBe(1);
+    expect(first.contacts).toHaveLength(50);
+    expect(first.contacts[0].email).toBe('contact-0@example.com');
+
+    const third = paginateAutomationHistoryContacts(contacts, 3, 50);
+    expect(third.page).toBe(3);
+    expect(third.contacts).toHaveLength(21);
+    expect(third.contacts[0].email).toBe('contact-100@example.com');
+
+    const clamped = paginateAutomationHistoryContacts(contacts, 99, 50);
+    expect(clamped.page).toBe(3);
+  });
+
+  it('sorts debug history contacts by recent pass and email in both directions', () => {
+    const contacts = [
+      {email: 'sarah@example.com', latest_created: '2026-07-20T10:00:00Z'},
+      {email: 'admin@example.com', latest_created: '2026-07-20T12:00:00Z'},
+      {email: 'zoe@example.com', latest_created: '2026-07-20T11:00:00Z'},
+    ];
+
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'recent_desc'), 'email')).toEqual([
+      'admin@example.com',
+      'zoe@example.com',
+      'sarah@example.com',
+    ]);
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'recent_asc'), 'email')).toEqual([
+      'sarah@example.com',
+      'zoe@example.com',
+      'admin@example.com',
+    ]);
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'email_asc'), 'email')).toEqual([
+      'admin@example.com',
+      'sarah@example.com',
+      'zoe@example.com',
+    ]);
+    expect(_.pluck(sortAutomationHistoryContacts(contacts, 'email_desc'), 'email')).toEqual([
+      'zoe@example.com',
+      'sarah@example.com',
+      'admin@example.com',
+    ]);
+  });
+
+  it('formats copy-friendly history text for one pass only', () => {
+    const log = automationHistoryLogForEnrolment({
+      enrolments: [
+        {
+          id: 'pass-1',
+          contact_email: 'contact@example.com',
+        },
+        {
+          id: 'pass-2',
+          contact_email: 'contact@example.com',
+        },
+      ],
+      events: [
+        {
+          type: 'enrolment',
+          created: '2026-07-20T10:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'pass-1',
+          status: 'completed',
+          published_revision: 3,
+        },
+        {
+          type: 'step_run',
+          created: '2026-07-20T11:00:00Z',
+          contact_email: 'contact@example.com',
+          enrolment_id: 'pass-2',
+          node_id: 'node_add_tag_2',
+          node_type: 'add_tag',
+          node_label: 'Add tag',
+          tag: 'second-pass',
+          status: 'succeeded',
+          published_revision: 4,
+        },
+      ],
+    }, 'pass-2');
+
+    expect(log).toContain('enrolment pass-2');
+    expect(log).toContain('step add_tag node_add_tag_2');
+    expect(log).toContain('tag=second-pass');
+    expect(log).toContain('revision=4');
+    expect(log).not.toContain('pass-1');
+  });
+});

@@ -1,4 +1,9 @@
-FROM python-base:latest
+ARG PYTHON_BASE=python-base:latest
+FROM ${PYTHON_BASE}
+
+# Installation belongs in the dependency build, not the running service.
+# Remove pip and its independently vendored vulnerable libraries together.
+RUN python -m pip check && python -m pip uninstall --yes pip
 
 EXPOSE 8000
 EXPOSE 5678

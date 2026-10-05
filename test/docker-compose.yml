@@ -19,7 +19,7 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
   cache:
-    image: redis:7.0.8-alpine
+    image: redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e619aa0ee78de08c6ca0
     platform: linux/arm64/v8
     container_name: edcom-cache-test
     command: redis-server --appendonly yes

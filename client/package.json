@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "proxy": {
-    "/l": {
+    "/@(l)": {
       "target": "http://api:8000"
     },
     "/api": {
@@ -47,7 +47,6 @@
     "react-dropzone": "^8.0.3",
     "react-event-timeline": "^1.4.2",
     "react-linkify": "^0.2.2",
-    "react-notify-toast": "^0.5.0",
     "react-popupbox": "^2.0.8",
     "react-router-dom": "^4.2.2",
     "react-scripts": "^1.0.13",

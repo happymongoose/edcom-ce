@@ -1,0 +1,20 @@
+# Release build contexts must not include databases, customer data or secrets.
+.git
+.build
+.env
+**/node_modules
+**/__pycache__
+**/*.pyc
+data/database
+data/cache
+data/buckets
+data/logs
+data/smtpcert
+data/letsencrypt-challenge
+config/edcom.json
+config/edcom.env
+config/commercial_license.key
+config/private.key
+config/certificate_chain.crt
+config/linkcerts
+machine-id

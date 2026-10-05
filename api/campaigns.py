@@ -75,6 +75,7 @@ from .shared.send import (
     client_domain,
     get_frontend_params,
     load_domain_throttles,
+    validate_sender_domains,
 )
 from .shared.s3 import (
     s3_write_stream,
@@ -87,6 +88,12 @@ from .shared.s3 import (
 from .shared.log import get_logger
 
 log = get_logger()
+
+
+def validate_campaign_sender(db: DB, camp: JsonObj) -> None:
+    validate_sender_domains(
+        db, camp["cid"], camp.get("fromemail"), camp.get("returnpath")
+    )
 
 
 class _CSVWriter:
@@ -901,6 +908,7 @@ def campaign_start(campid: str) -> None:
 
             if camp is None or camp.get("started"):
                 return
+            validate_campaign_sender(db, camp)
             db.campaigns.patch(campid, {"started": True})
 
             if not camp.get("type") or camp["type"] == "beefree":
@@ -1124,6 +1132,8 @@ class CampaignStart(object):
 
         if camp is None:
             raise falcon.HTTPForbidden()
+
+        validate_campaign_sender(db, camp)
 
         campcid = camp["cid"]
 
@@ -1360,6 +1370,11 @@ class CampaignUpdate(object):
                 "newestfirst",
             ):
                 p[k] = v
+
+        oldcamp = db.campaigns.get(id)
+        if oldcamp is None:
+            raise falcon.HTTPForbidden()
+        validate_campaign_sender(db, {**oldcamp, **p})
 
         db.campaigns.patch(id, p)
 
@@ -1849,6 +1864,8 @@ class CampaignTest(object):
         if camp is None:
             raise falcon.HTTPForbidden()
 
+        validate_campaign_sender(db, camp)
+
         db.set_cid(None)
 
         db.users.patch(
@@ -2263,6 +2280,13 @@ class Campaigns(CRUDCollection):
         if "scheduled_for" not in doc:
             doc["scheduled_for"] = None
 
+        validate_sender_domains(
+            req.context["db"],
+            req.context["db"].get_cid(),
+            doc.get("fromemail"),
+            doc.get("returnpath"),
+        )
+
         CRUDCollection.on_post(self, req, resp)
 
         if send:
@@ -2513,6 +2537,8 @@ class Campaign(CRUDSingle):
 
         doc["modified"] = datetime.utcnow().isoformat() + "Z"
         doc.pop("type", None)
+
+        validate_campaign_sender(db, {**exist, **doc})
 
         CRUDSingle.on_patch(self, req, resp, id)
 

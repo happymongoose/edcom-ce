@@ -1,5 +1,5 @@
 import React, { Component } from "react";
-import { FormGroup, Modal, Button } from "react-bootstrap";
+import { FormGroup, Modal, Button, Checkbox } from "react-bootstrap";
 import { SelectLabel, FormControlLabel } from "./FormControls";
 import _ from "underscore";
 import notify from "../utils/notify";
@@ -20,6 +20,7 @@ export default class TestButton extends Component {
       alert: '',
       alertred: false,
       json: '',
+      includeInLog: false,
       editMode: !(props.emails && props.emails.to),
       totext: (props.emails && props.emails.to) || '',
       totextedit: '',
@@ -61,7 +62,8 @@ export default class TestButton extends Component {
   }
 
   handleChange = event => {
-    this.setState({[event.target.id]: event.target.value, alert: '', alertred: false});
+    var val = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+    this.setState({[event.target.id]: val, alert: '', alertred: false});
   }
 
   onClick = () => {
@@ -75,9 +77,9 @@ export default class TestButton extends Component {
 
     if (this.props.toggleModal) {
       this.props.toggleModal(true)
-      this.setState({alert: '', alertred: false})
+      this.setState({alert: '', alertred: false, includeInLog: false})
     } else {
-      this.setState({showModal: true, alert: '', alertred: false});
+      this.setState({showModal: true, alert: '', alertred: false, includeInLog: false});
     }
   }
 
@@ -135,7 +137,7 @@ export default class TestButton extends Component {
     this.setState(p);
 
     if (yes) {
-      this.props.onConfirm(this.state.to || this.emailDefault(), this.state.route, this.state.json);
+      this.props.onConfirm(this.state.to || this.emailDefault(), this.state.route, this.state.json, this.state.includeInLog);
     }
   }
 
@@ -213,6 +215,14 @@ export default class TestButton extends Component {
                     options={this.props.routes}
                     help={routesHelp(this.props.routes)}
                   />
+                }
+                {
+                  this.props.showIncludeInLogCheckbox &&
+                    <FormGroup className="space10">
+                      <Checkbox id="includeInLog" checked={this.state.includeInLog} onChange={this.handleChange}>
+                        Include in transactional log
+                      </Checkbox>
+                    </FormGroup>
                 }
               </div>
             }

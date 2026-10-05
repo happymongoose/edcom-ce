@@ -1,35 +1,31 @@
-import React from "react";
-import shortid from "shortid";
-import { notify } from "react-notify-toast";
-
+// Keep the existing application-wide show(message, type, timeout) API.
 class Notify {
   constructor() {
-    this.lastid = null;
+    this.current = null;
+    this.listeners = [];
   }
 
   show(text, type, timeout) {
-    var id = shortid.generate();
-    this.lastid = id;
+    this.current = {text, type, duration: timeout || 7000};
+    this.emit();
+  }
 
-    notify.hide();
-    notify.show(
-      <span>{text} <span className="toast-dismiss" onClick={() => {
-          this.lastid = null;
-          notify.hide();
-        }
-      }>{'\u00D7'}</span></span>,
-      type, -1
-    );
+  dismiss(notification) {
+    // An old timer must never dismiss a newer notification.
+    if (notification !== this.current) return;
+    this.current = null;
+    this.emit();
+  }
 
-    setTimeout(() => {
-      if (id === this.lastid) {
-        notify.hide();
-      }
-    }, timeout?timeout:7000);
+  subscribe(listener) {
+    this.listeners.push(listener);
+    listener(this.current);
+    return () => { this.listeners = this.listeners.filter(item => item !== listener); };
+  }
+
+  emit() {
+    this.listeners.forEach(listener => listener(this.current));
   }
 }
 
-var n = new Notify();
-
-export default n;
-
+export default new Notify();

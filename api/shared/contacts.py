@@ -9,6 +9,8 @@ import random
 from typing import Dict, Tuple, List, Any, Callable
 from io import BytesIO, TextIOWrapper, IOBase
 from datetime import datetime
+from functools import wraps
+from contextlib import nullcontext
 from .block import read_block, list_blocks
 from .utils import (
     MPDictReader,
@@ -49,6 +51,345 @@ WRITE_BLOCK_SIZE = 32 * 1024
 HASH_BLOCK_SIZE = 1024 * 1024
 # Max hash buckets to prevent runaway rehashing/task fan-out. Can be overridden via env.
 HASHLIMIT_CAP = int(os.environ.get("hashlimit_max", "128"))
+AUTOMATION_TRIGGER_SOURCE_FIELDS = (
+    "type",
+    "automation_id",
+    "enrolment_id",
+    "node_id",
+    "step_run_id",
+    "published_revision",
+)
+
+
+def automation_trigger_emission_enabled() -> bool:
+    return (os.environ.get("automation_trigger_emission_enabled") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def sanitize_automation_trigger_source(source: JsonObj | None) -> JsonObj:
+    source = source or {}
+    ret: JsonObj = {
+        "type": str(source.get("type") or "manual")[:32],
+    }
+    for key in AUTOMATION_TRIGGER_SOURCE_FIELDS:
+        if key == "type":
+            continue
+        value = source.get(key)
+        if value is not None:
+            ret[key] = str(value)[:128]
+    return ret
+
+
+def matching_tag_trigger_automation_exists(db: DB, cid: str, event_type: str, tag: str) -> bool:
+    return bool(
+        db.single(
+            """
+            select id
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+                and (
+                    (
+                        data->'published'->'entry'->>'type' = %s
+                        and data->'published'->'entry'->>'tag' = %s
+                    )
+                    or (
+                        data->'published'->'entry'->>'type' = 'multi'
+                        and exists (
+                            select 1
+                            from jsonb_array_elements(coalesce(data->'published'->'entry'->'triggers', '[]'::jsonb)) trigger
+                            where trigger->>'type' = %s
+                                and trigger->>'tag' = %s
+                        )
+                    )
+                )
+            limit 1
+            """,
+            cid,
+            event_type,
+            tag,
+            event_type,
+            tag,
+        )
+    )
+
+
+def matching_list_trigger_automation_exists(db: DB, cid: str, event_type: str, list_id: str) -> bool:
+    return bool(
+        db.single(
+            """
+            select id
+            from automations
+            where cid = %s
+                and data->>'status' in ('published', 'paused')
+                and data->'published' is not null
+                and (
+                    (
+                        data->'published'->'entry'->>'type' = %s
+                        and data->'published'->'entry'->>'list_id' = %s
+                    )
+                    or (
+                        data->'published'->'entry'->>'type' = 'multi'
+                        and exists (
+                            select 1
+                            from jsonb_array_elements(coalesce(data->'published'->'entry'->'triggers', '[]'::jsonb)) trigger
+                            where trigger->>'type' = %s
+                                and trigger->>'list_id' = %s
+                        )
+                    )
+                )
+            limit 1
+            """,
+            cid,
+            event_type,
+            list_id,
+            event_type,
+            list_id,
+        )
+    )
+
+
+def matching_exit_rule_exists(db: DB, cid: str, field: str, value: str) -> bool:
+    return bool(db.single("""select id from automations where cid=%s
+        and data->>'status' in ('published','paused') and exists
+        (select 1 from jsonb_array_elements(coalesce(data->'published'->'exit_rules','[]'::jsonb)) rule
+         where rule->%s ? %s) limit 1""", cid, field, value))
+
+
+def lock_exit_rule_changes(db: DB, cid: str, publishing: bool = False) -> None:
+    """Coordinate contact state with publication; caller owns a short transaction."""
+    assert not db.conn.autocommit
+    function = "pg_advisory_xact_lock" if publishing else "pg_advisory_xact_lock_shared"
+    db.execute(f"select {function}(hashtextextended(%s, 0))", "automation-exit-contact:" + cid)
+
+
+def execute_exit_rule_change(db: DB, cid: str, field: str, value: str, event_type: str,
+                             sql: str, *params: Any) -> List[Tuple[Any, ...]]:
+    """Capture exit-only work in the same statement as a membership change.
+
+    The supplied statement must return contact_id. Existing ordinary list paths
+    do not emit entry events; this helper deliberately preserves that behaviour.
+    """
+    with db.transaction() if db.conn.autocommit else nullcontext():
+        lock_exit_rule_changes(db, cid)
+        if not matching_exit_rule_exists(db, cid, field, value):
+            return db.execute(sql, *params).fetchall()
+        return db.execute(f"""with changed as ({sql}), queued as (
+            insert into automation_trigger_events
+                (id,cid,contact_id,contact_email,event_type,ts,data)
+            select md5(random()::text || clock_timestamp()::text || c.contact_id::text),
+                %s,c.contact_id,c.email,%s,now(),jsonb_build_object(
+                    'status','processed','exit_status','pending',%s::text,%s::text,
+                    'source',jsonb_build_object('type','contact_change'),
+                    'depth',0,'created',now(),'results','[]'::jsonb)
+            from changed join contacts."contacts_{cid}" c using (contact_id)
+        ) select * from changed""", *params, cid, event_type,
+            'tag' if field == 'tags' else 'list_id', value).fetchall()
+
+
+def maybe_insert_tag_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    event_type: str,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    if event_type not in ("tag_added", "tag_removed"):
+        return None
+    exit_pending = matching_exit_rule_exists(db, cid, "tags", tag)
+    entry_pending = automation_trigger_emission_enabled() and matching_tag_trigger_automation_exists(db, cid, event_type, tag)
+    if not entry_pending and not exit_pending:
+        return None
+
+    now = datetime.utcnow()
+    event_id = shortuuid.uuid()
+    try:
+        depth = max(0, min(int(depth or 0), 100))
+    except (TypeError, ValueError):
+        depth = 0
+    data = {
+        "status": "pending" if entry_pending else "processed",
+        "exit_status": "pending" if exit_pending else None,
+        "tag": tag,
+        "source": sanitize_automation_trigger_source(source),
+        "correlation_id": (correlation_id or shortuuid.uuid())[:128],
+        "depth": depth,
+        "manual_debug": False,
+        "created_by": None,
+        "created": now.isoformat() + "Z",
+        "processed_at": None,
+        "results": [],
+    }
+    db.execute(
+        """
+        insert into automation_trigger_events
+            (id, cid, contact_id, contact_email, event_type, ts, data)
+        values (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        event_id,
+        cid,
+        contact_id,
+        email,
+        event_type,
+        now,
+        data,
+    )
+    return event_id
+
+
+def maybe_insert_list_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    event_type: str,
+    list_id: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    if event_type not in ("list_joined", "list_left"):
+        return None
+    exit_pending = matching_exit_rule_exists(db, cid, "list_ids", list_id)
+    entry_pending = automation_trigger_emission_enabled() and matching_list_trigger_automation_exists(db, cid, event_type, list_id)
+    if not entry_pending and not exit_pending:
+        return None
+
+    now = datetime.utcnow()
+    event_id = shortuuid.uuid()
+    try:
+        depth = max(0, min(int(depth or 0), 100))
+    except (TypeError, ValueError):
+        depth = 0
+    data = {
+        "status": "pending" if entry_pending else "processed",
+        "exit_status": "pending" if exit_pending else None,
+        "list_id": list_id,
+        "source": sanitize_automation_trigger_source(source),
+        "correlation_id": (correlation_id or shortuuid.uuid())[:128],
+        "depth": depth,
+        "manual_debug": False,
+        "created_by": None,
+        "created": now.isoformat() + "Z",
+        "processed_at": None,
+        "results": [],
+    }
+    db.execute(
+        """
+        insert into automation_trigger_events
+            (id, cid, contact_id, contact_email, event_type, ts, data)
+        values (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        event_id,
+        cid,
+        contact_id,
+        email,
+        event_type,
+        now,
+        data,
+    )
+    return event_id
+
+
+def maybe_insert_tag_added_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_tag_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "tag_added",
+        tag,
+        source,
+        correlation_id,
+        depth,
+    )
+
+
+def maybe_insert_list_joined_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    list_id: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_list_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "list_joined",
+        list_id,
+        source,
+        correlation_id,
+        depth,
+    )
+
+
+def maybe_insert_list_left_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    list_id: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_list_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "list_left",
+        list_id,
+        source,
+        correlation_id,
+        depth,
+    )
+
+
+def maybe_insert_tag_removed_trigger_event(
+    db: DB,
+    cid: str,
+    email: str,
+    contact_id: int,
+    tag: str,
+    source: JsonObj | None = None,
+    correlation_id: str | None = None,
+    depth: int = 0,
+) -> str | None:
+    return maybe_insert_tag_trigger_event(
+        db,
+        cid,
+        email,
+        contact_id,
+        "tag_removed",
+        tag,
+        source,
+        correlation_id,
+        depth,
+    )
 
 
 def load_campaign_or_message(db: DB, campid: str) -> Tuple[JsonObj | None, bool]:
@@ -208,6 +549,9 @@ def update_tags(
     webhook_msgs: List[JsonObj],
     email_contact_ids: List[Tuple[str, int]] | None = None,
     funnel: str | None = None,
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
 ) -> None:
     if email_contact_ids is None:
         email_contact_ids = list(
@@ -245,10 +589,24 @@ def update_tags(
                 funnelcounts,
                 tagcounts,
                 webhook_msgs,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
             )
 
         for tag in remove_tags:
-            remove_tag(db, cid, email, contact_id, tag, tagcounts, webhook_msgs)
+            remove_tag(
+                db,
+                cid,
+                email,
+                contact_id,
+                tag,
+                tagcounts,
+                webhook_msgs,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
 
         if funnel is not None:
             assert respfunnels is not None
@@ -267,6 +625,21 @@ def update_tags(
         )
 
 
+
+def _atomic_tag_change(func: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(func)
+    def change(db: DB, *args: Any, **kwargs: Any) -> Any:
+        # DB.transaction resets the connection; never nest it.
+        if db.conn.autocommit:
+            with db.transaction():
+                lock_exit_rule_changes(db, args[0] if args else kwargs["cid"])
+                return func(db, *args, **kwargs)
+        lock_exit_rule_changes(db, args[0] if args else kwargs["cid"])
+        return func(db, *args, **kwargs)
+    return change
+
+
+@_atomic_tag_change
 def add_tag(
     db: DB,
     cid: str,
@@ -277,7 +650,12 @@ def add_tag(
     funnelcounts: Dict[str, int],
     tagcounts: Dict[str, int],
     webhook_msgs: List[JsonObj],
-) -> None:
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
+    automation_trigger_strict: bool = False,
+) -> bool:
+    exit_required = matching_exit_rule_exists(db, cid, "tags", tag)
     is_new = db.single(
         f"""insert into contacts."contact_values_{cid}" (contact_id, type, value) values (%s, 'tag', %s)
                            on conflict (contact_id, type, value) do nothing returning contact_id""",
@@ -300,7 +678,27 @@ def add_tag(
         if tagfunnels is not None:
             insert_funnel_tag(db, cid, email, tag, tagfunnels, funnelcounts)
 
+        try:
+            maybe_insert_tag_added_trigger_event(
+                db,
+                cid,
+                email,
+                contact_id,
+                tag,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
+        except Exception:
+            if automation_trigger_strict or exit_required:
+                raise
+            log.exception("failed to emit automation tag_added trigger event")
+        return True
 
+    return False
+
+
+@_atomic_tag_change
 def remove_tag(
     db: DB,
     cid: str,
@@ -309,7 +707,12 @@ def remove_tag(
     tag: str,
     tagcounts: Dict[str, int],
     webhook_msgs: List[JsonObj],
-) -> None:
+    automation_trigger_source: JsonObj | None = None,
+    automation_trigger_correlation_id: str | None = None,
+    automation_trigger_depth: int = 0,
+    automation_trigger_strict: bool = False,
+) -> bool:
+    exit_required = matching_exit_rule_exists(db, cid, "tags", tag)
     is_del = db.execute(
         f"""delete from contacts."contact_values_{cid}"
                             where contact_id = %s and type = 'tag' and value = %s""",
@@ -328,6 +731,26 @@ def remove_tag(
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
         )
+
+        try:
+            maybe_insert_tag_removed_trigger_event(
+                db,
+                cid,
+                email,
+                contact_id,
+                tag,
+                automation_trigger_source,
+                automation_trigger_correlation_id,
+                automation_trigger_depth,
+            )
+        except Exception:
+            if automation_trigger_strict or exit_required:
+                raise
+            log.exception("failed to emit automation tag_removed trigger event")
+        return True
+
+    return False
+
 
 
 def erase(db: DB, cid: str, emails: List[str], unsublog: bool = False) -> None:
@@ -437,6 +860,17 @@ def erase(db: DB, cid: str, emails: List[str], unsublog: bool = False) -> None:
                 cid,
                 emails,
             )
+
+
+def clear_unsublogs(db: DB, cid: str, emails: List[str]) -> None:
+    if not emails:
+        return
+
+    db.execute(
+        "delete from unsublogs where cid = %s and email = any(%s)",
+        cid,
+        emails,
+    )
 
 
 def overwrite_props(db: DB, cid: str, email: str, props: JsonObj) -> None:
@@ -557,15 +991,10 @@ def feed(
         d,
     )
 
-    is_new = db.single(
-        f"""
-                            insert into contacts."contact_lists_{cid}" (contact_id, list_id)
-                            values (%s, %s)
-                            on conflict do nothing
-                            returning list_id
-                            """,
-        contact_id,
-        listid,
+    is_new = execute_exit_rule_change(db, cid, "list_ids", listid, "list_joined",
+        f"""insert into contacts."contact_lists_{cid}" (contact_id, list_id)
+            values (%s, %s) on conflict do nothing returning contact_id""",
+        contact_id, listid,
     )
 
     update_tags(db, cid, [email], tags, webhook_msgs, [(email, contact_id)], funnel)
@@ -643,9 +1072,7 @@ def feed(
         patch_list(db, otherlist, 0, ob, ou, oc, os, list(d.keys()))
 
     if override:
-        db.execute(
-            """delete from unsublogs where cid = %s and email = %s""", cid, email
-        )
+        clear_unsublogs(db, cid, [email])
     elif unsubscribe:
         db.execute(
             """insert into unsublogs (cid, email, rawhash, unsubscribed, complained, bounced) values (%s, %s, %s, true, false, false)
@@ -1105,17 +1532,18 @@ def remove_list_contacts(db: DB, cid: str, listid: str, emails: List[str]) -> in
             emails,
         )
 
-        ret = db.execute(
+        ret = len(execute_exit_rule_change(db, cid, "list_ids", listid, "list_left",
             f"""
             delete from contacts."contact_lists_{cid}" l
             using contacts."contacts_{cid}" c
             where l.contact_id = c.contact_id
             and l.list_id = %s
             and c.email = any(%s)
+            returning l.contact_id
         """,
             listid,
             emails,
-        ).rowcount
+        ))
 
         tc = {
             tag: cnt
@@ -1224,7 +1652,7 @@ def remove_list_domains_bucket(
                 *domain_params,
             )
 
-            db.execute(
+            execute_exit_rule_change(db, cid, "list_ids", listid, "list_left",
                 f"""
                 delete from contacts."contact_lists_{cid}" l
                 using contacts."contacts_{cid}" c
@@ -1235,6 +1663,7 @@ def remove_list_domains_bucket(
                 and (
                     {domain_or_expr}
                 )
+                returning l.contact_id
                     """,
                 hashval,
                 hashval,
@@ -1595,8 +2024,12 @@ def write_rows(
                     emails,
                 )
 
-            if webhook_count > 0:
-                for (email,) in db.execute(
+            if keytype == "list":
+                lock_exit_rule_changes(db, cid)
+            exit_interest = keytype == "list" and matching_exit_rule_exists(db, cid, "list_ids", listid)
+            if webhook_count > 0 or exit_interest:
+                added_contact_ids = []
+                for contact_id, email in db.execute(
                     f"""
                     with c as (
                         insert into contacts."contacts_{cid}" (email, added, props) values
@@ -1610,24 +2043,30 @@ def write_rows(
                         on conflict (contact_id, {list_column}) do nothing
                         returning contact_id
                     )
-                    select c.email
+                    select c.contact_id, c.email
                     from c
                     join l on c.contact_id = l.contact_id
                 """,
                     *values,
-                ):
+                ).fetchall():
+                    added_contact_ids.append(contact_id)
                     count += 1
                     domain = email.split("@")[1]
                     domaincounts[domain] = domaincounts.get(domain, 0) + 1
 
-                    webhook_msgs.append(
-                        {
-                            "type": "list_add",
-                            "list": listid,
-                            "email": email,
-                            "timestamp": datetime.utcnow().isoformat() + "Z",
-                        }
-                    )
+                    if webhook_count > 0:
+                        webhook_msgs.append(
+                            {
+                                "type": "list_add",
+                                "list": listid,
+                                "email": email,
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                            }
+                        )
+                if exit_interest and added_contact_ids:
+                    execute_exit_rule_change(db, cid, "list_ids", listid, "list_joined",
+                        "select unnest(%s::integer[]) as contact_id", added_contact_ids)
+
             else:
                 for domain, domaincount in db.execute(
                     f"""
@@ -1654,11 +2093,7 @@ def write_rows(
                     domaincounts[domain] = domaincount
 
             if len(override_emails):
-                db.execute(
-                    "delete from unsublogs where cid = %s and email = any(%s)",
-                    cid,
-                    override_emails,
-                )
+                clear_unsublogs(db, cid, override_emails)
 
     if len(webhook_msgs):
         send_webhooks(db, cid, webhook_msgs)
@@ -2110,40 +2545,19 @@ def remove_tag_all_bucket(cid: str, hashval: int, hashlimit: int, tag: str) -> N
             )
             webhook_msgs = []
 
-            if not webhook_count:
-                db.execute(
-                    f"""
-                    delete from contacts."contact_values_{cid}"
+            changed = execute_exit_rule_change(db, cid, "tags", tag, "tag_removed",
+                f"""delete from contacts."contact_values_{cid}"
                     where type = 'tag' and value = %s
                     and ({hashlimit} = 1 or mod(contact_id, {hashlimit}) = %s)
-                """,
-                    tag,
-                    hashval,
-                )
-            else:
+                    returning contact_id""", tag, hashval)
+            if webhook_count and changed:
                 for (email,) in db.execute(
-                    f"""
-                    with d as (
-                        delete from contacts."contact_values_{cid}"
-                        where type = 'tag' and value = %s
-                        and ({hashlimit} = 1 or mod(contact_id, {hashlimit}) = %s)
-                        returning contact_id
-                    )
-                    select c.email from contacts."contacts_{cid}" c
-                    join d on d.contact_id = c.contact_id
-                    where ({hashlimit} = 1 or mod(c.contact_id, {hashlimit}) = %s)
-                """,
-                    tag,
-                    hashval,
-                ):
-                    webhook_msgs.append(
-                        {
-                            "type": "tag_remove",
-                            "tag": tag,
-                            "email": email,
-                            "timestamp": datetime.utcnow().isoformat() + "Z",
-                        }
-                    )
+                    f'select email from contacts."contacts_{cid}" where contact_id=any(%s)',
+                    [row[0] for row in changed]).fetchall():
+                    webhook_msgs.append({
+                        "type": "tag_remove", "tag": tag, "email": email,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                    })
 
             if len(webhook_msgs):
                 send_webhooks(db, cid, webhook_msgs)

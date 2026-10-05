@@ -129,13 +129,13 @@ def cleanup_db() -> None:
 
             file_retention_days = int(os.environ.get("file_retention_days", 90))
 
-            s3_delete_all(
-                os.environ["s3_transferbucket"],
-                time.time() - (file_retention_days * 24 * 60 * 60),
-            )
-            s3_delete_all(
-                os.environ["s3_databucket"],
-                time.time() - (file_retention_days * 24 * 60 * 60),
-            )
+            for bucket_name in ("s3_transferbucket", "s3_databucket"):
+                summary = s3_delete_all(
+                    os.environ[bucket_name],
+                    time.time() - (file_retention_days * 24 * 60 * 60),
+                )
+                report = log.warning if summary["errors"] or summary["truncated"] else log.info
+                report("File age cleanup %s: %s", bucket_name, summary)
+
         except:
             log.exception("error")

@@ -8,27 +8,48 @@ import MenuNavbar from "../components/MenuNavbar";
 import { EDTableSection, EDTabs } from "../components/EDDOM";
 import moment from "moment";
 import notify from "../utils/notify";
+import { serializeDatetimeFilterValue } from "../utils/transactionalLog";
 
 import "./TransactionalLog.css";
 
 export default class TransactionalLog extends Component {
   constructor(props) {
     super(props);
+    this.reloadRequest = 0;
     this.state = {
       isLoading: false,
       data: null,
-      page: 1
+      page: 1,
+      search: "",
+      start: "",
+      end: ""
     };
   }
 
   async reload() {
+    const requestId = ++this.reloadRequest;
     this.setState({isLoading: true});
-    var data = await axios.get('/api/transactional/log', {
-      params: {
-        page: this.state.page
+    try {
+      var data = await axios.get('/api/transactional/log', {
+        params: {
+          page: this.state.page,
+          search: this.state.search,
+          start: serializeDatetimeFilterValue(this.state.start),
+          end: serializeDatetimeFilterValue(this.state.end)
+        }
+      });
+      if (requestId === this.reloadRequest) {
+        this.setState({data: data.data});
       }
-    });
-    this.setState({isLoading: false, data: data.data});
+    } catch (error) {
+      if (requestId === this.reloadRequest) {
+        notify.show('Unable to load the transactional log', 'error');
+      }
+    } finally {
+      if (requestId === this.reloadRequest) {
+        this.setState({isLoading: false});
+      }
+    }
   }
 
   previous = () => {
@@ -53,6 +74,22 @@ export default class TransactionalLog extends Component {
     this.setState({page: num}, () => this.reload());
   }
 
+  updateSearch = e => {
+    this.setState({search: e.target.value, page: 1}, () => this.reload());
+  }
+
+  updateStart = e => {
+    this.setState({start: e.target.value, page: 1}, () => this.reload());
+  }
+
+  updateEnd = e => {
+    this.setState({end: e.target.value, page: 1}, () => this.reload());
+  }
+
+  clearFilters = () => {
+    this.setState({search: '', start: '', end: '', page: 1}, () => this.reload());
+  }
+
   switchView = url => {
     this.props.history.push(url);
   }
@@ -67,6 +104,12 @@ export default class TransactionalLog extends Component {
     }
   }
 
+  displayStatus = l => {
+    if (l.error) return l.error;
+    if (l.event === 'Injection' && l.status === 'Accepted') return 'Queued';
+    return l.status || 'OK';
+  }
+
   exportClicked = async () => {
     await axios.post('/api/transactional/log/export');
 
@@ -74,6 +117,7 @@ export default class TransactionalLog extends Component {
   }
 
   maxPage = () => {
+    if (!this.state.data || !this.state.data.total) return 1;
     return Math.ceil(this.state.data.total / this.state.data.page_size);
   }
 
@@ -95,8 +139,38 @@ export default class TransactionalLog extends Component {
             </EDTabs>
           }
         />
-        <LoaderPanel isLoading={this.props.isLoading}>
-          <EDTableSection className="white-table-section">
+        <EDTableSection className="white-table-section">
+            <div className="log-toolbar">
+              <div className="log-search-field">
+                <label className="control-label">Search</label>
+                <FormControl
+                  type="text"
+                  value={this.state.search}
+                  placeholder="Search by to, from, or subject"
+                  onChange={this.updateSearch}
+                />
+              </div>
+              <div className="log-date-field">
+                <label className="control-label">From</label>
+                <FormControl
+                  type="datetime-local"
+                  value={this.state.start}
+                  onChange={this.updateStart}
+                  placeholder="YYYY-MM-DD HH:MM"
+                />
+              </div>
+              <div className="log-date-field">
+                <label className="control-label">To</label>
+                <FormControl
+                  type="datetime-local"
+                  value={this.state.end}
+                  onChange={this.updateEnd}
+                  placeholder="YYYY-MM-DD HH:MM"
+                />
+              </div>
+              <Button className="log-clear-button" onClick={this.clearFilters} disabled={!this.state.search && !this.state.start && !this.state.end}>Clear</Button>
+            </div>
+          <LoaderPanel isLoading={this.state.isLoading}>
           {
             (this.state.data && this.state.data.records && this.state.data.records.length) ?
               <div>
@@ -139,7 +213,7 @@ export default class TransactionalLog extends Component {
                             {moment(l.ts).format('l LTS')}
                           </td>
                           <td>
-                            {l.error || l.status || 'OK'}
+                            {this.displayStatus(l)}
                           </td>
                           <td className="text-center">
                             {l.open ? <i className="fa fa-check-square-o" /> : ''}
@@ -182,12 +256,12 @@ export default class TransactionalLog extends Component {
               </div>
               :
               <div className="text-center space-top-sm">
-                <h4>No transactional messages found!</h4>
-                <h5>When you send them, your most recent transactional messages will appear here.</h5>
+                <h4>{this.state.search.trim() || this.state.start || this.state.end ? 'No transactional messages matched your filters.' : 'No transactional messages found!'}</h4>
+                <h5>{this.state.search.trim() || this.state.start || this.state.end ? 'Try a different email address, subject, or date/time range.' : 'When you send them, your most recent transactional messages will appear here.'}</h5>
               </div>
           }
-          </EDTableSection>
-        </LoaderPanel>
+          </LoaderPanel>
+        </EDTableSection>
       </MenuNavbar>
     );
   }
