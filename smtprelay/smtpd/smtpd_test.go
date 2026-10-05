@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chrj/smtpd"
+	"smtprelay/smtpd"
 )
 
 var localhostCert = []byte(`-----BEGIN CERTIFICATE-----

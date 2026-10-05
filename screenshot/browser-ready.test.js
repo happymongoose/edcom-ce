@@ -1,0 +1,35 @@
+const assert = require('assert');
+const ready = require('./browser-ready');
+(async () => {
+  const tabs = [{id: 'local-tab', type: 'page'}];
+  let calls = 0, clock = 0;
+  const options = {now: () => clock, sleep: async ms => { clock += ms; }};
+  assert.deepStrictEqual(await ready(async () => tabs, options), tabs);
+  assert.strictEqual(clock, 0);
+  const refusal = new Error('ECONNREFUSED');
+  assert.deepStrictEqual(await ready(async () => {
+    calls += 1;
+    if (calls < 3) throw refusal;
+    return tabs;
+  }, options), tabs);
+  assert.strictEqual(calls, 3);
+  assert.strictEqual(clock, 200);
+  clock = 0;
+  await assert.rejects(ready(async () => { throw refusal; }, options), /ECONNREFUSED/);
+  assert.strictEqual(clock, 5000);
+  clock = 0;
+  await assert.rejects(ready(async () => [], options), /within 5 seconds/);
+  assert.strictEqual(clock, 5000);
+  clock = 0;
+  await assert.rejects(ready(async () => [], {...options, timeout: 120000}), /within 120 seconds/);
+  assert.strictEqual(clock, 120000);
+  clock = 0;
+  assert.deepStrictEqual(await ready(async () => clock < 10000 ? [] : tabs, {...options, timeout: 120000}), tabs);
+  assert.strictEqual(clock, 10000);
+  clock = 0;
+  const background = [{id: 'extension', type: 'background_page'}, {id: 'browser', type: 'browser_ui'}];
+  assert.deepStrictEqual(await ready(async () => background.concat(tabs), options), tabs);
+  await assert.rejects(ready(async () => background, options), /within 5 seconds/);
+  assert.strictEqual(clock, 5000);
+  console.log('Eight browser-readiness checks passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });

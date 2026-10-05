@@ -199,7 +199,14 @@ def check_send_limit(
     domain: str,
     domainthrottles: List[JsonObj],
     requested: int,
+    *,
+    transactional: bool = False,
 ) -> int:
+    # Static headroom inside the existing limits, never additional allowance.
+    # Reject bad configuration rather than silently disabling protection.
+    reserve_pct = int(os.environ.get("transactional_reserve_percent", "0"))
+    if not 0 <= reserve_pct <= 100:
+        raise ValueError("transactional_reserve_percent must be between 0 and 100")
     cid = company["id"]
     minlimit = fix_empty_limit(company.get("minlimit"))
     hourlimit = fix_empty_limit(company.get("hourlimit"))
@@ -441,8 +448,25 @@ def check_send_limit(
                 if persendlimit is not None:
                     allowed = min(allowed, persendlimit)
 
+                if reserve_pct and not transactional:
+                    # Shared counters are WATCHed above: concurrent schedulers cannot
+                    # spend the protected headroom or exceed the underlying cap.
+                    # Count transactional usage too; do not reclaim its headroom.
+                    for limit, count in (
+                        (minlimit, mincnt), (hourlimit, hourcnt),
+                        (daylimit, daycnt), (monthlimit, monthcnt),
+                        (domainminlimit, domainmincnt),
+                        (domainhourlimit, domainhourcnt),
+                        (domaindaylimit, domaindaycnt),
+                    ):
+                        if limit is not None and count is not None:
+                            reserved = (limit * reserve_pct + 99) // 100
+                            allowed = min(allowed, max(0, limit - reserved - count))
+
                 log.debug("requested = %s, allowed = %s", requested, allowed)
                 result = min(requested, allowed)
+                if result <= 0:
+                    return 0
 
                 if paid:
                     creditcnt -= result
@@ -941,6 +965,10 @@ def update_sink_camp(db: DB, sinkid: str, camp: JsonObj, html: str) -> None:
     r.raise_for_status()
 
 
+class MailNotSentError(Exception):
+    """A definite local rejection before a delivery backend was invoked."""
+
+
 def send_backend_mail(
     db: DB,
     usercid: str,
@@ -1020,7 +1048,7 @@ def send_backend_mail(
         db.set_cid(oldcid)
 
     if obj is None:
-        raise Exception(
+        raise MailNotSentError(
             "You must delete Drop All Mail from your postal route to send this message"
         )
 

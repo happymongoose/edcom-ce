@@ -1,0 +1,22 @@
+# Explicit opt-in production overlay. Start consumer before enabling producer
+# routing in config/edcom.json; see docs/interactive-queue.md and
+# docs/transactional-queue.md. Each flag is independent.
+services:
+  tasks:
+    environment:
+      EDCOM_CELERY_CONCURRENCY: "${EDCOM_BULK_CONCURRENCY:-1}"
+    command: sh -c '/scripts/run_db_migrations.py && celery -A api.app.tasks worker --loglevel=INFO --hostname=bulk@%h --queues=celery --concurrency `/scripts/num_tasks.py celery` -f /logs/app.log'
+  tasks-interactive:
+    extends:
+      file: docker-compose.yml
+      service: tasks
+    environment:
+      EDCOM_CELERY_CONCURRENCY: "${EDCOM_INTERACTIVE_CONCURRENCY:-1}"
+    command: sh -c '/scripts/run_db_migrations.py && celery -A api.app.tasks worker --loglevel=INFO --hostname=interactive@%h --queues=interactive --concurrency `/scripts/num_tasks.py celery` -f /logs/app.log'
+  tasks-transactional:
+    extends:
+      file: docker-compose.yml
+      service: tasks
+    environment:
+      EDCOM_CELERY_CONCURRENCY: "${EDCOM_TRANSACTIONAL_CONCURRENCY:-1}"
+    command: sh -c '/scripts/run_db_migrations.py && celery -A api.app.tasks worker --loglevel=INFO --hostname=transactional@%h --queues=transactional --concurrency `/scripts/num_tasks.py celery` -f /logs/app.log'

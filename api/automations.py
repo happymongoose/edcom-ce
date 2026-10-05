@@ -1,5 +1,7 @@
 import falcon
+from . import automation_subject_tests as subject_tests
 import copy
+import hashlib
 import email.utils
 import json
 import logging
@@ -7,7 +9,10 @@ import os
 import re
 import shortuuid
 import traceback
+import time
 import dateutil.parser
+from contextlib import contextmanager, nullcontext
+from functools import wraps
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
 from html import unescape as html_unescape
@@ -28,12 +33,13 @@ from .shared.db import DB, JsonObj, json_iter, json_obj, open_db
 from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.utils import user_log
 from .shared.utils import emailre
+from . import automation_exit_rules as exit_rules
 from .shared.utils import fix_tag
 from .shared.utils import is_true
 from .shared.utils import generate_html, remove_newlines
 from .shared.utils import check_automation_diagnostics
 from .shared.utils import gather_init, gather_complete, gather_check, run_task
-from .shared.send import check_test_limit, send_backend_mail, validate_sender_domains
+from .shared.send import check_test_limit, send_backend_mail, validate_sender_domains, MailNotSentError
 from .transactional import add_test_txn_log
 from .shared.segments import (
     Cache,
@@ -176,7 +182,8 @@ NODE_ID_SCHEMA = {
 
 ADD_TAG_NODE_SCHEMA = {
     "type": "object",
-    "required": ["id", "type", "label", "draft_tag"],
+    "required": ["id", "type", "label"],
+    "oneOf": [{"required": ["draft_tag"]}, {"required": ["draft_tags"]}],
     "properties": {
         "id": NODE_ID_SCHEMA,
         "type": {
@@ -188,6 +195,7 @@ ADD_TAG_NODE_SCHEMA = {
             "minLength": 1,
             "maxLength": 1024,
         },
+        "draft_tags": {"type": "array", "maxItems": 100, "uniqueItems": True, "items": {"type": "string", "maxLength": 1024}},
         "draft_tag": {
             "type": "string",
             "maxLength": 1024,
@@ -199,7 +207,8 @@ ADD_TAG_NODE_SCHEMA = {
 
 REMOVE_TAG_NODE_SCHEMA = {
     "type": "object",
-    "required": ["id", "type", "label", "draft_tag"],
+    "required": ["id", "type", "label"],
+    "oneOf": [{"required": ["draft_tag"]}, {"required": ["draft_tags"]}],
     "properties": {
         "id": NODE_ID_SCHEMA,
         "type": {
@@ -211,6 +220,7 @@ REMOVE_TAG_NODE_SCHEMA = {
             "minLength": 1,
             "maxLength": 1024,
         },
+        "draft_tags": {"type": "array", "maxItems": 100, "uniqueItems": True, "items": {"type": "string", "maxLength": 1024}},
         "draft_tag": {
             "type": "string",
             "maxLength": 1024,
@@ -222,7 +232,8 @@ REMOVE_TAG_NODE_SCHEMA = {
 
 ADD_TO_LIST_NODE_SCHEMA = {
     "type": "object",
-    "required": ["id", "type", "label", "list_id"],
+    "required": ["id", "type", "label"],
+    "oneOf": [{"required": ["list_id"]}, {"required": ["list_ids"]}],
     "properties": {
         "id": NODE_ID_SCHEMA,
         "type": {
@@ -234,6 +245,7 @@ ADD_TO_LIST_NODE_SCHEMA = {
             "minLength": 1,
             "maxLength": 1024,
         },
+        "list_ids": {"type": "array", "maxItems": 100, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
         "list_id": {
             "type": "string",
             "maxLength": 64,
@@ -245,7 +257,8 @@ ADD_TO_LIST_NODE_SCHEMA = {
 
 REMOVE_FROM_LIST_NODE_SCHEMA = {
     "type": "object",
-    "required": ["id", "type", "label", "list_id"],
+    "required": ["id", "type", "label"],
+    "oneOf": [{"required": ["list_id"]}, {"required": ["list_ids"]}],
     "properties": {
         "id": NODE_ID_SCHEMA,
         "type": {
@@ -257,10 +270,37 @@ REMOVE_FROM_LIST_NODE_SCHEMA = {
             "minLength": 1,
             "maxLength": 1024,
         },
+        "list_ids": {"type": "array", "maxItems": 100, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
         "list_id": {
             "type": "string",
             "maxLength": 64,
         },
+    },
+    "additionalProperties": False,
+}
+
+
+ENROL_AUTOMATION_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "automation_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {"enum": ["enrol_automation"]},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "automation_id": {"type": "string", "maxLength": 64},
+    },
+    "additionalProperties": False,
+}
+
+
+REMOVE_AUTOMATION_NODE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "type", "label", "automation_id"],
+    "properties": {
+        "id": NODE_ID_SCHEMA,
+        "type": {"enum": ["remove_automation"]},
+        "label": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "automation_id": {"type": "string", "maxLength": 64},
     },
     "additionalProperties": False,
 }
@@ -289,7 +329,8 @@ WAIT_DURATION_SCHEMA = {
 
 WAIT_DURATION_NODE_SCHEMA = {
     "type": "object",
-    "required": ["id", "type", "label", "duration"],
+    "required": ["id", "type", "label"],
+    "oneOf": [{"required": ["duration"]}, {"required": ["wait_until"]}],
     "properties": {
         "id": NODE_ID_SCHEMA,
         "type": {
@@ -302,6 +343,7 @@ WAIT_DURATION_NODE_SCHEMA = {
             "maxLength": 1024,
         },
         "duration": WAIT_DURATION_SCHEMA,
+        "wait_until": {"type": "string", "maxLength": 64},
     },
     "additionalProperties": False,
 }
@@ -365,7 +407,7 @@ CONDITION_ITEM_SCHEMA = {
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["opened_email"],
+                    "enum": ["opened_email", "not_opened_email"],
                 },
                 "automation_email_id": {
                     "type": "string",
@@ -380,7 +422,7 @@ CONDITION_ITEM_SCHEMA = {
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["clicked_email"],
+                    "enum": ["clicked_email", "not_clicked_email"],
                 },
                 "automation_email_id": {
                     "type": "string",
@@ -436,6 +478,25 @@ CONDITION_ITEM_SCHEMA = {
         },
     ],
 }
+
+
+# Preserve singular draft definitions; plural predicates match ANY (or NONE when negative).
+for condition_type, field, max_length in (
+    ("has_tag", "tags", 1024),
+    ("missing_tag", "tags", 1024),
+    ("in_list", "list_ids", 64),
+    ("not_in_list", "list_ids", 64),
+):
+    CONDITION_ITEM_SCHEMA["oneOf"].append({
+        "type": "object",
+        "required": ["type", field],
+        "properties": {
+            "type": {"type": "string", "enum": [condition_type]},
+            field: {"type": "array", "maxItems": 100, "uniqueItems": True,
+                    "items": {"type": "string", "maxLength": max_length}},
+        },
+        "additionalProperties": False,
+    })
 
 
 CONDITION_GROUP_SCHEMA = {
@@ -691,10 +752,30 @@ ENTRY_SCHEMA = {
 }
 
 
+MOVE_PLACEMENT_SCHEMA = {
+    "type": "object", "required": ["previous", "next", "incoming"],
+    "properties": {
+        "previous": {"type": ["string", "null"]}, "next": {"type": ["string", "null"]},
+        "incoming": {"type": "array", "items": {
+            "type": "object", "required": ["id", "field"],
+            "properties": {"id": NODE_ID_SCHEMA, "field": {"enum": ["yes_node_id", "no_node_id", "target_node_id"]}},
+            "additionalProperties": False,
+        }},
+    }, "additionalProperties": False,
+}
+
 DRAFT_SCHEMA = {
     "type": "object",
     "required": ["nodes"],
     "properties": {
+        "moves": {"type": "object", "propertyNames": NODE_ID_SCHEMA, "additionalProperties": {
+            "type": "object", "required": ["action", "published_revision", "placement"],
+            "properties": {
+                "action": {"enum": ["follow", "exit"]},
+                "published_revision": {"type": "integer", "minimum": 1},
+                "placement": MOVE_PLACEMENT_SCHEMA,
+            }, "additionalProperties": False,
+        }},
         "nodes": {
             "type": "array",
             "items": {
@@ -703,6 +784,8 @@ DRAFT_SCHEMA = {
                     REMOVE_TAG_NODE_SCHEMA,
                     ADD_TO_LIST_NODE_SCHEMA,
                     REMOVE_FROM_LIST_NODE_SCHEMA,
+                    ENROL_AUTOMATION_NODE_SCHEMA,
+                    REMOVE_AUTOMATION_NODE_SCHEMA,
                     WAIT_DURATION_NODE_SCHEMA,
                     IF_HAS_TAG_NODE_SCHEMA,
                     IF_MISSING_TAG_NODE_SCHEMA,
@@ -716,6 +799,43 @@ DRAFT_SCHEMA = {
         },
     },
     "additionalProperties": False,
+}
+
+
+# State predicates, not historical events: matching any rule both exits and
+# excludes a contact. Change events will prompt evaluation of these predicates.
+EXIT_RULES_SCHEMA = {
+    "type": "array",
+    "maxItems": 20,
+    "items": {
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["type", "tags"],
+                "properties": {
+                    "type": {"enum": ["has_tag", "missing_tag"]},
+                    "tags": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    },
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["type", "list_ids"],
+                "properties": {
+                    "type": {"enum": ["in_list", "not_in_list"]},
+                    "list_ids": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 64},
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ],
+    },
 }
 
 
@@ -752,7 +872,42 @@ AUTOMATION_PATCH_SCHEMA = {
         },
         "reentry": REENTRY_SCHEMA,
         "entry": ENTRY_SCHEMA,
+        "exit_rules": EXIT_RULES_SCHEMA,
         "draft": DRAFT_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+
+AUTOMATION_PUBLISH_SCHEMA = {
+    "type": "object",
+    "required": ["request_id", "review", "resolutions"],
+    "properties": {
+        "request_id": NODE_ID_SCHEMA,
+        "accept_exit_rules": {"const": True},
+        "review": {
+            "type": "object",
+            "required": ["draft_fingerprint", "published_fingerprint", "published_revision"],
+            "properties": {
+                "draft_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "published_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "published_revision": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        "resolutions": {
+            "type": "object",
+            "propertyNames": NODE_ID_SCHEMA,
+            "additionalProperties": {
+                "oneOf": [
+                    {"type": "object", "required": ["action", "destination_node_id"],
+                     "properties": {"action": {"const": "move"}, "destination_node_id": NODE_ID_SCHEMA},
+                     "additionalProperties": False},
+                    {"type": "object", "required": ["action"],
+                     "properties": {"action": {"const": "exit"}}, "additionalProperties": False},
+                ],
+            },
+        },
     },
     "additionalProperties": False,
 }
@@ -1002,6 +1157,26 @@ def _validate_doc(doc: JsonObj, schema: JsonObj) -> None:
         raise falcon.HTTPBadRequest(title="Input validation error", description=str(e))
 
 
+def _validate_unique_node_ids(nodes: list[JsonObj], title: str = "Input validation error") -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for node in nodes:
+        # Draft/publish callers already validate the schema. Avoid coercing IDs
+        # while checking potentially malformed historical published snapshots.
+        node_id = node.get("id") if isinstance(node, dict) else None
+        if not isinstance(node_id, str):
+            continue
+        if node_id in seen:
+            duplicates.add(node_id)
+        seen.add(node_id)
+    if duplicates:
+        ids = ", ".join(json.dumps(node_id) for node_id in sorted(duplicates))
+        raise falcon.HTTPBadRequest(
+            title=title,
+            description=_bounded_error_text("Automation node IDs must be unique. Duplicate IDs: %s." % ids),
+        )
+
+
 def _utc_now() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
@@ -1118,6 +1293,29 @@ def _published_entry(entry: JsonObj) -> JsonObj:
     }
 
 
+def _action_lists(node: JsonObj) -> list[str]:
+    # Drafts may be incomplete; executable actions require a nonempty exact ID set.
+    if "list_ids" in node and "list_id" in node:
+        return []
+    ids = node.get("list_ids") if "list_ids" in node else [node.get("list_id")]
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 100:
+        return []
+    if any(not isinstance(value, str) or not value or len(value) > 64 for value in ids):
+        return []
+    return ids if len(set(ids)) == len(ids) else []
+
+
+def _action_tags(node: JsonObj) -> list[str]:
+    # Legacy singular configurations retain their exact spelling and behaviour.
+    if "draft_tags" not in node:
+        tag = node.get("draft_tag")
+        return [tag] if isinstance(tag, str) and tag else []
+    tags = node["draft_tags"]
+    if not isinstance(tags, list) or len(tags) > 100 or any(not isinstance(tag, str) or not tag.strip() or len(tag) > 1024 for tag in tags):
+        return []
+    return list(dict.fromkeys(tags))
+
+
 def _validate_tag_condition_node(node: JsonObj, node_ids: set[str], label: str) -> None:
     if not node.get("draft_tag"):
         _validation_error("%s nodes must have draft tag configuration." % label)
@@ -1135,6 +1333,16 @@ def _validate_branch_targets(node: JsonObj, node_ids: set[str], label: str) -> N
         _validation_error("%s no target must exist in the draft workflow." % label)
     if node.get("yes_node_id") == node.get("id") or node.get("no_node_id") == node.get("id"):
         _validation_error("%s nodes cannot target themselves." % label)
+
+
+def _condition_selection(item: JsonObj, singular: str, plural: str) -> list[str]:
+    values = item.get(plural) if plural in item else [item.get(singular)]
+    if (not isinstance(values, list) or not values or len(values) > 100
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+            or len(set(values)) != len(values)
+            or (plural in item and singular in item)):
+        _validation_error("Condition must select between 1 and 100 distinct %s." % plural)
+    return values
 
 
 def _validate_conditions_node(db: DB, automation: JsonObj, node: JsonObj, node_ids: set[str]) -> None:
@@ -1155,9 +1363,10 @@ def _validate_conditions_node(db: DB, automation: JsonObj, node: JsonObj, node_i
         if item_type == "group":
             _validation_error("Nested condition groups are not supported yet.")
         if item_type in ("has_tag", "missing_tag"):
-            if not (item.get("tag") or "").strip():
+            if "tags" not in item and not (item.get("tag") or "").strip():
                 _validation_error("%s must select a tag." % label)
-        elif item_type in ("opened_email", "clicked_email"):
+            _condition_selection(item, "tag", "tags")
+        elif item_type in ("opened_email", "not_opened_email", "clicked_email", "not_clicked_email"):
             automation_email_id = item.get("automation_email_id")
             if not automation_email_id:
                 _validation_error("%s must select an automation email." % label)
@@ -1168,20 +1377,34 @@ def _validate_conditions_node(db: DB, automation: JsonObj, node: JsonObj, node_i
                 automation_email_id,
             ):
                 _validation_error("%s must reference an email from this automation." % label)
-            if item_type == "clicked_email":
+            if item_type in ("clicked_email", "not_clicked_email"):
                 click_match = _automation_click_match_mode(item.get("click_match"))
                 if click_match not in ("any", "url_exact", "url_prefix"):
                     _validation_error("%s has an unsupported click match mode." % label)
                 if click_match in ("url_exact", "url_prefix") and not _normalize_automation_click_url(item.get("link_url")):
                     _validation_error("%s URL conditions must have a link URL." % label)
         elif item_type in ("in_list", "not_in_list"):
-            list_id = item.get("list_id")
-            if not list_id:
+            if "list_ids" not in item and not item.get("list_id"):
                 _validation_error("%s must select a contact list." % label)
-            if db.lists.get(list_id) is None:
-                _validation_error("%s must reference a contact list from this account." % label)
+            for list_id in _condition_selection(item, "list_id", "list_ids"):
+                if db.lists.get(list_id) is None:
+                    _validation_error("%s must reference a contact list from this account." % label)
         else:
             _validation_error("%s has an unsupported condition type." % label)
+
+
+def _wait_deadline(value: Any) -> datetime:
+    try:
+        parsed = dateutil.parser.isoparse(value)
+        if parsed.tzinfo is None:
+            raise ValueError("Timezone required")
+        return parsed.astimezone(tzutc()).replace(tzinfo=None)
+    except (ValueError, TypeError, OverflowError):
+        _validation_error("Wait until must be a valid date and time including its UTC offset.")
+
+
+def _compatible_wait(old: JsonObj, new: JsonObj) -> bool:
+    return new.get("type") == "wait_duration" and ("wait_until" in old) == ("wait_until" in new)
 
 
 def _duration_minutes(duration: JsonObj) -> int:
@@ -1228,64 +1451,6 @@ def _automation_email_exists(db: DB, cid: str, automation_id: str, email_id: str
             email_id,
         )
     )
-
-
-def _node_display(node: JsonObj, node_positions: dict[str, int]) -> str:
-    node_id = node.get("id", "")
-    step = node_positions.get(node_id, -1) + 1
-    label = (node.get("label") or node.get("type") or node_id).strip()
-    if step > 0:
-        return "Step %s %s" % (step, label)
-    return label
-
-
-def _workflow_edges(nodes: list[JsonObj]) -> dict[str, list[str]]:
-    edges = {}
-    for index, node in enumerate(nodes):
-        node_id = node.get("id")
-        node_type = node.get("type")
-        if node_type == "exit":
-            edges[node_id] = []
-        elif node_type == "go_to":
-            edges[node_id] = [node.get("target_node_id")]
-        elif node_type in ("if_has_tag", "if_missing_tag", "if_conditions", "if_opened_email", "if_clicked_email"):
-            edges[node_id] = [node.get("yes_node_id"), node.get("no_node_id")]
-        elif index + 1 < len(nodes):
-            edges[node_id] = [nodes[index + 1].get("id")]
-        else:
-            edges[node_id] = []
-    return edges
-
-
-def _validate_no_workflow_cycles(nodes: list[JsonObj], node_positions: dict[str, int]) -> None:
-    node_map = {node.get("id"): node for node in nodes}
-    edges = _workflow_edges(nodes)
-    states: dict[str, str] = {}
-    stack: list[str] = []
-
-    def visit(node_id: str) -> None:
-        state = states.get(node_id)
-        if state == "visited":
-            return
-        if state == "visiting":
-            start = stack.index(node_id)
-            cycle_ids = stack[start:] + [node_id]
-            cycle = " -> ".join(
-                _node_display(node_map[cycle_id], node_positions)
-                for cycle_id in cycle_ids
-            )
-            _validation_error("Workflow contains a cycle: %s." % cycle)
-
-        states[node_id] = "visiting"
-        stack.append(node_id)
-        for target_id in edges.get(node_id, []):
-            if target_id in node_map:
-                visit(target_id)
-        stack.pop()
-        states[node_id] = "visited"
-
-    for node in nodes:
-        visit(node.get("id"))
 
 
 def _contact_has_tag(db: DB, cid: str, contact_id: int, tag: str) -> bool:
@@ -1410,6 +1575,7 @@ def _add_contact_to_list(
     automation_trigger_source: JsonObj | None = None,
     automation_trigger_correlation_id: str | None = None,
     automation_trigger_depth: int = 0,
+    strict_events: bool = False,
 ) -> JsonObj:
     lst = db.lists.get(list_id)
     if lst is None:
@@ -1469,6 +1635,8 @@ def _add_contact_to_list(
                 automation_trigger_depth,
             )
         except Exception:
+            if strict_events:
+                raise
             log.exception("Error creating automation list_joined trigger event")
 
     return {
@@ -1487,6 +1655,7 @@ def _remove_contact_from_list(
     automation_trigger_source: JsonObj | None = None,
     automation_trigger_correlation_id: str | None = None,
     automation_trigger_depth: int = 0,
+    strict_events: bool = False,
 ) -> JsonObj:
     lst = db.lists.get(list_id)
     if lst is None:
@@ -1557,6 +1726,8 @@ def _remove_contact_from_list(
                     automation_trigger_depth,
                 )
             except Exception:
+                if strict_events:
+                    raise
                 log.exception("Error creating automation list_left trigger event")
 
     return {
@@ -1566,11 +1737,58 @@ def _remove_contact_from_list(
     }
 
 
+def _prepare_exit_rules(rules: list[JsonObj]) -> list[JsonObj]:
+    """Canonicalise tag spelling; list IDs retain exact, case-sensitive values."""
+    _validate_doc(rules, EXIT_RULES_SCHEMA)
+    prepared = copy.deepcopy(rules)
+    for rule in prepared:
+        if rule["type"] in ("has_tag", "missing_tag"):
+            tags = [fix_tag(tag) for tag in rule["tags"]]
+            if any(not tag for tag in tags):
+                raise falcon.HTTPBadRequest(title="Input validation error",
+                    description="Exit rules must select nonempty tags.")
+            rule["tags"] = list(dict.fromkeys(tags))
+        elif any(not value.strip() for value in rule["list_ids"]):
+            raise falcon.HTTPBadRequest(title="Input validation error",
+                description="Exit rules must select nonempty list IDs.")
+    return prepared
+
+
+def _validate_publish_exit_rules(db: DB, rules: list[JsonObj]) -> None:
+    prepared = _prepare_exit_rules(rules)
+    for rule in prepared:
+        for list_id in rule.get("list_ids", []):
+            if db.lists.get(list_id) is None:
+                _validation_error("Exit rules must reference contact lists from this account.")
+
+
+def _automation_publish_inputs(automation: JsonObj) -> JsonObj:
+    # Keep saved review identity and the authoritative publication path aligned.
+    inputs = {
+        "name": automation.get("name"),
+        "entry": automation.get("entry"),
+        "reentry": automation.get("reentry", "once"),
+        "draft": automation.get("draft"),
+    }
+    # Absent and explicitly empty rules both mean disabled. Preserve the review
+    # identity of existing workflows; every nonempty/invalid value is included.
+    if "exit_rules" in automation and automation["exit_rules"] != []:
+        inputs["exit_rules"] = automation["exit_rules"]
+    return inputs
+
+
+def _automation_fingerprint(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
-    if not automation.get("name") or not automation.get("name").strip():
+    inputs = _automation_publish_inputs(automation)
+    _validate_publish_exit_rules(db, inputs.get("exit_rules", []))
+    if not inputs["name"] or not inputs["name"].strip():
         _validation_error("Automation must have a name before publishing.")
 
-    entry = automation.get("entry")
+    entry = inputs["entry"]
     if entry is None:
         _validation_error("Automation entry is required.")
     _validate_doc(entry, ENTRY_SCHEMA)
@@ -1581,10 +1799,10 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
         if trigger.get("type") in ("segment_entered", "segment_left") and db.segments.get(trigger.get("segment_id")) is None:
             _validation_error("Segment entry trigger must reference a segment from this account.")
 
-    reentry = automation.get("reentry", "once")
+    reentry = inputs["reentry"]
     _validate_doc(reentry, REENTRY_SCHEMA)
 
-    draft = automation.get("draft")
+    draft = inputs["draft"]
     if draft is None:
         _validation_error("Automation draft workflow is required.")
     _validate_doc(draft, DRAFT_SCHEMA)
@@ -1592,6 +1810,7 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
     nodes = draft.get("nodes") or []
     if not nodes:
         _validation_error("Automation draft must contain at least one node.")
+    _validate_unique_node_ids(nodes, "Automation publish validation failed")
     node_positions = {node.get("id"): index for index, node in enumerate(nodes)}
     node_ids = set(node_positions.keys())
     for index, node in enumerate(nodes):
@@ -1599,19 +1818,24 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
             _validation_error("Every automation node must have a stable ID.")
         if not node.get("label") or not node.get("label").strip():
             _validation_error("Every automation node must have a label.")
-        if node.get("type") == "add_tag" and not node.get("draft_tag"):
+        if node.get("type") == "add_tag" and not _action_tags(node):
             _validation_error("Add tag nodes must have draft tag configuration.")
-        if node.get("type") == "remove_tag" and not node.get("draft_tag"):
+        if node.get("type") == "remove_tag" and not _action_tags(node):
             _validation_error("Remove tag nodes must have draft tag configuration.")
+        if node.get("type") == "remove_automation":
+            _remove_action_target(db, automation.get("id"), node.get("automation_id"))
+        if node.get("type") == "enrol_automation":
+            _enrol_action_target(db, automation.get("id"), node.get("automation_id"))
         if node.get("type") in ("add_to_list", "remove_from_list"):
-            list_id = node.get("list_id")
-            if not list_id:
+            list_ids = _action_lists(node)
+            if not list_ids:
                 _validation_error("%s nodes must select a contact list." % node.get("type"))
-            if db.lists.get(list_id) is None:
-                _validation_error(
-                    "%s node at step %s must reference a contact list from this account."
-                    % (node.get("type"), index + 1)
-                )
+            for list_id in list_ids:
+                if db.lists.get(list_id) is None:
+                    _validation_error(
+                        "%s node at step %s must reference a contact list from this account."
+                        % (node.get("type"), index + 1)
+                    )
         if node.get("type") == "if_has_tag":
             _validate_tag_condition_node(node, node_ids, "If has tag")
         if node.get("type") == "if_missing_tag":
@@ -1655,8 +1879,6 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
                 _validation_error("Go to target must exist in the draft workflow.")
             if target_node_id == node.get("id"):
                 _validation_error("Go to nodes cannot target themselves.")
-            if node_positions.get(target_node_id, -1) <= index:
-                _validation_error("Go to nodes must target a later node.")
         if node.get("type") == "send_email":
             automation_email_id = node.get("automation_email_id")
             if not automation_email_id:
@@ -1671,17 +1893,19 @@ def _published_snapshot(db: DB, automation: JsonObj) -> JsonObj:
                     "Send email node at step %s must reference an email from this automation."
                     % (index + 1)
                 )
-        if node.get("type") == "wait_duration":
+        if node.get("type") == "wait_duration" and "wait_until" in node:
+            _wait_deadline(node["wait_until"])
+        elif node.get("type") == "wait_duration":
             total_minutes = _duration_minutes(node.get("duration", {}))
             if total_minutes < 5:
                 _validation_error("Wait duration nodes must wait at least 5 minutes.")
             if total_minutes > 365 * 24 * 60:
                 _validation_error("Wait duration nodes cannot wait more than 365 days.")
-    _validate_no_workflow_cycles(nodes, node_positions)
     return {
         "entry": copy.deepcopy(entry),
         "reentry": reentry,
         "nodes": copy.deepcopy(nodes),
+        **({"exit_rules": _prepare_exit_rules(inputs["exit_rules"])} if inputs.get("exit_rules") else {}),
     }
 
 
@@ -1918,6 +2142,10 @@ def _node_references_automation_email(node: JsonObj, email_id: str) -> bool:
     return (
         node.get("email_id") == email_id
         or node.get("automation_email_id") == email_id
+        or (node.get("type") == "if_conditions" and any(
+            item.get("automation_email_id") == email_id
+            for item in (node.get("condition") or {}).get("items", [])
+        ))
     )
 
 
@@ -1956,6 +2184,169 @@ def _published_enrolment_context(automation: JsonObj) -> tuple[JsonObj, List[Jso
     return published, nodes, reentry
 
 
+def _enrol_action_target(db: DB, source_id: str, target_id: str) -> JsonObj:
+    if not isinstance(target_id, str) or not target_id or target_id == source_id:
+        _validation_error("Enrol in another automation must select a different automation.")
+    target = db.automations.get(target_id)
+    if not target or target.get("status") not in ("published", "paused"):
+        _validation_error("Enrol in another automation must target a published automation in this account.")
+    _, nodes, _ = _published_enrolment_context(target)
+    _validate_doc({"nodes": nodes}, DRAFT_SCHEMA)
+    _validate_unique_node_ids(nodes)
+    return target
+
+
+def _commit_automation_enrolment_action(db: DB, cid: str, source_id: str,
+        enrolment: JsonObj, node: JsonObj, claim_token: str, run_id: str,
+        success: JsonObj, update: JsonObj, visited: List[str], inherited: list) -> None:
+    """Target creation and source acknowledgement are one database-only action."""
+    target_id = node.get("automation_id")
+    if not isinstance(target_id, str) or not target_id or target_id == source_id:
+        _validation_error("Enrol in another automation must select a different automation.")
+    depth = _safe_int(enrolment.get("trigger_depth"), 0) + 1
+    if depth >= _automation_trigger_max_depth():
+        _validation_error("Cross-automation enrolment depth limit reached. Review the chain before resuming.")
+    try:
+        with db.transaction():
+            # Opposite-direction actions acquire both automation locks in the
+            # same order. Never run a destination action in this transaction.
+            for aid in sorted((source_id, target_id)):
+                if db.single("select id from automations where cid = %s and id = %s for update", cid, aid) is None:
+                    _validation_error("The source or target automation is no longer available in this account.")
+            current = db.row("select data from automation_enrolments where cid = %s and automation_id = %s and id = %s for update",
+                             cid, source_id, enrolment["id"])
+            if not current or current[0].get("claim_token") != claim_token:
+                raise falcon.HTTPConflict(title="Automation execution claim was lost",
+                    description="The source claim changed before target enrolment. No target enrolment was created.")
+            target = _enrol_action_target(db, source_id, target_id)
+            if db.single(f'select contact_id from contacts."contacts_{cid}" where contact_id = %s for update', enrolment["contact_id"]) is None:
+                _validation_error("The contact no longer exists in this account.")
+            outcome = _create_enrolment_for_contact_locked(db, cid, target_id, target,
+                enrolment["contact_id"], enrolment["contact_email"], "automation:%s" % enrolment["id"],
+                enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment["id"], depth)
+            if outcome["status"] == "enrolled":
+                trace = copy.deepcopy(inherited)
+                trace.extend([source_id, nid] for nid in visited if [source_id, nid] not in trace)
+                db.execute("update automation_enrolments set data = data || %s where cid = %s and id = %s",
+                    {"cross_automation_visits": trace, "source_automation_id": source_id,
+                     "source_enrolment_id": enrolment["id"], "source_node_id": node["id"],
+                     "source_step_run_id": run_id}, cid, outcome["enrolment_id"])
+            success.update({"action": "enrol_automation", "automation_id": target_id,
+                "outcome": outcome["status"], "reason": outcome.get("reason"),
+                "target_enrolment_id": outcome.get("enrolment_id") or outcome.get("existing_enrolment_id")})
+            source = db.automations.get(source_id)
+            if source.get("status") == "paused" and update["status"] == "ready":
+                update.update(status="paused_ready", paused_at=source.get("paused_at") or _utc_now())
+            _patch_step_run(db, cid, run_id, success)
+            _advance_claimed_enrolment(db, cid, source_id, enrolment["id"], claim_token, update)
+    except falcon.HTTPError:
+        raise
+    except Exception:
+        log.exception("Cross-automation enrolment transaction failed")
+        raise falcon.HTTPBadRequest(title="Automation enrolment action failed",
+            description="No target enrolment or source advancement was committed. The source is held for review.")
+
+
+def _remove_action_target(db: DB, source_id: str, target_id: str) -> JsonObj:
+    if not isinstance(target_id, str) or not target_id or target_id == source_id:
+        _validation_error("Remove from another automation must select a different automation.")
+    target = db.automations.get(target_id)
+    if not target or target.get("status") not in ("published", "paused") or not target.get("published"):
+        _validation_error("Remove from another automation must target a published automation in this account.")
+    # Cancellation does not execute or traverse the target graph.
+    return target
+
+
+def _commit_automation_removal_action(db: DB, cid: str, source_id: str,
+        enrolment: JsonObj, node: JsonObj, claim_token: str, run_id: str,
+        success: JsonObj, update: JsonObj) -> None:
+    """Cancel target passes and acknowledge the source in one short transaction."""
+    target_id = node.get("automation_id")
+    if not isinstance(target_id, str) or not target_id or target_id == source_id:
+        _validation_error("Remove from another automation must select a different automation.")
+    try:
+        with db.transaction():
+            # Same ordering as enrol_automation, publication, claims and pause.
+            # Never acquire these locks around external action execution.
+            for aid in sorted((source_id, target_id)):
+                if db.single("select id from automations where cid = %s and id = %s for update", cid, aid) is None:
+                    _validation_error("The source or target automation is no longer available in this account.")
+            current = db.row("select data from automation_enrolments where cid = %s and automation_id = %s and id = %s for update",
+                             cid, source_id, enrolment["id"])
+            if not current or current[0].get("claim_token") != claim_token:
+                raise falcon.HTTPConflict(title="Automation execution claim was lost",
+                    description="The source claim changed before target removal. No target enrolment was cancelled.")
+            _remove_action_target(db, source_id, target_id)
+            rows = db.execute("""
+                select id, data from automation_enrolments
+                where cid = %s and automation_id = %s and contact_id = %s
+                    and (coalesce(data->>'status', '') <> all(%s)
+                         or nullif(data->>'claim_token', '') is not null)
+                order by id for update
+                """, cid, target_id, enrolment["contact_id"], list(TERMINAL_ENROLMENT_STATUSES)).fetchall()
+            # Validate the complete cohort before changing any target pass.
+            for _, previous in rows:
+                if previous.get("status") == "running" or previous.get("claim_token"):
+                    raise falcon.HTTPConflict(title="Target automation enrolment is currently running",
+                        description="No contacts were removed. The source is held. Let the target action finish, or use existing stale-claim recovery, then retry the source step.")
+                if previous.get("status") not in AutomationEnrolmentCancel.CANCELLABLE_STATUSES:
+                    raise falcon.HTTPConflict(title="Target automation enrolment state is invalid",
+                        description="No contacts were removed. Review the target enrolment state before retrying the held source step.")
+            now = _utc_now()
+            for target_enrolment_id, previous in rows:
+                db.execute("""
+                    update automation_enrolments set data = data || %s
+                    where cid = %s and automation_id = %s and id = %s
+                    """, {
+                        **_claim_clear_patch(), **_retry_clear_patch(),
+                        "status": "cancelled", "modified": now, "cancelled_at": now,
+                        "cancelled_by_uid": None,
+                        "cancelled_metadata": {
+                            "source": "automation_action", "previous_status": previous["status"],
+                            "source_automation_id": source_id, "source_enrolment_id": enrolment["id"],
+                            "source_node_id": node["id"], "source_step_run_id": run_id,
+                        },
+                        "wake_at": None, "wait": None, "paused_at": None, "resumed_at": None,
+                    }, cid, target_id, target_enrolment_id)
+            success.update({"action": "remove_automation", "automation_id": target_id,
+                "outcome": "cancelled" if rows else "skipped", "reason": None if rows else "no_active_enrolment",
+                "removed_count": len(rows), "target_enrolment_ids": [row[0] for row in rows]})
+            source = db.automations.get(source_id)
+            if source.get("status") == "paused" and update["status"] == "ready":
+                update.update(status="paused_ready", paused_at=source.get("paused_at") or now)
+            _patch_step_run(db, cid, run_id, success)
+            _advance_claimed_enrolment(db, cid, source_id, enrolment["id"], claim_token, update)
+    except falcon.HTTPError:
+        raise
+    except Exception:
+        log.exception("Cross-automation removal transaction failed")
+        raise falcon.HTTPBadRequest(title="Automation removal action failed",
+            description="No target cancellation or source advancement was committed. The source is held for review.")
+
+
+@contextmanager
+def _locked_automation(db: DB, cid: str, automation_id: str):
+    # DB.transaction() is not nestable. Reuse an existing transaction when a
+    # caller owns one; otherwise keep this state transition short.
+    with db.transaction() if db.conn.autocommit else nullcontext():
+        if db.single(
+            "select id from automations where cid = %s and id = %s for update",
+            cid, automation_id,
+        ) is None:
+            raise falcon.HTTPForbidden()
+        yield db.automations.get(automation_id)
+
+
+def _automation_state_transition(method):
+    @wraps(method)
+    def locked(self, req, resp, id, *args, **kwargs):
+        check_noadmin(req)
+        db = req.context["db"]
+        with _locked_automation(db, db.get_cid(), id):
+            return method(self, req, resp, id, *args, **kwargs)
+    return locked
+
+
 def _create_enrolment_for_contact(
     db: DB,
     cid: str,
@@ -1967,7 +2358,30 @@ def _create_enrolment_for_contact(
     trigger_correlation_id: str | None = None,
     trigger_depth: int | None = None,
 ) -> JsonObj:
-    _, nodes, reentry = _published_enrolment_context(automation)
+    # Bulk/trigger callers may have loaded this automation before publication.
+    with _locked_automation(db, cid, automation_id) as current:
+        return _create_enrolment_for_contact_locked(
+            db, cid, automation_id, current, contact_id, contact_email, source,
+            trigger_correlation_id, trigger_depth,
+        )
+
+
+def _create_enrolment_for_contact_locked(
+    db: DB,
+    cid: str,
+    automation_id: str,
+    automation: JsonObj,
+    contact_id: int,
+    contact_email: str,
+    source: str,
+    trigger_correlation_id: str | None = None,
+    trigger_depth: int | None = None,
+) -> JsonObj:
+    published, nodes, reentry = _published_enrolment_context(automation)
+    if exit_rules.matching_rule(db, cid, contact_id, published):
+        return {"status": "skipped", "reason": "exit_rule", "title": "Contact excluded by exit rule",
+            "description": "This contact matches a published exit rule and cannot enter this automation.",
+            "contact_id": contact_id, "contact_email": contact_email}
 
     existing_enrolment_id = db.single(
         """
@@ -2794,10 +3208,12 @@ def _retry_after_blocks_processing(value: object, now: datetime) -> bool:
 
 
 def _automation_failure_is_retryable(error: falcon.HTTPError) -> bool:
-    return error.title == "Error sending automation email"
+    return error.title in ("Error sending automation email", "Automation email send pending")
 
 
 def _automation_failure_class(error: falcon.HTTPError, retryable: bool) -> str:
+    if error.title == "Automation email send pending":
+        return "coordination"
     if retryable:
         return "provider"
     if error.title in (
@@ -2808,6 +3224,7 @@ def _automation_failure_class(error: falcon.HTTPError, retryable: bool) -> str:
         "Automation branch target is missing",
         "Automation go to target is missing",
         "Current automation node is missing",
+        "Duplicate automation node IDs",
         "Unsupported automation node",
     ):
         return "configuration"
@@ -2979,18 +3396,8 @@ def _release_run_claim(
     patch.update(_claim_clear_patch())
     if extra:
         patch.update(extra)
-    db.execute(
-        """
-        update automation_enrolments
-        set data = data || %s
-        where cid = %s and automation_id = %s and id = %s and data->>'claim_token' = %s
-        """,
-        patch,
-        cid,
-        automation_id,
-        enrolment_id,
-        claim_token,
-    )
+    exit_rules.finish_claim(db, cid, automation_id, enrolment_id, claim_token, patch)
+
 
 
 def _advance_claimed_enrolment(
@@ -3004,18 +3411,8 @@ def _advance_claimed_enrolment(
     update = update.copy()
     update.update(_claim_clear_patch())
     update.update(_retry_clear_patch())
-    updated = db.execute(
-        """
-        update automation_enrolments
-        set data = data || %s
-        where cid = %s and automation_id = %s and id = %s and data->>'claim_token' = %s
-        """,
-        update,
-        cid,
-        automation_id,
-        enrolment_id,
-        claim_token,
-    ).rowcount
+    update["subject_gate"] = None
+    updated = exit_rules.finish_claim(db, cid, automation_id, enrolment_id, claim_token, update)
     if updated != 1:
         raise falcon.HTTPConflict(
             title="Automation execution claim was lost",
@@ -3095,7 +3492,8 @@ class Automation(CRUDSingle):
     def on_patch(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
 
-        if req.context["db"].automations.get(id) is None:
+        automation = req.context["db"].automations.get(id)
+        if automation is None:
             raise falcon.HTTPForbidden()
 
         doc = req.context.get("doc")
@@ -3105,6 +3503,10 @@ class Automation(CRUDSingle):
             )
 
         _validate_doc(doc, AUTOMATION_PATCH_SCHEMA)
+        if "exit_rules" in doc:
+            doc["exit_rules"] = _prepare_exit_rules(doc["exit_rules"])
+        draft = doc.get("draft", automation.get("draft") or {})
+        _validate_unique_node_ids(draft.get("nodes") or [])
         _prepare_patch_doc(doc)
 
         CRUDSingle.on_patch(self, req, resp, id)
@@ -3556,6 +3958,7 @@ class AutomationEmail(object):
         _automation_for_email_route(db, id)
         req.context["result"] = _get_automation_email(db, cid, id, email_id)
 
+    @_automation_state_transition
     def on_patch(
         self,
         req: falcon.Request,
@@ -3583,6 +3986,12 @@ class AutomationEmail(object):
                     title="Automation email editor type is fixed",
                     description="Create a new automation email to use a different editor type.",
                 )
+        experiment = subject_tests.active(db, cid, id, email_id)
+        shared_fields = {"rawText", "parts", "bodyStyle", "type", "preheader", "fromname", "fromemail", "replyto", "returnpath"}
+        if experiment and experiment["status"] in ("collecting", "observing") and any(
+            field in doc and doc[field] != email.get(field) for field in shared_fields
+        ):
+            subject_tests.error("Choose a winner before changing the shared email content or sender. Subject variants are immutable; add a challenger instead.")
         patch = _prepare_automation_email_patch(doc)
 
         db.execute(
@@ -3848,37 +4257,440 @@ class AutomationEmailTest(object):
         req.context["result"] = {}
 
 
+def _publish_enrolment_counts(db: DB, cid: str, automation_id: str) -> List[JsonObj]:
+    # One statement gives preview consistent counts even as an already-claimed
+    # action finishes. Keep JSON types for strict preview classification.
+    return [
+        {"node_id": node_id, "node_id_type": node_id_type, "status": status,
+         "status_type": status_type, "count": count, "claimed_count": claimed}
+        for node_id, node_id_type, status, status_type, count, claimed in db.execute(
+            """
+            select data->>'current_node_id', jsonb_typeof(data->'current_node_id'),
+                data->>'status', jsonb_typeof(data->'status'), count(*),
+                count(*) filter (where data->>'status' = 'running'
+                    or nullif(data->>'claim_token', '') is not null)
+            from automation_enrolments
+            where cid = %s and automation_id = %s
+            group by 1, 2, 3, 4
+            """,
+            cid, automation_id,
+        )
+    ]
+
+
+def _reject_publish_claims(groups: List[JsonObj]) -> None:
+    claimed = sum(group["claimed_count"] for group in groups)
+    if claimed:
+        raise falcon.HTTPConflict(
+            title="Automation publication is blocked by execution",
+            description=(
+                "%s enrolment(s) still have an execution claim. Wait for execution to finish and retry. "
+                "For stale claims, verify the worker has stopped before using the existing recovery action."
+            ) % claimed,
+        )
+
+
+def _validate_publish_enrolments(db: DB, cid: str, automation_id: str, published: JsonObj) -> None:
+    # The automation row lock excludes new claims, enrolments and reactivation.
+    # Actions run without this lock, retaining their claim until advancement.
+    groups = _publish_enrolment_counts(db, cid, automation_id)
+    _reject_publish_claims(groups)
+    node_types = {node["id"]: node["type"] for node in published["nodes"]}
+    old_nodes = {node["id"]: node for node in (db.automations.get(automation_id).get("published") or {}).get("nodes", [])}
+    new_nodes = {node["id"]: node for node in published["nodes"]}
+    missing = set()
+    incompatible_waits = set()
+    for group in groups:
+        node_id, status = group["node_id"], group["status"]
+        if status in TERMINAL_ENROLMENT_STATUSES:
+            continue
+        if node_id not in node_types:
+            missing.add(node_id)
+        elif status in ("waiting", "paused_waiting") and not _compatible_wait(old_nodes.get(node_id, {}), new_nodes[node_id]):
+            incompatible_waits.add(node_id)
+    if missing or incompatible_waits:
+        details = []
+        if missing:
+            details.append("Nonterminal enrolments need retained node IDs: %s." % ", ".join(
+                json.dumps(node_id) for node_id in sorted(missing, key=lambda value: value or "")
+            ))
+        if incompatible_waits:
+            details.append("Waiting enrolments require these nodes to remain Wait steps using the same duration or date/time mode: %s." % ", ".join(
+                json.dumps(node_id) for node_id in sorted(incompatible_waits)
+            ))
+        raise falcon.HTTPConflict(
+            title="Automation publication would strand enrolments",
+            description=_bounded_error_text(" ".join(details)) + (
+                " Restore these draft nodes or allow the affected enrolments to finish before publishing. "
+                "No contacts were moved."
+            ),
+        )
+
+
+def _publish_review(automation: JsonObj) -> JsonObj:
+    return {
+        "draft_fingerprint": _automation_fingerprint(_automation_publish_inputs(automation)),
+        "published_fingerprint": _automation_fingerprint(automation.get("published")),
+        "published_revision": automation.get("published_revision") or 0,
+    }
+
+
+MOVABLE_NODE_TYPES = {"add_tag", "remove_tag", "add_to_list", "remove_from_list", "send_email", "wait_duration"}
+
+
+def _move_placement(nodes: List[JsonObj], node_id: str) -> JsonObj:
+    index = next(i for i, node in enumerate(nodes) if node["id"] == node_id)
+    return {
+        "previous": nodes[index - 1]["id"] if index else None,
+        "next": nodes[index + 1]["id"] if index + 1 < len(nodes) else None,
+        "incoming": sorted([
+            {"id": node["id"], "field": field} for node in nodes
+            for field in ("yes_node_id", "no_node_id", "target_node_id") if node.get(field) == node_id
+        ], key=lambda item: (item["id"], item["field"])),
+    }
+
+
+def _assess_move_decisions(automation: JsonObj, proposed: JsonObj, groups: List[JsonObj]) -> tuple:
+    """Draft-only instructions bound to the live revision and exact placement."""
+    decisions = (automation.get("draft") or {}).get("moves") or {}
+    old = {node["id"]: node for node in (automation.get("published") or {}).get("nodes", [])}
+    nodes = proposed["nodes"]
+    current = {node["id"]: node for node in nodes}
+    moves, blockers = [], []
+    for node_id, decision in sorted(decisions.items()):
+        if (node_id not in old or node_id not in current or current[node_id]["type"] not in MOVABLE_NODE_TYPES
+                or old[node_id]["type"] != current[node_id]["type"]
+                or decision["published_revision"] != (automation.get("published_revision") or 0)
+                or decision["placement"] != _move_placement(nodes, node_id)):
+            blockers.append({"code": "stale_move_decision", "node_id": node_id,
+                "title": "Moved-step contact decision needs review",
+                "description": "Review the move decision for step %s in the visual editor before publishing. Its placement or published workflow changed. Nothing was moved." % json.dumps(node_id)})
+            continue
+        states = {group["status"]: group["count"] for group in groups
+                  if group["node_id"] == node_id and group["status"] in ACTIVE_ENROLMENT_STATUSES}
+        moves.append({"node_id": node_id, "label": old[node_id]["label"], "action": decision["action"],
+                      "enrolment_count": sum(states.values()), "states": states})
+    return moves, blockers
+
+
+def _publish_impact(db: DB, cid: str, automation: JsonObj, proposed: JsonObj | None = None, rule_cohort=None) -> JsonObj:
+    """Read-only assessment; callers hold the automation coordination lock."""
+    blockers: List[JsonObj] = []
+    result = {
+        "review": _publish_review(automation),
+        "automation_status": automation.get("status"),
+        "sources": [],
+        "destinations": [],
+        "blockers": blockers,
+    }
+
+    if proposed is None:
+        try:
+            proposed = _published_snapshot(db, automation)
+        except falcon.HTTPBadRequest as error:
+            blockers.append({
+                "code": "invalid_proposed_workflow", "title": error.title,
+                "description": _bounded_error_text(error.description or error.title),
+            })
+    if proposed is not None:
+        result["destinations"] = [
+            {"node_id": node["id"], "label": node["label"], "type": node["type"]}
+            for node in proposed["nodes"]
+        ]
+
+    try:
+        rule_cohort = rule_cohort if rule_cohort is not None else exit_rules.cohort(db, cid, automation, proposed) if proposed else []
+    except falcon.HTTPBadRequest as error:
+        rule_cohort = []
+        blockers.append({"code": "invalid_exit_rules", "title": error.title, "description": error.description})
+    exit_states = {}
+    exit_positions = {}
+    for _, previous, _ in rule_cohort:
+        status = previous.get("status")
+        exit_states[status] = exit_states.get(status, 0) + 1
+        key = (previous.get("current_node_id"), status)
+        exit_positions[key] = exit_positions.get(key, 0) + 1
+    result["rule_exits"] = {"enrolment_count": len(rule_cohort), "states": exit_states}
+    result["exit_review_required"] = bool(rule_cohort or (proposed is not None and
+        proposed.get("exit_rules", []) != (automation.get("published") or {}).get("exit_rules", [])))
+
+    published = automation.get("published")
+    old_nodes = []
+    old_valid = True
+    revision = result["review"]["published_revision"]
+    try:
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise ValueError()
+        if published is not None:
+            if not isinstance(published, dict):
+                raise ValueError()
+            _validate_doc({"nodes": published.get("nodes")}, DRAFT_SCHEMA)
+            _validate_unique_node_ids(published["nodes"])
+            old_nodes = published["nodes"]
+            if not old_nodes or revision == 0:
+                raise ValueError()
+        elif revision != 0:
+            raise ValueError()
+    except (falcon.HTTPBadRequest, ValueError):
+        old_valid = False
+        old_nodes = []
+        blockers.append({
+            "code": "unsupported_published_workflow",
+            "title": "Published workflow is malformed",
+            "description": "The stored published workflow or revision cannot be assessed safely. Recovery is not supported by this endpoint.",
+        })
+
+    old_by_id = {node["id"]: node for node in old_nodes}
+    new_by_id = {node["id"]: node for node in proposed["nodes"]} if proposed is not None else {}
+    sources: Dict[str, JsonObj] = {}
+    groups = _publish_enrolment_counts(db, cid, automation["id"])
+    if old_valid and proposed is not None and (automation.get("draft") or {}).get("moves"):
+        result["moves"], move_blockers = _assess_move_decisions(automation, proposed, groups)
+        blockers.extend(move_blockers)
+    claimed = sum(group["claimed_count"] for group in groups)
+    if claimed:
+        blockers.append({
+            "code": "execution_claims", "title": "Execution claims remain",
+            "description": "Publication is blocked until execution claims are released, including stale claims. Preview does not release claims.",
+            "enrolment_count": claimed,
+        })
+    for group in sorted(groups, key=lambda item: (item["node_id"] or "", item["status"] or "", item["node_id_type"] or "", item["status_type"] or "")):
+        node_id, status, count = group["node_id"], group["status"], group["count"]
+        if group["status_type"] == "string" and status in TERMINAL_ENROLMENT_STATUSES:
+            continue
+        valid_id = group["node_id_type"] == "string" and re.fullmatch(NODE_ID_SCHEMA["pattern"], node_id or "") is not None
+        detail = {"node_id": node_id if valid_id else None, "enrolment_count": count}
+        if group["status_type"] != "string" or status not in ACTIVE_ENROLMENT_STATUSES:
+            blockers.append({
+                "code": "unsupported_enrolment_state", "title": "Enrolment state is malformed",
+                "description": "This nonterminal state requires separate review; preview cannot repair it.", **detail,
+            })
+            state_key = "unsupported"
+        else:
+            state_key = status
+        if not valid_id:
+            blockers.append({
+                "code": "invalid_current_position", "title": "Enrolment position is invalid",
+                "description": "A current node ID is missing or is not a valid string node ID. Recovery is not supported by this endpoint.", **detail,
+            })
+        elif old_valid and node_id not in old_by_id:
+            blockers.append({
+                "code": "already_stranded", "title": "Enrolments are already stranded",
+                "description": "This position is absent from the current published workflow; it is not a deletion introduced by the draft.", **detail,
+            })
+        elif old_valid and proposed is not None and node_id not in new_by_id:
+            count -= exit_positions.get((node_id, status), 0)
+            if count <= 0:
+                continue
+            source = sources.setdefault(node_id, {
+                "node_id": node_id, "label": old_by_id[node_id]["label"],
+                "type": old_by_id[node_id]["type"], "enrolment_count": 0, "states": {},
+            })
+            source["enrolment_count"] += count
+            source["states"][state_key] = source["states"].get(state_key, 0) + count
+        elif proposed is not None and node_id in new_by_id and status in ("waiting", "paused_waiting") and not _compatible_wait(old_by_id.get(node_id, {}), new_by_id[node_id]):
+            blockers.append({
+                "code": "incompatible_retained_wait", "title": "Retained wait is incompatible",
+                "description": "A retained node with waiting enrolments must remain a Wait step using the same duration or date/time mode.", **detail,
+            })
+    result["sources"] = [sources[node["id"]] for node in old_nodes if node["id"] in sources]
+    return result
+
+
+class AutomationPublishImpact(object):
+
+    def on_get(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
+        check_noadmin(req)
+        db = req.context["db"]
+        cid = db.get_cid()
+        with _locked_automation(db, cid, id) as automation:
+            req.context["result"] = _publish_impact(db, cid, automation)
+
+
+def _validate_publish_resolutions(automation: JsonObj, proposed: JsonObj, impact: JsonObj, resolutions: JsonObj) -> None:
+    destinations = {node["id"] for node in proposed["nodes"]}
+    deleted = {node["id"] for node in (automation.get("published") or {}).get("nodes", [])} - destinations
+    for source_id, choice in resolutions.items():
+        if source_id not in deleted:
+            raise falcon.HTTPBadRequest(
+                title="Invalid automation migration resolution",
+                description="Source %s is not a deletion from the reviewed published workflow." % json.dumps(source_id),
+            )
+        if choice["action"] == "move" and choice["destination_node_id"] not in destinations:
+            raise falcon.HTTPBadRequest(
+                title="Invalid automation migration resolution",
+                description="Destination %s does not exist in the proposed workflow." % json.dumps(choice["destination_node_id"]),
+            )
+    missing = {source["node_id"] for source in impact["sources"]} - set(resolutions)
+    if missing:
+        raise falcon.HTTPConflict(
+            title="Automation migration resolutions required",
+            description="Review the current impact and choose a resolution for: %s. Nothing was published or moved." % ", ".join(json.dumps(value) for value in sorted(missing)),
+        )
+
+
+def _record_publish_migration(db: DB, cid: str, automation_id: str, enrolment_id: str, event: JsonObj) -> None:
+    db.execute(
+        """
+        update automation_enrolments
+        set data = data || jsonb_build_object('migration_events',
+            coalesce(nullif(data->'migration_events', 'null'::jsonb), '[]'::jsonb) || jsonb_build_array(%s::jsonb))
+        where cid = %s and automation_id = %s and id = %s
+        """,
+        event, cid, automation_id, enrolment_id,
+    )
+
+
+def _migrate_publish_enrolments(db: DB, cid: str, automation: JsonObj, request: JsonObj,
+                               revision: int, now: str, uid: str) -> List[JsonObj]:
+    outcomes = []
+    paused = automation.get("status") == "paused"
+    choices = dict(request["resolutions"])
+    for node_id, decision in ((automation.get("draft") or {}).get("moves") or {}).items():
+        choices[node_id] = {"action": decision["action"], "reason": "node_relocated"}
+    for source_id, choice in sorted(choices.items()):
+        rows = db.execute(
+            """
+            select id, data from automation_enrolments
+            where cid = %s and automation_id = %s
+                and data->'current_node_id' = to_jsonb(%s::text)
+                and data->>'status' = any(%s)
+            order by id for update
+            """,
+            cid, automation["id"], source_id,
+            [status for status in ACTIVE_ENROLMENT_STATUSES if status != "running"],
+        ).fetchall()
+        for enrolment_id, previous in rows:
+            events = previous.get("migration_events")
+            if events is not None and (not isinstance(events, list) or any(not isinstance(event, dict) for event in events)):
+                raise falcon.HTTPConflict(
+                    title="Enrolment migration history is malformed",
+                    description="Publication cannot safely append migration history. No changes were committed.",
+                )
+            if choice["action"] == "follow":
+                # Stable ID follows the relocated step. Preserve every timer,
+                # retry, pause and held-state field; do not execute the step.
+                status = previous["status"]
+            else:
+                moving = choice["action"] == "move"
+                status = ("paused_ready" if paused else "ready") if moving else "exited"
+                update = {
+                    **_claim_clear_patch(), **_retry_clear_patch(),
+                    "current_node_id": choice["destination_node_id"] if moving else source_id,
+                    "status": status, "modified": now, "wake_at": None, "wait": None,
+                    "paused_at": now if moving and paused else None, "resumed_at": None,
+                    "subject_gate": None,
+                    "transitions_without_wait": 0,
+                    "visited_node_ids": [],
+                    "cross_automation_visits": [],
+                }
+                db.execute(
+                    "update automation_enrolments set data = data || %s where cid = %s and automation_id = %s and id = %s",
+                    update, cid, automation["id"], enrolment_id,
+                )
+            _record_publish_migration(db, cid, automation["id"], enrolment_id, {
+                "request_id": request["request_id"], "created": now,
+                "source_node_id": source_id, **choice,
+                "previous_status": previous["status"], "resulting_status": status,
+                "previous_published_revision": automation.get("published_revision") or 0,
+                "published_revision": revision, "user_id": uid,
+            })
+        outcomes.append({"source_node_id": source_id, **choice, "enrolment_count": len(rows)})
+    return outcomes
+
+
 class AutomationPublish(object):
 
+    @_automation_state_transition
     def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
-
         db = req.context["db"]
+        cid = db.get_cid()
         automation = db.automations.get(id)
         if automation is None:
             raise falcon.HTTPForbidden()
 
+        request = req.context.get("doc")
+        if request is not None:
+            _validate_doc(request, AUTOMATION_PUBLISH_SCHEMA)
+            fingerprint = _automation_fingerprint(request)
+            receipt = automation.get("publication_receipt") or {}
+            if receipt.get("request_id") == request["request_id"]:
+                if receipt.get("request_fingerprint") != fingerprint:
+                    raise falcon.HTTPConflict(
+                        title="Publication request ID was already used",
+                        description="This operation ID was committed with different content. Reload the automation before reviewing another publication.",
+                    )
+                if receipt.get("published_revision") == automation.get("published_revision"):
+                    req.context["result"] = automation
+                    return
+            if request["review"] != _publish_review(automation):
+                raise falcon.HTTPConflict(
+                    title="Automation publish review is stale",
+                    description="The saved draft or published workflow changed. Reload publish impact and review the resolutions again.",
+                )
+
+        # The automation row is already locked: no new execution can claim it.
+        # Refuse before waiting for the account membership lock, which an
+        # in-flight tag/list action may hold. Receipt replay above is read-only.
+        _reject_publish_claims(_publish_enrolment_counts(db, cid, id))
+        contacts.lock_exit_rule_changes(db, cid, publishing=True)
         published = _published_snapshot(db, automation)
+        rule_cohort = exit_rules.cohort(db, cid, automation, published)
+        impact = _publish_impact(db, cid, automation, published, rule_cohort)
+        if impact["exit_review_required"] and (request is None or not request.get("accept_exit_rules")):
+            raise falcon.HTTPConflict(title="Exit-rule publication requires review",
+                description="Review the current exit-rule impact and confirm that matching enrolments will exit. Nothing was published.")
+        if request is None:
+            if (automation.get("draft") or {}).get("moves"):
+                raise falcon.HTTPConflict(title="Moved-step publication requires review",
+                    description="Reload publish impact and publish using its review binding. No contacts were moved.")
+            # Preserve the existing bodyless caller and its occupied-node refusal.
+            _validate_publish_enrolments(db, cid, id, published)
+        if impact["blockers"]:
+            blocker = impact["blockers"][0]
+            raise falcon.HTTPConflict(title=blocker["title"], description=blocker["description"])
+        if request is not None:
+            _validate_publish_resolutions(automation, published, impact, request["resolutions"])
+
         now = _utc_now()
         revision = int(automation.get("published_revision", 0) or 0) + 1
-
+        receipt = None
+        for eid, previous, match in rule_cohort:
+            metadata = previous.get("pending_rule_exit") or exit_rules.reason(
+                {**automation, "published_revision": revision}, previous, match, "publication",
+                previous_published_revision=automation.get("published_revision") or 0,
+                user_id=req.context["uid"], request_id=request["request_id"])
+            db.execute("update automation_enrolments set data=data||%s where cid=%s and automation_id=%s and id=%s",
+                exit_rules.exit_patch(previous, metadata), cid, id, eid)
+        if request is not None:
+            outcomes = _migrate_publish_enrolments(db, cid, automation, request, revision, now, req.context["uid"])
+            receipt = {
+                "request_id": request["request_id"], "request_fingerprint": fingerprint,
+                "previous_published_revision": revision - 1, "published_revision": revision,
+                "created": now, "user_id": req.context["uid"], "outcomes": outcomes,
+                "rule_exit_count": len(rule_cohort),
+            }
         doc = {
-            "status": "published",
-            "published": published,
-            "published_at": now,
-            "published_by": req.context["uid"],
-            "published_revision": revision,
-            "modified": now,
+            "status": "paused" if automation.get("status") == "paused" else "published",
+            "published": published, "published_at": now, "published_by": req.context["uid"],
+            "published_revision": revision, "modified": now,
+            # A later bodyless publication also supersedes the latest receipt.
+            "publication_receipt": receipt,
         }
-
+        if (automation.get("draft") or {}).get("moves"):
+            doc["draft"] = {key: value for key, value in automation["draft"].items() if key != "moves"}
         db.automations.patch(id, doc)
-        user_log(req, "pencil", "published automation ", "automations", id, ".")
-
+        audit = "."
+        if receipt is not None:
+            audit += " Migration: " + json.dumps({key: value for key, value in receipt.items() if key != "request_fingerprint"}, sort_keys=True)
+        user_log(req, "pencil", "published automation ", "automations", id, audit)
         req.context["result"] = db.automations.get(id)
 
 
 class AutomationPause(object):
 
+    @_automation_state_transition
     def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
 
@@ -3965,6 +4777,7 @@ class AutomationPause(object):
 
 class AutomationResume(object):
 
+    @_automation_state_transition
     def on_post(self, req: falcon.Request, resp: falcon.Response, id: str) -> None:
         check_noadmin(req)
 
@@ -3998,6 +4811,8 @@ class AutomationResume(object):
             )
         ]
         for enrolment in rows:
+            if exit_rules.apply(db, cid, automation, enrolment["id"], "resume"):
+                continue
             status = enrolment.get("status")
             update = None
             if status in ("held", "paused_ready"):
@@ -4009,7 +4824,7 @@ class AutomationResume(object):
             elif status == "paused_waiting":
                 wait = copy.deepcopy(enrolment.get("wait") or {})
                 remaining = int(wait.get("remaining_seconds", 0) or 0)
-                wake_at = _iso_datetime(now_dt + timedelta(seconds=remaining))
+                wake_at = wait.get("wait_until") or _iso_datetime(now_dt + timedelta(seconds=remaining))
                 wait.update(
                     {
                         "wake_at": wake_at,
@@ -4316,7 +5131,7 @@ class AutomationEnrolments(object):
                 title=outcome["title"],
                 description=outcome["description"],
             )
-        if outcome.get("status") == "skipped" and outcome.get("reason") == "active_pass":
+        if outcome.get("status") == "skipped" and outcome.get("reason") in ("active_pass", "exit_rule"):
             raise falcon.HTTPBadRequest(
                 title=outcome["title"],
                 description=outcome["description"],
@@ -4875,11 +5690,14 @@ class AutomationHistory(object):
                     "node_type": step_run["node_type"],
                     "node_label": step_run.get("node_label"),
                     "tag": step_run.get("tag"),
+                    "tags": step_run.get("tags"),
+                    "changed_tags": step_run.get("changed_tags"),
                     "list_id": step_run.get("list_id"),
                     "list_name": step_run.get("list_name"),
                     "added": step_run.get("added"),
                     "removed": step_run.get("removed"),
                     "duration": step_run.get("duration"),
+                    "wait_until": step_run.get("wait_until"),
                     "wake_at": step_run.get("wake_at"),
                     "action": step_run.get("action"),
                     "skipped": step_run.get("skipped"),
@@ -4892,6 +5710,9 @@ class AutomationHistory(object):
                     "recipient_email": step_run.get("recipient_email"),
                     "route_id": step_run.get("route_id"),
                     "sent": step_run.get("sent"),
+                    "throttled": step_run.get("throttled"),
+                    "throttle_reason": step_run.get("throttle_reason"),
+                    "email_delivery_status": step_run.get("email_delivery_status"),
                     "suppressed": step_run.get("suppressed"),
                     "suppression_reason": step_run.get("suppression_reason"),
                     "published_revision": step_run.get("published_revision"),
@@ -4900,6 +5721,14 @@ class AutomationHistory(object):
                 }
             )
 
+        for enrolment in enrolments:
+            for event in enrolment.get("migration_events") or []:
+                events.append({"type": "migration", "enrolment_id": enrolment["id"], **event})
+
+        for enrolment in enrolments:
+            metadata = enrolment.get("exit_metadata")
+            if metadata:
+                events.append({"type": "rule_exit", "enrolment_id": enrolment["id"], **metadata})
         events.extend(engagement_events)
 
         events.sort(key=lambda event: (event.get("created") or "", event["type"]))
@@ -5053,16 +5882,20 @@ def _evaluate_automation_condition_item(
     }
 
     if item_type in ("has_tag", "missing_tag"):
-        tag = item.get("tag") or ""
-        has_tag = _contact_has_tag(db, cid, contact_id, tag)
+        tags = _condition_selection(item, "tag", "tags")
+        has_tag = any(_contact_has_tag(db, cid, contact_id, tag) for tag in tags)
         result = has_tag if item_type == "has_tag" else not has_tag
-        metadata.update({"tag": tag, "has_tag": has_tag})
+        metadata.update({"has_tag": has_tag})
+        metadata.update({"tags": tags} if "tags" in item else {"tag": tags[0]})
     elif item_type in ("in_list", "not_in_list"):
-        list_id = item.get("list_id") or ""
-        in_list = _contact_is_in_list(db, cid, contact_id, list_id)
+        list_ids = _condition_selection(item, "list_id", "list_ids")
+        # Check all memberships within the contact's account.
+        memberships = [_contact_is_in_list(db, cid, contact_id, list_id) for list_id in list_ids]
+        in_list = any(memberships)
         result = in_list if item_type == "in_list" else not in_list
-        metadata.update({"list_id": list_id, "in_list": in_list})
-    elif item_type == "opened_email":
+        metadata.update({"in_list": in_list})
+        metadata.update({"list_ids": list_ids} if "list_ids" in item else {"list_id": list_ids[0]})
+    elif item_type in ("opened_email", "not_opened_email"):
         automation_email_id = item.get("automation_email_id") or ""
         automation_email = _automation_email_condition_metadata(db, cid, automation_id, automation_email_id)
         result = _automation_email_opened_for_enrolment(
@@ -5080,7 +5913,7 @@ def _evaluate_automation_condition_item(
                 "subject": automation_email.get("subject"),
             }
         )
-    elif item_type == "clicked_email":
+    elif item_type in ("clicked_email", "not_clicked_email"):
         automation_email_id = item.get("automation_email_id") or ""
         automation_email = _automation_email_condition_metadata(db, cid, automation_id, automation_email_id)
         raw_click_match = item.get("click_match") or "any"
@@ -5120,6 +5953,8 @@ def _evaluate_automation_condition_item(
             description="The published condition type is not supported.",
         )
 
+    if item_type in ("not_opened_email", "not_clicked_email"):
+        result = not result
     metadata["result"] = result
     return metadata
 
@@ -5166,6 +6001,41 @@ def _evaluate_automation_condition_group(
     }
 
 
+def _reserve_automation_email(db: DB, cid: str, automation_id: str, contact_id: int,
+                              email_id: str, run_id: str) -> bool:
+    """One contact/email handoff per rolling 24 hours, across enrolments.
+
+    The existing automation lock serialises short reservations. External sending
+    happens after the transaction commits; ambiguous sends remain fail-closed.
+    """
+    now = datetime.utcnow()
+    cutoff = _iso_datetime(now - timedelta(hours=24))
+    with _locked_automation(db, cid, automation_id) as automation:
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        rows = db.execute("""
+            select data from automation_step_runs
+            where cid = %s and automation_id = %s and contact_id = %s
+              and data->>'automation_email_id' = %s and id <> %s
+              and coalesce(data->>'email_sent_at', data->>'email_reserved_at', data->>'created') > %s
+              and (data->>'sent' = 'true' or data->>'email_delivery_status' in ('reserved', 'accepted', 'uncertain'))
+            """, cid, automation_id, contact_id, email_id, run_id, cutoff).fetchall()
+        if any(row[0].get("sent") or row[0].get("email_delivery_status") == "accepted" for row in rows):
+            return False
+        if any(row[0].get("email_delivery_status") == "uncertain" for row in rows):
+            raise falcon.HTTPBadRequest(title="Automation email delivery uncertain",
+                description="A recent attempt may have sent this email. This enrolment is held to avoid a duplicate; review the delivery before retrying.")
+        if rows:
+            raise falcon.HTTPBadRequest(title="Automation email send pending",
+                description="Another enrolment is sending this contact the same email. Processing will retry.")
+        run = db.row("select enrolment_id,node_id from automation_step_runs where cid=%s and id=%s", cid, run_id)
+        assignment = subject_tests.reserve(db, cid, automation_id, email_id, run[0], run[1], contact_id, run_id)
+        _patch_step_run(db, cid, run_id, {"automation_email_id": email_id,
+            "subject_assignment": assignment,
+            "email_reserved_at": _iso_datetime(now), "email_delivery_status": "reserved"})
+    return True
+
+
 def _run_next_automation_enrolment(
     db: DB,
     cid: str,
@@ -5173,34 +6043,42 @@ def _run_next_automation_enrolment(
     enrolment_id: str,
     skip_wait: bool = False,
 ) -> JsonObj:
-    automation = db.automations.get(id)
-    if automation is None:
-        raise falcon.HTTPForbidden()
-    if automation.get("status") == "paused":
-        raise falcon.HTTPBadRequest(
-            title="Automation is paused",
-            description="Resume the automation before running test steps.",
-        )
+    with _locked_automation(db, cid, id) as current:
+        automation = current
+        if automation is None:
+            raise falcon.HTTPForbidden()
+        current_enrolment = _read_run_enrolment(db, cid, id, enrolment_id)
+        if current_enrolment and not current_enrolment.get("claim_token") and current_enrolment.get("status") in AutomationEnrolmentCancel.CANCELLABLE_STATUSES:
+            if exit_rules.apply(db, cid, automation, enrolment_id, "before_action") == "exited":
+                return {"enrolment": _read_run_enrolment(db, cid, id, enrolment_id), "step_run": None}
+        if automation.get("status") == "paused":
+            raise falcon.HTTPBadRequest(
+                title="Automation is paused",
+                description="Resume the automation before running test steps.",
+            )
 
-    published = automation.get("published")
-    if not published:
-        raise falcon.HTTPBadRequest(
-            title="Automation is not published",
-            description="Automation execution uses the published workflow snapshot.",
-        )
+        published = automation.get("published")
+        if not published:
+            raise falcon.HTTPBadRequest(
+                title="Automation is not published",
+                description="Automation execution uses the published workflow snapshot.",
+            )
 
-    now_dt = datetime.utcnow()
-    now = now_dt.isoformat() + "Z"
-    claim_token = shortuuid.uuid()
-    enrolment = _claim_run_enrolment(
-        db,
-        cid,
-        id,
-        enrolment_id,
-        claim_token,
-        now,
-        now_dt - CLAIM_STALE_AFTER,
-    )
+        now_dt = datetime.utcnow()
+        now = now_dt.isoformat() + "Z"
+        claim_token = shortuuid.uuid()
+        enrolment = _claim_run_enrolment(
+            db,
+            cid,
+            id,
+            enrolment_id,
+            claim_token,
+            now,
+            now_dt - CLAIM_STALE_AFTER,
+        )
+    if enrolment.get("pending_rule_exit") or exit_rules.matching_rule(db, cid, enrolment["contact_id"], published):
+        _advance_claimed_enrolment(db, cid, id, enrolment_id, claim_token, {})
+        return {"enrolment": _read_run_enrolment(db, cid, id, enrolment_id), "step_run": None}
     original_status = _running_status(enrolment)
     run_id = shortuuid.uuid()
     run_inserted = False
@@ -5210,6 +6088,7 @@ def _run_next_automation_enrolment(
 
     try:
         nodes = published.get("nodes") or []
+        _validate_unique_node_ids(nodes, "Duplicate automation node IDs")
         node_index = None
         for i, node in enumerate(nodes):
             if node.get("id") == current_node_id:
@@ -5224,12 +6103,12 @@ def _run_next_automation_enrolment(
 
         node = nodes[node_index]
         node_type = node.get("type")
-        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "wait_duration", "if_has_tag", "if_missing_tag", "if_conditions", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
+        if node_type not in ("add_tag", "remove_tag", "add_to_list", "remove_from_list", "enrol_automation", "remove_automation", "wait_duration", "if_has_tag", "if_missing_tag", "if_conditions", "if_opened_email", "if_clicked_email", "go_to", "send_email", "exit"):
             raise falcon.HTTPBadRequest(
                 title="Unsupported automation node",
                 description=(
                     "%s nodes are not supported by manual execution yet. "
-                    "Only add_tag, remove_tag, add_to_list, remove_from_list, wait_duration, if_has_tag, if_missing_tag, if_conditions, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
+                    "Only add_tag, remove_tag, add_to_list, remove_from_list, enrol_automation, remove_automation, wait_duration, if_has_tag, if_missing_tag, if_conditions, if_opened_email, if_clicked_email, go_to, send_email and exit nodes can be executed manually."
                     % node_type
                 ),
             )
@@ -5262,6 +6141,44 @@ def _run_next_automation_enrolment(
                     description="This enrolment is waiting until %s." % wake_at,
                 )
 
+        # A second defence against repeated transitions, including diagnostic
+        # skip-wait calls. Only an actually elapsed wait resets this budget.
+        transitions = max(0, _safe_int(enrolment.get("transitions_without_wait"), 0))
+        elapsed_wait = False
+        if original_status == "waiting":
+            started = (enrolment.get("wait") or {}).get("started_at")
+            try:
+                elapsed_wait = bool(started and now_dt >= _parse_datetime(enrolment["wake_at"])
+                                    and ((_parse_datetime(enrolment["wake_at"]) > _parse_datetime(started)) if (enrolment.get("wait") or {}).get("wait_until") else (now_dt - _parse_datetime(started)).total_seconds() >= 300))
+            except (TypeError, ValueError):
+                elapsed_wait = False
+        if elapsed_wait:
+            transitions = 0
+        visited = enrolment.get("visited_node_ids", [])
+        if not isinstance(visited, list) or any(not isinstance(value, str) for value in visited):
+            raise falcon.HTTPBadRequest(title="Automation visit history is invalid",
+                description="This enrolment has malformed visit history and has been held for review.")
+        visited = list(dict.fromkeys(visited))
+        if elapsed_wait:
+            visited = []
+        inherited = enrolment.get("cross_automation_visits", [])
+        if not isinstance(inherited, list) or any(
+            not isinstance(pair, list) or len(pair) != 2 or any(not isinstance(value, str) or not value for value in pair)
+            for pair in inherited
+        ):
+            _validation_error("Cross-automation visit history is malformed. Review this enrolment before resuming.")
+        if elapsed_wait:
+            inherited = []
+        if original_status != "waiting" and [id, current_node_id] in inherited:
+            raise falcon.HTTPBadRequest(title="Automation loop detected",
+                description="This contact returned to an already visited step across automations without an elapsed wait. It has been held before repeating the action.")
+        if original_status != "waiting" and current_node_id in visited:
+            raise falcon.HTTPBadRequest(title="Automation loop detected",
+                description="This enrolment returned to step %s without an elapsed wait. It has been held before repeating the action." % current_node_id)
+        if transitions >= max(1000, len(nodes) * 2):
+            raise falcon.HTTPBadRequest(title="Automation transition safety limit reached",
+                description="This enrolment made too many transitions without an elapsed wait and has been held. Review its workflow before resuming.")
+
         run_data = {
             "id": run_id,
             "status": "running",
@@ -5292,6 +6209,7 @@ def _run_next_automation_enrolment(
                 {
                     "action": "wait_complete",
                     "duration": wait.get("duration", node.get("duration")),
+                    "wait_until": wait.get("wait_until"),
                     "wake_at": wake_at,
                     "skipped": skip_wait and now_dt < _parse_datetime(wake_at),
                 }
@@ -5312,237 +6230,96 @@ def _run_next_automation_enrolment(
                     "wait": None,
                     "modified": now,
                 }
-        elif node_type == "add_tag":
-            tag = node.get("draft_tag")
-            if not tag:
+        elif node_type in ("enrol_automation", "remove_automation"):
+            # Side effects are deferred to the atomic acknowledgement below.
+            enrolment_update = {"status": "ready" if node_index + 1 < len(nodes) else "completed", "modified": now}
+            if node_index + 1 < len(nodes):
+                enrolment_update["current_node_id"] = nodes[node_index + 1]["id"]
+        elif node_type in ("add_tag", "remove_tag"):
+            tags = _action_tags(node)
+            if not tags:
                 raise falcon.HTTPBadRequest(
-                    title="Add tag node is missing tag configuration",
-                    description="The published add_tag node does not include a tag.",
+                    title="%s node is missing tag configuration" % ("Add tag" if node_type == "add_tag" else "Remove tag"),
+                    description="The published tag action must select at least one valid tag.",
                 )
-
-            db.execute(
-                """insert into alltags (cid, tag, added, count) values (%s, %s, now(), 0)
-                on conflict (cid, tag) do nothing""",
-                cid,
-                tag,
-            )
             tagcounts = {}
-            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            correlation = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            depth = _safe_int(enrolment.get("trigger_depth"), 0) + 1
+            source = {"type": "automation", "automation_id": id, "enrolment_id": enrolment_id,
+                      "node_id": current_node_id, "step_run_id": run_id,
+                      "published_revision": automation.get("published_revision")}
             try:
-                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
-            except (TypeError, ValueError):
-                trigger_depth = 1
-            contacts.add_tag(
-                db,
-                cid,
-                enrolment["contact_email"],
-                enrolment["contact_id"],
-                tag,
-                None,
-                {},
-                tagcounts,
-                [],
-                {
-                    "type": "automation",
-                    "automation_id": id,
-                    "enrolment_id": enrolment_id,
-                    "node_id": node.get("id"),
-                    "step_run_id": run_id,
-                    "published_revision": automation.get("published_revision"),
-                },
-                trigger_correlation_id,
-                trigger_depth,
-            )
-            for tagname, cnt in tagcounts.items():
-                db.execute(
-                    "update alltags set count = count + %s where cid = %s and tag = %s",
-                    cnt,
-                    cid,
-                    tagname,
-                )
-
-            success_data["tag"] = tag
-
+                with db.transaction():
+                    contacts.lock_exit_rule_changes(db, cid)
+                    # Serialize this contact's tag batch, including concurrent workflows.
+                    db.execute(f'select contact_id from contacts."contacts_{cid}" where contact_id = %s for update', enrolment["contact_id"])
+                    for tag in sorted(tags):
+                        if node_type == "add_tag":
+                            db.execute("insert into alltags (cid, tag, added, count) values (%s, %s, now(), 0) on conflict (cid, tag) do nothing", cid, tag)
+                            contacts.add_tag(db, cid, enrolment["contact_email"], enrolment["contact_id"], tag,
+                                             None, {}, tagcounts, [], source, correlation, depth, automation_trigger_strict=True)
+                        else:
+                            contacts.remove_tag(db, cid, enrolment["contact_email"], enrolment["contact_id"], tag,
+                                                tagcounts, [], source, correlation, depth, automation_trigger_strict=True)
+                    for tag, count in tagcounts.items():
+                        db.execute("update alltags set count = count + %s where cid = %s and tag = %s", count, cid, tag)
+                    if node_type == "remove_tag":
+                        db.execute("delete from alltags where cid = %s and tag = any(%s) and count <= 0", cid, tags)
+            except Exception:
+                log.exception("Automation tag batch failed")
+                raise falcon.HTTPBadRequest(title="Automation tag action failed",
+                    description="No changes from this tag action were committed. The enrolment is held for review.")
+            success_data.update({"action": node_type, "tags": tags, "changed_tags": list(tagcounts),
+                                 "tag": tags[0] if len(tags) == 1 else None})
+            if node_type == "remove_tag":
+                success_data["removed"] = bool(tagcounts)
+            enrolment_update = {"status": "ready" if node_index + 1 < len(nodes) else "completed", "modified": now}
             if node_index + 1 < len(nodes):
-                enrolment_update = {
-                    "status": "ready",
-                    "current_node_id": nodes[node_index + 1]["id"],
-                    "modified": now,
-                }
-            else:
-                enrolment_update = {
-                    "status": "completed",
-                    "modified": now,
-                }
-        elif node_type == "remove_tag":
-            tag = node.get("draft_tag")
-            if not tag:
-                raise falcon.HTTPBadRequest(
-                    title="Remove tag node is missing tag configuration",
-                    description="The published remove_tag node does not include a tag.",
-                )
-
-            tagcounts = {}
-            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+                enrolment_update["current_node_id"] = nodes[node_index + 1]["id"]
+        elif node_type in ("add_to_list", "remove_from_list"):
+            list_ids = _action_lists(node)
+            if not list_ids:
+                raise falcon.HTTPBadRequest(title="List action is missing valid list configuration",
+                    description="Select at least one valid, unique contact list.")
+            source = {"type": "automation", "automation_id": id, "enrolment_id": enrolment_id,
+                      "node_id": current_node_id, "step_run_id": run_id,
+                      "published_revision": automation.get("published_revision")}
+            correlation = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
+            depth = _safe_int(enrolment.get("trigger_depth"), 0) + 1
+            helper = _add_contact_to_list if node_type == "add_to_list" else _remove_contact_from_list
+            changed_key = "added" if node_type == "add_to_list" else "removed"
+            results = {}
             try:
-                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
-            except (TypeError, ValueError):
-                trigger_depth = 1
-            contacts.remove_tag(
-                db,
-                cid,
-                enrolment["contact_email"],
-                enrolment["contact_id"],
-                tag,
-                tagcounts,
-                [],
-                {
-                    "type": "automation",
-                    "automation_id": id,
-                    "enrolment_id": enrolment_id,
-                    "node_id": node.get("id"),
-                    "step_run_id": run_id,
-                    "published_revision": automation.get("published_revision"),
-                },
-                trigger_correlation_id,
-                trigger_depth,
-            )
-            removed = bool(tagcounts.get(tag))
-            for tagname, cnt in tagcounts.items():
-                db.execute(
-                    "update alltags set count = count + %s where cid = %s and tag = %s",
-                    cnt,
-                    cid,
-                    tagname,
-                )
-            if tagcounts:
-                db.execute(
-                    "delete from alltags where cid = %s and count <= 0",
-                    cid,
-                )
-
-            success_data.update(
-                {
-                    "action": "remove_tag",
-                    "tag": tag,
-                    "removed": removed,
-                }
-            )
-
+                with db.transaction():
+                    contacts.lock_exit_rule_changes(db, cid)
+                    # Share the contact lock with tag batches. Lock lists in stable order
+                    # before counters so overlapping batches cannot invert list locks.
+                    db.execute(f'select contact_id from contacts."contacts_{cid}" where contact_id = %s for update', enrolment["contact_id"])
+                    for list_id in sorted(list_ids):
+                        if db.single("select id from lists where cid = %s and id = %s for update", cid, list_id) is None:
+                            raise falcon.HTTPBadRequest(title="Automation list is missing",
+                                description="The published list node references a contact list that was not found.")
+                    for list_id in sorted(list_ids):
+                        results[list_id] = helper(db, cid, enrolment["contact_id"], enrolment["contact_email"],
+                            list_id, source, correlation, depth, strict_events=True)
+            except falcon.HTTPBadRequest:
+                raise
+            except Exception:
+                log.exception("Automation list batch failed")
+                raise falcon.HTTPBadRequest(title="Automation list action failed",
+                    description="No changes from this list action were committed. Check that all selected lists still exist in this account. The enrolment is held for review.")
+            success_data.update({"action": node_type, "list_ids": list_ids,
+                "changed_list_ids": [value for value in list_ids if results[value][changed_key]],
+                "lists": [results[value] for value in list_ids]})
+            if len(list_ids) == 1:
+                success_data.update(results[list_ids[0]])
+            enrolment_update = {"status": "ready" if node_index + 1 < len(nodes) else "completed", "modified": now}
             if node_index + 1 < len(nodes):
-                enrolment_update = {
-                    "status": "ready",
-                    "current_node_id": nodes[node_index + 1]["id"],
-                    "modified": now,
-                }
-            else:
-                enrolment_update = {
-                    "status": "completed",
-                    "modified": now,
-                }
-        elif node_type == "add_to_list":
-            list_id = node.get("list_id")
-            if not list_id:
-                raise falcon.HTTPBadRequest(
-                    title="Add to list node is missing list configuration",
-                    description="The published add_to_list node does not include a contact list.",
-                )
-
-            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
-            try:
-                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
-            except (TypeError, ValueError):
-                trigger_depth = 1
-            list_result = _add_contact_to_list(
-                db,
-                cid,
-                enrolment["contact_id"],
-                enrolment["contact_email"],
-                list_id,
-                {
-                    "type": "automation",
-                    "automation_id": id,
-                    "enrolment_id": enrolment_id,
-                    "node_id": node.get("id"),
-                    "step_run_id": run_id,
-                    "published_revision": automation.get("published_revision"),
-                },
-                trigger_correlation_id,
-                trigger_depth,
-            )
-            success_data.update(
-                {
-                    "action": "add_to_list",
-                    "list_id": list_result["list_id"],
-                    "list_name": list_result.get("list_name"),
-                    "added": list_result["added"],
-                }
-            )
-
-            if node_index + 1 < len(nodes):
-                enrolment_update = {
-                    "status": "ready",
-                    "current_node_id": nodes[node_index + 1]["id"],
-                    "modified": now,
-                }
-            else:
-                enrolment_update = {
-                    "status": "completed",
-                    "modified": now,
-                }
-        elif node_type == "remove_from_list":
-            list_id = node.get("list_id")
-            if not list_id:
-                raise falcon.HTTPBadRequest(
-                    title="Remove from list node is missing list configuration",
-                    description="The published remove_from_list node does not include a contact list.",
-                )
-
-            trigger_correlation_id = enrolment.get("trigger_correlation_id") or "automation:%s" % enrolment_id
-            try:
-                trigger_depth = int(enrolment.get("trigger_depth") or 0) + 1
-            except (TypeError, ValueError):
-                trigger_depth = 1
-            list_result = _remove_contact_from_list(
-                db,
-                cid,
-                enrolment["contact_id"],
-                enrolment["contact_email"],
-                list_id,
-                {
-                    "type": "automation",
-                    "automation_id": id,
-                    "enrolment_id": enrolment_id,
-                    "node_id": node.get("id"),
-                    "step_run_id": run_id,
-                    "published_revision": automation.get("published_revision"),
-                },
-                trigger_correlation_id,
-                trigger_depth,
-            )
-            success_data.update(
-                {
-                    "action": "remove_from_list",
-                    "list_id": list_result["list_id"],
-                    "list_name": list_result.get("list_name"),
-                    "removed": list_result["removed"],
-                }
-            )
-
-            if node_index + 1 < len(nodes):
-                enrolment_update = {
-                    "status": "ready",
-                    "current_node_id": nodes[node_index + 1]["id"],
-                    "modified": now,
-                }
-            else:
-                enrolment_update = {
-                    "status": "completed",
-                    "modified": now,
-                }
+                enrolment_update["current_node_id"] = nodes[node_index + 1]["id"]
         elif node_type == "wait_duration":
             duration = node.get("duration") or {}
-            wake_at = _wake_at(now_dt, duration)
+            deadline = _wait_deadline(node["wait_until"]) if "wait_until" in node else None
+            wake_at = _iso_datetime(deadline) if deadline is not None else _wake_at(now_dt, duration)
             success_data.update(
                 {
                     "status": "waiting",
@@ -5558,12 +6335,20 @@ def _run_next_automation_enrolment(
                 "wait": {
                     "node_id": current_node_id,
                     "duration": duration,
+                    **({"wait_until": wake_at} if deadline is not None else {}),
                     "started_at": now,
                     "wake_at": wake_at,
                     "published_revision": automation.get("published_revision"),
                 },
                 "modified": now,
             }
+            if deadline is not None:
+                success_data["wait_until"] = wake_at
+                if deadline <= now_dt:
+                    success_data.update({"status": "succeeded", "action": "wait_deadline_passed"})
+                    enrolment_update.update({"status": "ready" if node_index + 1 < len(nodes) else "completed", "wait": None, "wake_at": None})
+                    if node_index + 1 < len(nodes):
+                        enrolment_update["current_node_id"] = nodes[node_index + 1]["id"]
         elif node_type in ("if_has_tag", "if_missing_tag"):
             tag = node.get("draft_tag")
             if not tag:
@@ -5790,6 +6575,7 @@ def _run_next_automation_enrolment(
             )
             route_id = None
             sent = False
+            throttled = False
             if suppression_reason is None:
                 fromname, fromemail, returnpath, replyto = _automation_email_sender(automation_email)
 
@@ -5815,46 +6601,60 @@ def _run_next_automation_enrolment(
                     fromdomain = fromemail.split("@")[-1].strip().lower()
                 fromaddr = email.utils.formataddr((fromname, fromemail))
 
-                try:
-                    send_backend_mail(
-                        db,
-                        cid,
-                        route,
-                        html,
-                        fromaddr,
-                        returnpath,
-                        fromdomain,
-                        replyto,
-                        recipient_email,
-                        recipient_email,
-                        subject,
-                        campid=run_id,
-                        source_type="automation",
-                        source_id=id,
-                        source_ids={
-                            "automation_id": id,
-                            "automation_email_id": automation_email_id,
-                            "enrolment_id": enrolment_id,
-                            "node_id": current_node_id,
-                            "step_run_id": run_id,
-                            "published_revision": automation.get("published_revision"),
-                        },
-                        metadata={
-                            "automation_id": id,
-                            "automation_email_id": automation_email_id,
-                            "enrolment_id": enrolment_id,
-                            "node_id": current_node_id,
-                            "step_run_id": run_id,
-                            "published_revision": automation.get("published_revision"),
-                        },
-                    )
-                    sent = True
-                except Exception as e:
-                    log.warning("Error sending automation email: %s", e)
-                    raise falcon.HTTPBadRequest(
-                        title="Error sending automation email",
-                        description="Error sending automation email: %s" % e,
-                    )
+                allowed = _reserve_automation_email(db, cid, id, enrolment["contact_id"], automation_email_id, run_id)
+                throttled = not allowed
+                if allowed:
+                    assignment = db.single("select data->'subject_assignment' from automation_step_runs where cid=%s and id=%s", cid, run_id)
+                    if assignment:
+                        subject = assignment["subject"]
+                    try:
+                        send_backend_mail(
+                            db,
+                            cid,
+                            route,
+                            html,
+                            fromaddr,
+                            returnpath,
+                            fromdomain,
+                            replyto,
+                            recipient_email,
+                            recipient_email,
+                            subject,
+                            campid=run_id,
+                            source_type="automation",
+                            source_id=id,
+                            source_ids={
+                                "automation_id": id,
+                                "automation_email_id": automation_email_id,
+                                "enrolment_id": enrolment_id,
+                                "node_id": current_node_id,
+                                "step_run_id": run_id,
+                                "published_revision": automation.get("published_revision"),
+                            },
+                            metadata={
+                                "automation_id": id,
+                                "automation_email_id": automation_email_id,
+                                "enrolment_id": enrolment_id,
+                                "node_id": current_node_id,
+                                "step_run_id": run_id,
+                                "published_revision": automation.get("published_revision"),
+                            },
+                        )
+                        sent = True
+                        subject_tests.outcome(db, cid, run_id, "accepted")
+                        _patch_step_run(db, cid, run_id, {"email_delivery_status": "accepted", "email_sent_at": _utc_now()})
+                    except MailNotSentError as e:
+                        subject_tests.outcome(db, cid, run_id, "not_sent")
+                        _patch_step_run(db, cid, run_id, {"email_delivery_status": "not_sent"})
+                        raise falcon.HTTPBadRequest(title="Error sending automation email", description=str(e))
+                    except Exception as e:
+                        subject_tests.outcome(db, cid, run_id, "uncertain")
+                        _patch_step_run(db, cid, run_id, {"email_delivery_status": "uncertain"})
+                        log.warning("Error sending automation email: %s", e)
+                        raise falcon.HTTPBadRequest(
+                            title="Automation email delivery uncertain",
+                            description="The send outcome could not be confirmed. This enrolment is held to avoid a duplicate email. Review the delivery before retrying.",
+                        )
 
             success_data.update(
                 {
@@ -5865,6 +6665,8 @@ def _run_next_automation_enrolment(
                     "recipient_email": recipient_email,
                     "route_id": route_id,
                     "sent": sent,
+                    "throttled": throttled,
+                    "throttle_reason": "same_email_sent_within_24_hours" if throttled else None,
                     "suppressed": suppression_reason is not None,
                     "suppression_reason": suppression_reason,
                 }
@@ -5886,6 +6688,30 @@ def _run_next_automation_enrolment(
                 "status": "exited",
                 "modified": now,
             }
+        enrolment_update["transitions_without_wait"] = transitions + 1
+        # A wait's start and completion are one visit; only a real delay resets
+        # local and inherited visit history, never an expired/skipped wait.
+        if not elapsed_wait and current_node_id not in visited:
+            visited.append(current_node_id)
+        enrolment_update["visited_node_ids"] = visited
+        if "cross_automation_visits" in enrolment:
+            enrolment_update["cross_automation_visits"] = inherited
+        if node_type == "remove_automation":
+            _commit_automation_removal_action(db, cid, id, enrolment, node, claim_token,
+                run_id, success_data, enrolment_update)
+        elif node_type == "enrol_automation":
+            _commit_automation_enrolment_action(db, cid, id, enrolment, node, claim_token,
+                run_id, success_data, enrolment_update, visited, inherited)
+        else:
+            _patch_step_run(db, cid, run_id, success_data)
+            _advance_claimed_enrolment(db, cid, id, enrolment_id, claim_token, enrolment_update)
+    except subject_tests.Gate as gate:
+        with _locked_automation(db, cid, id):
+            current = db.single("select data from automation_subject_tests where cid=%s and id=%s", cid, gate.experiment_id)
+            pending = current and current.get("status") != "selected"
+            _patch_step_run(db, cid, run_id, {"status": "deferred", "action": "subject_test_gate", "experiment_id": gate.experiment_id})
+            _release_run_claim(db, cid, id, enrolment_id, claim_token, "ready", _utc_now(),
+                {"subject_gate": gate.experiment_id if pending else None, "retry_after": gate.deadline if pending else None})
     except falcon.HTTPError as e:
         fail_now = _utc_now()
         wait_not_elapsed = e.title == "Wait has not elapsed"
@@ -5930,16 +6756,6 @@ def _run_next_automation_enrolment(
             failure_update,
         )
         raise
-
-    _patch_step_run(db, cid, run_id, success_data)
-    _advance_claimed_enrolment(
-        db,
-        cid,
-        id,
-        enrolment_id,
-        claim_token,
-        enrolment_update,
-    )
 
     return {
         "enrolment": _enrolment_obj(
@@ -6371,7 +7187,7 @@ def recover_stale_automation_enrolment_claims(
             rows = db.execute(
                 """
                 select e.id, e.automation_id, a.data->>'name', e.contact_email,
-                    e.data->>'running_status', e.data->>'claimed_at', e.data->>'claimed_node_id'
+                    case when jsonb_typeof(e.data->'pending_rule_exit')='object' then 'exited' else e.data->>'running_status' end, e.data->>'claimed_at', e.data->>'claimed_node_id'
                 from automation_enrolments e
                 join automations a on a.cid = e.cid and a.id = e.automation_id
                 where e.cid = %s
@@ -6419,11 +7235,13 @@ def recover_stale_automation_enrolment_claims(
                     'admin_recovered_at', %s,
                     'admin_recovered_by_uid', %s,
                     'admin_recovery_action', %s
-                )
+                ) || case when jsonb_typeof(e.data->'pending_rule_exit')='object'
+                    then %s::jsonb || jsonb_build_object('exit_metadata',e.data->'pending_rule_exit')
+                    else '{}'::jsonb end
                 from candidates
                 where e.cid = %s and e.id = candidates.id
                 returning e.id, e.automation_id, candidates.automation_name, candidates.contact_email,
-                    candidates.restore_status, candidates.claimed_at, candidates.claimed_node_id
+                    e.data->>'status', candidates.claimed_at, candidates.claimed_node_id
                 """,
                 cid,
                 automation_id,
@@ -6434,6 +7252,8 @@ def recover_stale_automation_enrolment_claims(
                 now,
                 recovered_by_uid,
                 action,
+                {**_retry_clear_patch(), "status": "exited", "wait": None, "wake_at": None,
+                 "paused_at": None, "resumed_at": None, "pending_rule_exit": None},
                 cid,
             ).fetchall()
 
@@ -6602,7 +7422,7 @@ def recover_stale_automation_segment_scanner_claims(
                         and s.claimed_at < %s
                     order by s.claimed_at, s.id
                     limit %s
-                    for update skip locked
+                    for update of s skip locked
                 )
                 update automation_segment_trigger_snapshots s
                 set status = 'idle',
@@ -7330,6 +8150,8 @@ def _process_automation_trigger_event(db: DB, cid: str, event: JsonObj) -> JsonO
         result["errors"].append(error)
         record_event_result({"status": "failed", **error})
         return result
+
+    exit_rules.process_event(db, cid, event)
 
     if depth >= _automation_trigger_max_depth():
         result["suppressed"] += 1
@@ -8709,6 +9531,8 @@ def _eligible_automation_enrolments(
                 {automation_filter}
                 and a.data->'published' is not null
                 and coalesce(a.data->>'status', '') <> 'paused'
+                and (e.data->>'subject_gate' is null or coalesce(e.data->>'retry_after','') <=
+                    to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
                 and (
                     e.data->>'status' = 'ready'
                     or (
@@ -8787,6 +9611,8 @@ def _automation_processing_account_ids(
                 and c.data->>'automation_processing_enabled' = 'true'
                 and a.data->'published' is not null
                 and coalesce(a.data->>'status', '') <> 'paused'
+                and (e.data->>'subject_gate' is null or coalesce(e.data->>'retry_after','') <=
+                    to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'))
                 and (
                     e.data->>'status' = 'ready'
                     or (
@@ -9006,6 +9832,7 @@ def _cleanup_automation_trigger_events_for_account(
                 where cid = %s
                     and ts < %s
                     and data->>'status' = any(%s)
+                    and coalesce(data->>'exit_status', '') <> 'pending'
                 order by ts, id
                 limit %s
             ),
@@ -9173,6 +10000,33 @@ def _process_eligible_automation_enrolments(
     return result
 
 
+def _process_automation_budget(db: DB, cid: str, limit: int,
+                               automation_id: str | None = None) -> JsonObj:
+    # Opt-in throughput tuning: retain one batch by default. Never chain tasks
+    # into an unbounded queue. The deadline is checked between bounded batches;
+    # it must not interrupt an in-flight external action or clear its claim.
+    try:
+        budget = max(0, min(30, int(os.environ.get("automation_processing_budget_seconds", "0"))))
+    except (TypeError, ValueError):
+        budget = 0
+    deadline = time.monotonic() + budget
+    result = _process_eligible_automation_enrolments(db, cid, limit, automation_id)
+    for _ in range(99):
+        if (not budget or time.monotonic() >= deadline or not result["succeeded"]
+                or result["failed"]):
+            break
+        if not _customer_automation_processing_enabled(db, cid):
+            break
+        batch = _process_eligible_automation_enrolments(db, cid, limit, automation_id)
+        for key in ("processed", "succeeded", "waiting", "completed", "exited", "failed"):
+            result[key] += batch[key]
+        result["skipped_running"] = max(result["skipped_running"], batch["skipped_running"])
+        result["errors"] = (result["errors"] + batch["errors"])[:AUTOMATION_PROCESS_ERROR_LIMIT]
+        if not batch["succeeded"]:
+            break
+    return result
+
+
 @tasks.task(priority=HIGH_PRIORITY)
 def process_automation_enrolments_task(
     cid: str,
@@ -9209,7 +10063,7 @@ def process_automation_enrolments_task(
         if automation_id and db.automations.get(automation_id) is None:
             raise ValueError("Automation %s was not found for cid %s" % (automation_id, cid))
 
-        result = _process_eligible_automation_enrolments(
+        result = _process_automation_budget(
             db,
             cid,
             limit,
@@ -9514,6 +10368,7 @@ class AutomationEnrolmentCancel(object):
         "paused_waiting",
     }
 
+    @_automation_state_transition
     def on_post(
         self,
         req: falcon.Request,
@@ -9587,3 +10442,43 @@ class AutomationEnrolmentCancel(object):
         )
         user_log(req, "remove", "cancelled automation enrolment ", "automations", id, ".")
         req.context["result"] = updated
+
+
+@tasks.task(priority=HIGH_PRIORITY)
+def process_automation_exit_events_task(cid: str, limit: int = 100) -> JsonObj:
+    with open_db() as db:
+        db.set_cid(cid)
+        return exit_rules.process_pending(db, cid, min(max(limit, 1), 500))
+
+
+def check_automation_exit_events() -> JsonObj:
+    # Event queue only, including paused accounts/workflows; no contact scan.
+    with open_db() as db:
+        cids = [row[0] for row in db.execute("""select cid from automation_trigger_events
+            where data->>'exit_status'='pending'
+              and (data->>'exit_retry_at' is null or (data->>'exit_retry_at')::timestamptz <= now())
+            group by cid order by min(ts) limit 100""").fetchall()]
+        for cid in cids:
+            run_task(process_automation_exit_events_task, cid, 100)
+    return {"accounts": len(cids)}
+
+
+def check_automation_subject_tests():
+    """Decision-only scheduler: runs even while automation is paused; never sends."""
+    count = 0
+    with open_db() as db:
+        rows = db.execute("""select t.id,t.cid,t.automation_id from automation_subject_tests t
+            join automations a on a.cid=t.cid and a.id=t.automation_id
+            where t.data->>'status' in ('collecting','observing') and t.data->>'deadline' <= %s
+            order by t.data->>'deadline' limit 100""", _utc_now()).fetchall()
+        for eid, cid, aid in rows:
+            try:
+                with _locked_automation(db, cid, aid):
+                    data = db.single("select data from automation_subject_tests where cid=%s and id=%s", cid, eid)
+                    if data:
+                        subject_tests.decide(db, cid, dict(data, id=eid))
+                        count += 1
+            except falcon.HTTPForbidden:
+                # Deletion between the candidate query and lock is harmless.
+                continue
+    return {"processed": count}

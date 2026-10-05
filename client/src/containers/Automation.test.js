@@ -59,14 +59,21 @@ describe('automation enrolment display helpers', () => {
     expect(updated[0].automation_email_id).toBe('email-1');
   });
 
+  ['add_to_list', 'remove_from_list'].forEach(type => {
+    it('creates ' + type + ' with the supplied list or an empty selection', () => {
+      expect(appendAutomationNode([], type, {lists: [{id: 'list-1'}]})[0].list_id).toBe('list-1');
+      expect(appendAutomationNode([], type, {lists: []})[0].list_id).toBe('');
+      expect(appendAutomationNode([], type)[0].list_id).toBe('');
+    });
+  });
+
   it('keeps add-node menu options alphabetical and descriptive', () => {
     const items = automationAddNodeMenuItems(true, true);
     const labels = _.pluck(items, 'label');
 
     expect(labels).toEqual(labels.slice().sort((a, b) => a.localeCompare(b)));
-    expect(labels).toContain('If Contact Does Not Have Tag Node');
-    expect(labels).toContain('If Has Tag Node');
-    expect(labels).not.toContain('Condition Node');
+    expect(labels).toEqual(['Add tag', 'Add to list', 'Enrol in another automation', 'Exit automation', 'Go to', 'If conditions', 'Remove from another automation', 'Remove from list', 'Remove tag', 'Send email', 'Wait']);
+    expect(items.filter(item => item.type.indexOf('if_') === 0).map(item => item.type)).toEqual(['if_conditions']);
   });
 
   it('creates missing-tag condition nodes with branch targets', () => {
@@ -92,7 +99,7 @@ describe('automation enrolment display helpers', () => {
       condition: {
         mode: 'all',
         items: [
-          {type: 'has_tag', tag: ''},
+          {type: 'has_tag', tags: []},
         ],
       },
       yes_node_id: '',
@@ -106,7 +113,9 @@ describe('automation enrolment display helpers', () => {
       lists: [{id: 'list-1'}],
     };
 
-    expect(createAutomationConditionItem('missing_tag', options)).toEqual({type: 'missing_tag', tag: ''});
+    expect(createAutomationConditionItem('missing_tag', options)).toEqual({type: 'missing_tag', tags: []});
+    expect(createAutomationConditionItem('has_tag', options)).toEqual({type: 'has_tag', tags: []});
+    expect(createAutomationConditionItem('in_list', options)).toEqual({type: 'in_list', list_ids: []});
     expect(createAutomationConditionItem('opened_email', options)).toEqual({type: 'opened_email', automation_email_id: 'email-1'});
     expect(createAutomationConditionItem('clicked_email', options)).toEqual({
       type: 'clicked_email',
@@ -114,7 +123,11 @@ describe('automation enrolment display helpers', () => {
       click_match: 'any',
       link_url: '',
     });
-    expect(createAutomationConditionItem('not_in_list', options)).toEqual({type: 'not_in_list', list_id: 'list-1'});
+    expect(createAutomationConditionItem('not_in_list', options)).toEqual({type: 'not_in_list', list_ids: []});
+    expect(createAutomationConditionItem('not_opened_email', options)).toEqual({type: 'not_opened_email', automation_email_id: 'email-1'});
+    expect(createAutomationConditionItem('not_clicked_email', options)).toEqual({
+      type: 'not_clicked_email', automation_email_id: 'email-1', click_match: 'any', link_url: '',
+    });
   });
 
   it('inserts workflow nodes after a step without rewriting branch targets', () => {
@@ -313,7 +326,7 @@ describe('automation enrolment display helpers', () => {
     ];
 
     expect(automationNodeSummary(nodes[0], {nodes: nodes, emails: emails, lists: lists})).toBe(
-      'All of 3 conditions: has tag vip | clicked URL starts with https://example.com/offer in Welcome - Hello (HTML) | ... | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
+      'All of 3 conditions: has any of these tags: vip | clicked URL starts with https://example.com/offer in Welcome - Hello (HTML) | ... | Yes -> Step 2 - Yes (Add tag) | No -> Step 3 - No (Exit)'
     );
   });
 
@@ -495,7 +508,7 @@ describe('automation enrolment display helpers', () => {
 
     expect(_.pluck(_.map(flow.main, block => block.item), 'id')).toEqual(['send', 'branch']);
     expect(flow.main[0].item.type_label).toBe('Send email');
-    expect(flow.main[0].item.summary).toBe('Welcome - Hello (HTML)');
+    expect(flow.main[0].item.summary).toBe('Welcome');
     expect(flow.main[1].item.summary).toBe('vip');
     expect(flow.branch.item.id).toBe('branch');
     expect(_.pluck(flow.branch.lanes, 'label')).toEqual(['Yes', 'No']);
@@ -571,7 +584,7 @@ describe('automation enrolment display helpers', () => {
 
     const flow = automationWorkflowPreviewFlow(nodes, {});
 
-    expect(flow.main[0].item.summary).toBe('has tag vip');
+    expect(flow.main[0].item.summary).toBe('has any of these tags: vip');
     expect(flow.main[0].item.summary).not.toContain('All of 1 condition');
     expect(flow.main[0].item.summary).not.toContain('Yes ->');
   });
@@ -615,7 +628,7 @@ describe('automation enrolment display helpers', () => {
     expect(flow.branch.lanes[0].blocks[0].target.label).toBe('Step 1 - Pre');
   });
 
-  it('marks nested branches as a compact stop in preview lanes', () => {
+  it('expands nested branches and references a shared downstream node without duplicating it', () => {
     const nodes = [
       {id: 'branch', type: 'if_has_tag', label: 'Outer', draft_tag: 'vip', yes_node_id: 'nested', no_node_id: 'exit'},
       {id: 'nested', type: 'if_missing_tag', label: 'Nested', draft_tag: 'cold', yes_node_id: 'yes', no_node_id: 'no'},
@@ -627,7 +640,11 @@ describe('automation enrolment display helpers', () => {
     const flow = automationWorkflowPreviewFlow(nodes, {});
 
     expect(flow.branch.lanes[0].blocks[0].item.id).toBe('nested');
-    expect(flow.branch.lanes[0].blocks[0].item.nested_branch_stop).toBe(true);
+    const nested = flow.branch.lanes[0].blocks[0];
+    expect(nested.item.nested_branch_stop).toBe(false);
+    expect(nested.branch.lanes[0].blocks.map(block => block.item.id)).toEqual(['yes', 'no']);
+    expect(nested.branch.lanes[1].blocks[0].kind).toBe('reference');
+    expect(nested.branch.lanes[1].blocks[0].target.id).toBe('no');
     expect(flow.branch.lanes[0].blocks).toHaveLength(1);
   });
 
@@ -714,50 +731,76 @@ describe('automation enrolment display helpers', () => {
     expect(automationImpersonatedHref('/automations/abc/enrolments', '')).toBe('/automations/abc/enrolments');
   });
 
-  it('maps draft step contact counts to matching published step ids', () => {
+  it('maps live contact counts and links by the exact stable node ID', () => {
     const draftNodes = [
-      {id: 'draft-send', label: 'Send email'},
-      {id: 'draft-tag', label: 'Add tag'},
+      {id: 'send', label: 'Send email'},
+      {id: 'tag', label: 'Add tag'},
     ];
     const publishedNodes = [
-      {id: 'published-send', label: 'Send email'},
-      {id: 'published-tag', label: 'Add tag'},
+      {id: 'send', label: 'Send email'},
+      {id: 'tag', label: 'Add tag'},
     ];
     const summary = {
       nodes: {
-        'published-send': 1,
-        'draft-tag': 2,
-        'published-tag': 3,
+        send: 1,
+        tag: 3,
       },
     };
 
     expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(1);
-    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(5);
-    expect(automationNodeContactFilterId(draftNodes[0], draftNodes, publishedNodes)).toBe('published-send');
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(3);
+    expect(automationNodeContactFilterId(draftNodes[0], draftNodes, publishedNodes)).toBe('send');
     expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
       key: 'node_id',
-      value: 'published-send',
+      value: 'send',
     });
   });
 
-  it('prefers step-position counts for older active revisions', () => {
+  it('does not transfer a deleted published step occupancy to the next draft row', () => {
     const draftNodes = [
-      {id: 'draft-send', label: 'Send email'},
-      {id: 'draft-tag', label: 'Add tag'},
+      {id: 'exit', label: 'Exit'},
+      {id: 'wait-two', label: 'Wait'},
+    ];
+    const publishedNodes = [
+      {id: 'wait-one', label: 'Wait'},
+      {id: 'exit', label: 'Exit'},
+      {id: 'wait-two', label: 'Wait'},
     ];
     const summary = {
       nodes: {
-        'old-wait-node': 1,
+        'wait-one': 1,
       },
       node_positions: {
-        '2': 1,
+        '1': 1,
       },
     };
 
-    expect(automationNodeContactCount(draftNodes[1], draftNodes, [], summary)).toBe(1);
-    expect(automationNodeContactFilterParam(draftNodes[1], draftNodes, [], summary)).toEqual({
-      key: 'node_position',
-      value: '2',
+    expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(0);
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(0);
+    expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id',
+      value: 'exit',
+    });
+  });
+
+  it('keeps counts and view targets with their IDs when draft nodes are reordered', () => {
+    const draftNodes = [
+      {id: 'exit', label: 'Exit'},
+      {id: 'wait', label: 'Wait'},
+    ];
+    const publishedNodes = [
+      {id: 'wait', label: 'Wait'},
+      {id: 'exit', label: 'Exit'},
+    ];
+    const summary = {nodes: {wait: 2, exit: 1}, node_positions: {'1': 2, '2': 1}};
+
+    expect(automationNodeContactCount(draftNodes[0], draftNodes, publishedNodes, summary)).toBe(1);
+    expect(automationNodeContactFilterParam(draftNodes[0], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id', value: 'exit',
+    });
+    expect(automationNodeContactCount(draftNodes[1], draftNodes, publishedNodes, summary)).toBe(2);
+    expect(automationNodeContactFilterParam(draftNodes[1], draftNodes, publishedNodes, summary)).toEqual({
+      key: 'node_id', value: 'wait',
     });
   });
 
@@ -946,6 +989,24 @@ describe('automation enrolment display helpers', () => {
       expect(action.type).toBe('none');
       expect(action.disabled).toBe(true);
     });
+  });
+
+  it('explains throttled and uncertain email deliveries in history', () => {
+    const log = automationHistoryLog({events: [
+      {type: 'step_run', action: 'send_email', sent: false, throttled: true, status: 'succeeded'},
+      {type: 'step_run', action: 'send_email', email_delivery_status: 'uncertain', status: 'failed'},
+    ]});
+    expect(log).toContain('Email skipped: already sent to this contact in the last 24 hours');
+    expect(log).toContain('delivery=uncertain');
+  });
+
+  it('shows all action tags and the exact deadline in history', () => {
+    const log = automationHistoryLog({events: [
+      {type: 'step_run', tags: ['customer', 'paid'], action: 'add_tag'},
+      {type: 'step_run', wait_until: '2030-06-12T08:30:00Z', action: 'wait_complete'},
+    ]});
+    expect(log).toContain('tags=customer, paid');
+    expect(log).toContain('wait_until=2030-06-12T08:30:00Z');
   });
 
   it('includes wait metadata in copy-friendly history text', () => {

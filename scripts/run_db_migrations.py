@@ -15,6 +15,7 @@ from api.migrations import fix_funnel_indexes, create_sp_event_table, add_monthl
     add_automations_table, add_automation_enrolments_table, add_automation_step_runs_table, \
     add_automation_emails_table, add_debug_email_tables, add_automation_email_events_table, \
     add_automation_trigger_events_table, add_automation_segment_trigger_baselines_table
+from api.migrations import add_automation_subject_tests
 from api.shared.log import get_logger
 
 log = get_logger()
@@ -42,6 +43,7 @@ migration_list = [
     ('add_automation_email_events_table', add_automation_email_events_table),
     ('add_automation_trigger_events_table', add_automation_trigger_events_table),
     ('add_automation_segment_trigger_baselines_table', add_automation_segment_trigger_baselines_table),
+    ('add_automation_subject_tests', add_automation_subject_tests),
 ]
 
 def run():

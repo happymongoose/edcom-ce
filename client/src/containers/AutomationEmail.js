@@ -1,3 +1,4 @@
+import AutomationSubjectTests from './AutomationSubjectTests';
 import React, { Component } from "react";
 import { Button, Row, Col } from "react-bootstrap";
 import axios from "axios";
@@ -331,6 +332,7 @@ class AutomationEmail extends Component {
                 required
                 space
               />
+              <AutomationSubjectTests automationId={this.props.data.automation_id} emailId={this.props.data.id} saveEmail={this.save} />
               <FormControlLabel
                 id="preheader"
                 label="Preheader"

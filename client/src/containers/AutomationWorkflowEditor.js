@@ -1,15 +1,27 @@
 import React, { Component } from "react";
 import axios from "axios";
-import { Button, ButtonGroup, DropdownButton, FormControl, MenuItem } from "react-bootstrap";
+import { Button, ButtonGroup, DropdownButton, FormControl, MenuItem, Modal } from "react-bootstrap";
 import _ from "underscore";
+import moment from 'moment';
 import shortid from "shortid";
-import Select2 from "react-select2-wrapper";
+import update from "immutability-helper";
 import { SelectLabel } from "../components/FormControls";
 import { EDFormBox } from "../components/EDDOM";
-import fixTag from "../utils/fixtag";
 import getvalue from "../utils/getvalue";
+import AutomationListField, { automationListSelectionError, automationLists, withAutomationLists, automationListsError } from "./AutomationListField";
+import AutomationTargetField, { automationTargetOptions, automationTargetError, automationTargetSummary } from './AutomationTargetField';
+import AutomationEmailField, { automationEmailSelectionError } from "./AutomationEmailField";
+import AutomationTagsField, {automationTags, automationTagsError, withAutomationTags} from './AutomationTagsField';
+import AutomationTagField, { automationTagError } from "./AutomationTagField";
+import AutomationWaitFields, { automationWaitError, withAutomationWait } from "./AutomationWaitFields";
+import automationPendingRemovals from "./automationPendingRemovals";
+import AutomationGoToConnections from './AutomationGoToConnections';
+import AutomationViewport from './AutomationViewport';
+import {fallsThrough, targetFields, incomingTargets, uniqueNode, insertOnPath, removeStep, structureError, branchFallsIntoSibling, movableNode, moveOnPath, movePlacement, deleteCondition, retargetGoTo} from './automationStructure';
 
 export function automationNodeTypeLabel(type) {
+  if (type === 'remove_automation') return 'Remove from another automation';
+  if (type === 'enrol_automation') return 'Enrol in another automation';
   if (type === 'add_tag') {
     return 'Add tag';
   }
@@ -107,40 +119,38 @@ export function automationNodeTargetOptions(nodes, node) {
 
 export function automationAddNodeMenuItems(hasEmails, hasLists) {
   return _.sortBy([
-    {type: 'add_tag', label: 'Add Tag Node'},
-    {type: 'add_to_list', label: 'Add To List Node', disabled: !hasLists},
-    {type: 'exit', label: 'Add Exit Node'},
-    {type: 'go_to', label: 'Go To Node'},
-    {type: 'if_clicked_email', label: 'If Clicked Email Node', disabled: !hasEmails},
-    {type: 'if_conditions', label: 'If Conditions Node'},
-    {type: 'if_missing_tag', label: 'If Contact Does Not Have Tag Node'},
-    {type: 'if_has_tag', label: 'If Has Tag Node'},
-    {type: 'if_opened_email', label: 'If Opened Email Node', disabled: !hasEmails},
-    {type: 'remove_from_list', label: 'Remove From List Node', disabled: !hasLists},
-    {type: 'remove_tag', label: 'Remove Tag Node'},
-    {type: 'send_email', label: 'Send Email Node', disabled: !hasEmails},
-    {type: 'wait_duration', label: 'Wait Duration Node'},
+    {type: 'add_tag', label: 'Add tag'},
+    {type: 'add_to_list', label: 'Add to list', disabled: !hasLists},
+    {type: 'enrol_automation', label: 'Enrol in another automation'},
+    {type: 'exit', label: 'Exit automation'},
+    {type: 'go_to', label: 'Go to'},
+    {type: 'if_conditions', label: 'If conditions'},
+    {type: 'remove_automation', label: 'Remove from another automation'},
+    {type: 'remove_from_list', label: 'Remove from list', disabled: !hasLists},
+    {type: 'remove_tag', label: 'Remove tag'},
+    {type: 'send_email', label: 'Send email', disabled: !hasEmails},
+    {type: 'wait_duration', label: 'Wait'},
   ], item => item.label.toLowerCase());
 }
 
 export function automationConditionItemTypeLabel(type) {
   if (type === 'has_tag') {
-    return 'Has tag';
+    return 'Has any of these tags';
   }
   if (type === 'missing_tag') {
-    return 'Missing tag';
+    return 'Has none of these tags';
   }
-  if (type === 'opened_email') {
-    return 'Opened email';
+  if (['opened_email', 'not_opened_email'].includes(type)) {
+    return type === 'not_opened_email' ? 'Did not open email' : 'Opened email';
   }
-  if (type === 'clicked_email') {
-    return 'Clicked email';
+  if (['clicked_email', 'not_clicked_email'].includes(type)) {
+    return type === 'not_clicked_email' ? 'Did not click link in email' : 'Clicked link in email';
   }
   if (type === 'in_list') {
-    return 'In list';
+    return 'Is in any of these lists';
   }
   if (type === 'not_in_list') {
-    return 'Not in list';
+    return 'Not in any of these lists';
   }
   return 'Unsupported condition';
 }
@@ -148,11 +158,10 @@ export function automationConditionItemTypeLabel(type) {
 export function createAutomationConditionItem(type, options) {
   const opts = options || {};
   const emails = opts.emails || [];
-  const lists = opts.lists || [];
-  if (type === 'opened_email') {
+  if (['opened_email', 'not_opened_email'].includes(type)) {
     return {type: type, automation_email_id: emails.length ? emails[0].id : ''};
   }
-  if (type === 'clicked_email') {
+  if (['clicked_email', 'not_clicked_email'].includes(type)) {
     return {
       type: type,
       automation_email_id: emails.length ? emails[0].id : '',
@@ -160,9 +169,8 @@ export function createAutomationConditionItem(type, options) {
       link_url: '',
     };
   }
-  if (type === 'in_list' || type === 'not_in_list') {
-    return {type: type, list_id: lists.length ? lists[0].id : ''};
-  }
+  if (type === 'has_tag' || type === 'missing_tag') return {type, tags: []};
+  if (type === 'in_list' || type === 'not_in_list') return {type, list_ids: []};
   return {type: type, tag: ''};
 }
 
@@ -201,15 +209,15 @@ function conditionItemSummary(item, options) {
   const emailOptions = automationEmailOptions(opts.emails || []);
   const listOptions = automationListOptions(opts.lists || []);
   if (item.type === 'has_tag') {
-    return 'has tag ' + (item.tag || 'No tag selected');
+    return 'has any of these tags: ' + ((item.tags || [item.tag]).filter(Boolean).join(', ') || 'No tags selected');
   }
   if (item.type === 'missing_tag') {
-    return 'missing tag ' + (item.tag || 'No tag selected');
+    return 'has none of these tags: ' + ((item.tags || [item.tag]).filter(Boolean).join(', ') || 'No tags selected');
   }
-  if (item.type === 'opened_email') {
-    return 'opened ' + (item.automation_email_id ? (optionName(emailOptions, item.automation_email_id) || 'Selected email not found') : 'No email selected');
+  if (['opened_email', 'not_opened_email'].includes(item.type)) {
+    return (item.type === 'not_opened_email' ? 'did not open ' : 'opened ') + (item.automation_email_id ? (optionName(emailOptions, item.automation_email_id) || 'Selected email not found') : 'No email selected');
   }
-  if (item.type === 'clicked_email') {
+  if (['clicked_email', 'not_clicked_email'].includes(item.type)) {
     const clickMatch = automationClickMatchValue(item);
     let clickSummary = 'any link';
     if (clickMatch === 'url_exact') {
@@ -217,13 +225,13 @@ function conditionItemSummary(item, options) {
     } else if (clickMatch === 'url_prefix') {
       clickSummary = 'URL starts with ' + (item.link_url || 'No URL entered');
     }
-    return 'clicked ' + clickSummary + ' in ' + (item.automation_email_id ? (optionName(emailOptions, item.automation_email_id) || 'Selected email not found') : 'No email selected');
+    return (item.type === 'not_clicked_email' ? 'did not click ' : 'clicked ') + clickSummary + ' in ' + (item.automation_email_id ? (optionName(emailOptions, item.automation_email_id) || 'Selected email not found') : 'No email selected');
   }
   if (item.type === 'in_list') {
-    return 'in list ' + (item.list_id ? (optionName(listOptions, item.list_id) || 'Selected list not found') : 'No list selected');
+    return 'is in any of these lists: ' + ((item.list_ids || [item.list_id]).filter(Boolean).map(id => optionName(listOptions, id) || 'Selected list not found').join(', ') || 'No lists selected');
   }
   if (item.type === 'not_in_list') {
-    return 'not in list ' + (item.list_id ? (optionName(listOptions, item.list_id) || 'Selected list not found') : 'No list selected');
+    return 'not in any of these lists: ' + ((item.list_ids || [item.list_id]).filter(Boolean).map(id => optionName(listOptions, id) || 'Selected list not found').join(', ') || 'No lists selected');
   }
   return 'Unsupported condition';
 }
@@ -234,6 +242,9 @@ export function automationNodeSummary(node, options) {
   const emailOptions = automationEmailOptions(opts.emails || []);
   const listOptions = automationListOptions(opts.lists || []);
 
+  if (['enrol_automation', 'remove_automation'].includes(node.type)) {
+    return automationNodeTypeLabel(node.type) + ': ' + automationTargetSummary(node.automation_id, automationTargetOptions(opts.automations, opts.automationId, node.type));
+  }
   if (node.type === 'send_email') {
     if (!node.automation_email_id) {
       return 'No email selected';
@@ -241,25 +252,19 @@ export function automationNodeSummary(node, options) {
     return 'Send email: ' + (optionName(emailOptions, node.automation_email_id) || 'Selected email not found');
   }
   if (node.type === 'add_tag') {
-    return node.draft_tag ? 'Add tag: ' + node.draft_tag : 'No tag selected';
+    return automationTags(node).filter(Boolean).length ? (automationTags(node).length > 1 ? 'Add tags: ' : 'Add tag: ') + automationTags(node).join(', ') : 'No tag selected';
   }
   if (node.type === 'remove_tag') {
-    return node.draft_tag ? 'Remove tag: ' + node.draft_tag : 'No tag selected';
+    return automationTags(node).filter(Boolean).length ? (automationTags(node).length > 1 ? 'Remove tags: ' : 'Remove tag: ') + automationTags(node).join(', ') : 'No tag selected';
   }
-  if (node.type === 'add_to_list') {
-    if (!node.list_id) {
-      return 'No list selected';
-    }
-    return 'Add to list: ' + (optionName(listOptions, node.list_id) || 'Selected list not found');
-  }
-  if (node.type === 'remove_from_list') {
-    if (!node.list_id) {
-      return 'No list selected';
-    }
-    return 'Remove from list: ' + (optionName(listOptions, node.list_id) || 'Selected list not found');
+  if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
+    const ids = automationLists(node).filter(Boolean);
+    if (!ids.length) return 'No list selected';
+    return (node.type === 'add_to_list' ? 'Add to ' : 'Remove from ') + (ids.length > 1 ? 'lists: ' : 'list: ') +
+      ids.map(id => optionName(listOptions, id) || 'Selected list not found').join(', ');
   }
   if (node.type === 'wait_duration') {
-    return 'Wait: ' + durationSummary(node.duration || {});
+    return node.wait_until !== undefined ? 'Wait until: ' + (node.wait_until ? moment(node.wait_until).format('LLL') : 'Choose date and time') : 'Wait: ' + durationSummary(node.duration || {});
   }
   if (node.type === 'if_has_tag') {
     return 'If has tag: ' + (node.draft_tag || 'No tag selected') +
@@ -314,10 +319,12 @@ export function automationNodeSummaryWarning(summary) {
     summary.indexOf('No tag selected') !== -1 ||
     summary.indexOf('No email selected') !== -1 ||
     summary.indexOf('No list selected') !== -1 ||
+    summary.indexOf('No automation selected') !== -1 ||
     summary.indexOf('No conditions configured') !== -1 ||
     summary.indexOf('No URL entered') !== -1 ||
     summary.indexOf('Selected email not found') !== -1 ||
     summary.indexOf('Selected list not found') !== -1 ||
+    summary.indexOf('Selected automation unavailable') !== -1 ||
     summary.indexOf('Target missing') !== -1 ||
     summary.indexOf('Wait duration incomplete') !== -1;
 }
@@ -438,23 +445,24 @@ function automationWorkflowPreviewSummary(node, options) {
   const emailOptions = automationEmailOptions(opts.emails || []);
   const listOptions = automationListOptions(opts.lists || []);
 
+  if (['enrol_automation', 'remove_automation'].includes(node.type)) {
+    return automationTargetSummary(node.automation_id, automationTargetOptions(opts.automations, opts.automationId, node.type));
+  }
   if (node.type === 'send_email') {
     if (!node.automation_email_id) {
       return 'No email selected';
     }
-    return optionName(emailOptions, node.automation_email_id) || 'Selected email not found';
+    const email = _.findWhere(opts.emails || [], {id: node.automation_email_id});
+    return email ? (email.name || email.subject || 'Untitled email') : 'Selected email not found';
   }
   if (node.type === 'add_tag' || node.type === 'remove_tag') {
-    return node.draft_tag || 'No tag selected';
+    return automationTags(node).filter(Boolean).join(', ') || 'No tag selected';
   }
   if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
-    if (!node.list_id) {
-      return 'No list selected';
-    }
-    return optionName(listOptions, node.list_id) || 'Selected list not found';
+    return automationLists(node).filter(Boolean).map(id => optionName(listOptions, id) || 'Selected list not found').join(', ') || 'No list selected';
   }
   if (node.type === 'wait_duration') {
-    return durationSummary(node.duration || {});
+    return node.wait_until !== undefined ? (node.wait_until ? moment(node.wait_until).format('LLL') : 'Choose date and time') : durationSummary(node.duration || {});
   }
   if (node.type === 'if_has_tag' || node.type === 'if_missing_tag') {
     return node.draft_tag || 'No tag selected';
@@ -570,6 +578,13 @@ function automationWorkflowPreviewNodeIndex(workflowNodes, nodeId) {
   return -1;
 }
 
+function automationWorkflowPreviewBranch(workflowNodes, item, options, visited, depth) {
+  return {item, lanes: ['Yes', 'No'].map(label => ({label,
+    blocks: automationWorkflowPreviewPath(workflowNodes, item.node[label === 'Yes' ? 'yes_node_id' : 'no_node_id'],
+      options, visited, depth),
+  }))};
+}
+
 function automationWorkflowPreviewPath(workflowNodes, startId, options, visited, depth) {
   const opts = options || {};
   const maxDepth = opts.maxDepth || 40;
@@ -599,12 +614,13 @@ function automationWorkflowPreviewPath(workflowNodes, startId, options, visited,
       return blocks;
     }
 
-    if (currentVisited[nodeId]) {
+    if (currentVisited[nodeId] || opts.rendered.has(nodeId)) {
       blocks.push(automationWorkflowPreviewReferenceBlock(workflowNodes, nodeId, 'Continues at'));
       return blocks;
     }
 
     const node = workflowNodes[nodeIndex];
+    opts.rendered.add(nodeId);
     const item = automationWorkflowPreviewItemForNode(workflowNodes, node, opts);
     currentVisited = {
       ...currentVisited,
@@ -622,7 +638,7 @@ function automationWorkflowPreviewPath(workflowNodes, startId, options, visited,
       return blocks;
     }
     if (automationBranchNode(node.type)) {
-      item.nested_branch_stop = true;
+      blocks[blocks.length - 1].branch = automationWorkflowPreviewBranch(workflowNodes, item, opts, currentVisited, currentDepth + 1);
       return blocks;
     }
     if (!workflowNodes[nodeIndex + 1]) {
@@ -642,6 +658,7 @@ export function automationWorkflowPreviewFlow(nodes, options) {
   const opts = {
     ...(options || {}),
     nodes: workflowNodes,
+    rendered: new Set(),
   };
   const main = [];
   let branch = null;
@@ -673,6 +690,7 @@ export function automationWorkflowPreviewFlow(nodes, options) {
     }
 
     const node = workflowNodes[nodeIndex];
+    opts.rendered.add(nodeId);
     const item = automationWorkflowPreviewItemForNode(workflowNodes, node, opts);
     visited = {
       ...visited,
@@ -740,7 +758,7 @@ export function createAutomationNode(type, options) {
   const node = {
     id: generateId(),
     type: type,
-    label: type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_missing_tag' ? 'If contact does not have tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'if_conditions' ? 'If conditions' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
+    label: type === 'remove_automation' ? 'Remove from another automation' : type === 'enrol_automation' ? 'Enrol in another automation' : type === 'add_tag' ? 'Add tag' : type === 'remove_tag' ? 'Remove tag' : type === 'add_to_list' ? 'Add to list' : type === 'remove_from_list' ? 'Remove from list' : type === 'wait_duration' ? 'Wait' : type === 'if_has_tag' ? 'If contact has tag' : type === 'if_missing_tag' ? 'If contact does not have tag' : type === 'if_opened_email' ? 'If opened email' : type === 'if_clicked_email' ? 'If clicked email' : type === 'if_conditions' ? 'If conditions' : type === 'go_to' ? 'Go to' : type === 'send_email' ? 'Send email' : 'Exit automation',
   };
 
   if (type === 'add_tag' || type === 'remove_tag') {
@@ -778,6 +796,7 @@ export function createAutomationNode(type, options) {
   if (type === 'go_to') {
     node.target_node_id = '';
   }
+  if (['enrol_automation', 'remove_automation'].includes(type)) node.automation_id = '';
   if (type === 'send_email') {
     node.automation_email_id = emails.length ? emails[0].id : '';
   }
@@ -810,17 +829,105 @@ export function moveAutomationNode(nodes, index, direction) {
   return nextNodes;
 }
 
+export function automationPreviewPathWidth(blocks) {
+  return Math.max(340, ...(blocks || []).map(block => automationPreviewBranchWidth(block.branch)));
+}
+
+export function automationPreviewBranchWidth(branch) {
+  return branch ? branch.lanes.reduce((sum, lane) => sum + automationPreviewPathWidth(lane.blocks), 0) + 32 : 340;
+}
+
 class AutomationWorkflowEditor extends Component {
   state = {
     expandedNodeIds: {},
     emailLinksById: {},
     emailLinksLoading: {},
     emailLinksError: {},
-    workflowView: 'edit',
+    workflowView: 'preview',
+    nodeEdit: null,
+    nodeEditError: '',
+    nodeSaving: false,
+    structureEdit: null,
+    structureEditError: '',
+    moving: null,
+    goToSelection: null,
+    goToError: '',
   }
 
   componentDidMount() {
+    document.addEventListener('keydown', this.cancelGoToOnEscape);
     this.loadVisibleClickedEmailLinks();
+  }
+
+  componentWillUnmount() {
+    document.removeEventListener('keydown', this.cancelGoToOnEscape);
+  }
+
+  cancelGoToOnEscape = event => {
+    if (event.keyCode === 27 && this.state.goToSelection) this.closeGoToSelection();
+  }
+
+  openGoToSelection = (id, trigger) => {
+    const original = JSON.parse(JSON.stringify(this.props.nodes || []));
+    try {
+      const node = uniqueNode(original, id);
+      if (node.type !== 'go_to') return;
+      this.goToTrigger = trigger;
+      this.setState({goToSelection: {id, original, nodes: original, target: node.target_node_id}, goToError: '', moving: null}, () => {
+        if (this.goToPrompt) this.goToPrompt.focus();
+      });
+    } catch (error) {this.setState({structureEditError: error.message});}
+  }
+
+  closeGoToSelection = () => {
+    this.setState({goToSelection: null, goToError: ''}, () => {
+      if (this.goToTrigger && document.body.contains(this.goToTrigger)) this.goToTrigger.focus();
+    });
+  }
+
+  goToSelectionError(nodes = this.props.nodes || []) {
+    const selection = this.state.goToSelection;
+    if (!selection) return '';
+    if (!_.isEqual(nodes, selection.original)) return 'The workflow changed. Cancel and select the destination again.';
+    try {
+      if (!selection.target) return 'Select an available destination node.';
+      retargetGoTo(selection.nodes, selection.id, selection.target);
+      return '';
+    } catch (error) {return error.message;}
+  }
+
+  confirmGoToSelection = () => {
+    if (!this.state.goToSelection || this.goToSaving) return;
+    const error = this.goToSelectionError();
+    if (error) {this.setState({goToError: error}); return;}
+    const selection = this.state.goToSelection;
+    let committed = false;
+    this.goToSaving = true;
+    this.props.update({draft: {$apply: draft => {
+      if (this.goToSelectionError(draft.nodes)) return draft;
+      const plan = retargetGoTo(selection.nodes, selection.id, selection.target);
+      const moves = {...(draft.moves || {})};
+      plan.removed.forEach(node => {delete moves[node.id];});
+      committed = true;
+      return {...draft, nodes: plan.nodes, ...(draft.moves ? {moves} : {})};
+    }}}, () => {
+      this.goToSaving = false;
+      if (committed) this.closeGoToSelection();
+      else this.setState({goToError: 'The workflow changed. Cancel and select the destination again.'});
+    });
+  }
+
+  renderGoToChoice(node) {
+    const selection = this.state.goToSelection;
+    if (!selection || node.id === selection.id) return null;
+    const nodes = selection.nodes;
+    const available = nodes.filter(item => item.id === node.id).length === 1;
+    return <label className="automation-go-to-choice" title={available ? 'Choose destination' : 'Ambiguous node ID'}>
+      <input type="checkbox" checked={selection.target === node.id} disabled={!available}
+        aria-label={'Go to ' + node.label} data-target-node-id={node.id}
+        onChange={() => this.setState({goToSelection: {...selection, target: selection.target === node.id ? '' : node.id}, goToError: ''})} />
+      <span className="sr-only">Go to {node.label}</span>
+    </label>;
   }
 
   componentDidUpdate() {
@@ -830,17 +937,17 @@ class AutomationWorkflowEditor extends Component {
   loadVisibleClickedEmailLinks() {
     _.each(this.props.nodes || [], node => {
       if (
-        this.state.expandedNodeIds[node.id] &&
+        (this.state.expandedNodeIds[node.id] || this.props.configurationOnly === node.id) &&
         node.type === 'if_clicked_email' &&
         automationClickMatchValue(node) !== 'any' &&
         node.automation_email_id
       ) {
         this.loadAutomationEmailLinks(node.automation_email_id);
       }
-      if (this.state.expandedNodeIds[node.id] && node.type === 'if_conditions') {
+      if ((this.state.expandedNodeIds[node.id] || this.props.configurationOnly === node.id) && node.type === 'if_conditions') {
         _.each(((node.condition || {}).items || []), item => {
           if (
-            item.type === 'clicked_email' &&
+            ['clicked_email', 'not_clicked_email'].includes(item.type) &&
             automationClickMatchValue(item) !== 'any' &&
             item.automation_email_id
           ) {
@@ -911,26 +1018,26 @@ class AutomationWorkflowEditor extends Component {
     });
   }
 
-  nodeTagChange = (index, event) => {
+  nodeTagChange = (index, tag) => {
     this.props.update({
       draft: {
         nodes: {
           [index]: {
-            draft_tag: {$set: event.params.data.id},
+            $apply: node => ['add_tag', 'remove_tag'].includes(node.type) ? withAutomationTags(node, tag) : {...node, draft_tag: tag},
           },
         },
       },
     });
   }
 
-  nodeDurationChange = (index, event) => {
-    const value = parseInt(event.target.value, 10);
+  nodeDurationChange = (index, unit, rawValue) => {
+    const value = parseInt(rawValue, 10);
     this.props.update({
       draft: {
         nodes: {
           [index]: {
             duration: {
-              [event.target.id]: {$set: isNaN(value) ? 0 : value},
+              [unit]: {$set: this.props.configurationOnly ? rawValue : isNaN(value) ? 0 : value},
             },
           },
         },
@@ -1001,13 +1108,11 @@ class AutomationWorkflowEditor extends Component {
     });
   }
 
-  conditionItemTagChange = (index, itemIndex, event) => {
-    this.conditionItemChange(index, itemIndex, {
-      target: {
-        id: 'tag',
-        value: event.params.data.id,
-      },
-    });
+  conditionSelectionsChange = (index, itemIndex, item, singular, plural, values) => {
+    const next = {...item};
+    delete next[singular];
+    next[plural] = values;
+    this.props.update({draft: {nodes: {[index]: {condition: {items: {[itemIndex]: {$set: next}}}}}}});
   }
 
   addConditionItem = index => {
@@ -1076,8 +1181,14 @@ class AutomationWorkflowEditor extends Component {
   }
 
   deleteNode = index => {
+    const node = this.props.nodes[index];
+    if (automationBranchNode(node.type)) {
+      this.openStructureEditor('delete', node.id);
+      return;
+    }
     this.props.update({
       draft: {
+        ...((this.props.moveDecisions || {})[node.id] ? {moves: {$unset: [node.id]}} : {}),
         nodes: {
           $splice: [[index, 1]],
         },
@@ -1123,8 +1234,8 @@ class AutomationWorkflowEditor extends Component {
   tagData() {
     const tags = this.props.tags || [];
     const nodes = this.props.nodes || [];
-    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag', 'if_missing_tag'], node.type) && node.draft_tag), 'draft_tag');
-    const conditionTags = _.flatten(_.map(nodes, node => _.map(((node.condition || {}).items || []), item => item.tag || '')));
+    const draftTags = _.flatten(nodes.filter(node => ['add_tag', 'remove_tag', 'if_has_tag', 'if_missing_tag'].includes(node.type)).map(automationTags));
+    const conditionTags = _.flatten(_.map(nodes, node => _.map(((node.condition || {}).items || []), item => item.tags || [item.tag || ''])));
     return _.map(_.uniq(tags.concat(draftTags).concat(conditionTags).concat(this.props.entryTags || [])), tag => tag).filter(Boolean).map(tag => ({id: tag, text: tag}));
   }
 
@@ -1137,36 +1248,199 @@ class AutomationWorkflowEditor extends Component {
       nodes: this.props.nodes || [],
       emails: this.props.emails || [],
       lists: this.props.lists || [],
+      automations: this.props.automations || [], automationId: this.props.automationId,
     });
   }
 
+  openNodeEditor = (id, type) => {
+    if (!_.contains(['wait_duration', 'add_tag', 'remove_tag', 'send_email', 'add_to_list', 'remove_from_list', 'enrol_automation', 'remove_automation'], type)) return;
+    const matches = (this.props.nodes || []).filter(node => node.id === id);
+    const original = matches.length === 1 && matches[0].type === type ?
+      JSON.parse(JSON.stringify(matches[0])) : null;
+    this.setState({
+      nodeEdit: {
+        id: id, type: type, original: original,
+        duration: type === 'wait_duration' ? {...((original || {}).duration || {days: 0, hours: 0, minutes: 5})} : undefined,
+        wait_until: (original || {}).wait_until,
+        list_ids: _.contains(['add_to_list', 'remove_from_list'], type) ? automationLists(original || {}) : undefined,
+        automation_id: ['enrol_automation', 'remove_automation'].includes(type) ? (original || {}).automation_id || '' : undefined,
+        automation_email_id: type === 'send_email' ? (original || {}).automation_email_id || '' : undefined,
+        tags: _.contains(['add_tag', 'remove_tag'], type) ? automationTags(original || {}) : undefined,
+      },
+      nodeEditError: '',
+    });
+  }
+
+  closeNodeEditor = () => {
+    this.setState({nodeEdit: null, nodeEditError: ''});
+  }
+
+  waitDurationChange = (unit, value) => {
+    this.setState(state => ({
+      nodeEdit: {...state.nodeEdit, duration: {...state.nodeEdit.duration, [unit]: value}},
+      nodeEditError: '',
+    }));
+  }
+
+  modalTagChange = tag => {
+    this.setState(state => ({nodeEdit: {...state.nodeEdit, tags: tag}, nodeEditError: ''}));
+  }
+
+  modalEmailChange = event => {
+    const value = getvalue(event);
+    this.setState(state => ({nodeEdit: {...state.nodeEdit, automation_email_id: value}, nodeEditError: ''}));
+  }
+
+  modalListChange = value => {
+    this.setState(state => ({nodeEdit: {...state.nodeEdit, list_ids: value}, nodeEditError: ''}));
+  }
+
+  targetAutomationOptions(type) {
+    return automationTargetOptions(this.props.automations, this.props.automationId, type);
+  }
+
+  nodeFieldError(edit) {
+    if (['enrol_automation', 'remove_automation'].includes(edit.type)) return automationTargetError(edit.automation_id, this.targetAutomationOptions(edit.type));
+    if (_.contains(['add_to_list', 'remove_from_list'], edit.type)) {
+      return automationListsError(edit.list_ids, automationListOptions(this.props.lists || []));
+    }
+    if (edit.type === 'send_email') {
+      return automationEmailSelectionError(edit.automation_email_id, automationEmailOptions(this.props.emails || []));
+    }
+    return edit.type === 'wait_duration' ? automationWaitError(edit.duration, edit.wait_until) : automationTagsError(edit.tags);
+  }
+
+  nodeTargetError(edit, nodes) {
+    const label = automationNodeTypeLabel(edit.type);
+    const matches = (nodes || []).filter(node => node.id === edit.id);
+    if (matches.length !== 1 || !edit.original || matches[0].type !== edit.type) {
+      return 'This ' + label + ' step is missing, changed type, or has a duplicate ID. Close this dialog and check the list editor.';
+    }
+    if (!_.isEqual(matches[0], edit.original)) {
+      return 'This ' + label + ' step changed while the dialog was open. Close and reopen it to edit the current values.';
+    }
+    return '';
+  }
+
+  saveNodeEditor = () => {
+    const edit = this.state.nodeEdit;
+    if (!edit || this.nodeCommitPending) {
+      return;
+    }
+    const error = this.nodeTargetError(edit, this.props.nodes) || this.nodeFieldError(edit);
+    if (error) {
+      this.setState({nodeEditError: this.nodeTargetError(edit, this.props.nodes)});
+      return;
+    }
+    const patch = ['enrol_automation', 'remove_automation'].includes(edit.type) ? {automation_id: edit.automation_id} : edit.type === 'wait_duration' ? withAutomationWait({}, edit) : _.contains(['add_to_list', 'remove_from_list'], edit.type) ? withAutomationLists({}, edit.list_ids) : edit.type === 'send_email' ? {automation_email_id: edit.automation_email_id} : withAutomationTags({}, edit.tags);
+    this.nodeCommitPending = true;
+    this.setState({nodeSaving: true});
+    let committed = false;
+    this.props.update({draft: {nodes: {$apply: nodes => {
+      // Resolve against the canonical array at commit time, never a captured index.
+      if (this.nodeTargetError(edit, nodes) || this.nodeFieldError(edit)) {
+        return nodes;
+      }
+      committed = true;
+      return nodes.map(node => node.id === edit.id ? (['add_tag', 'remove_tag'].includes(edit.type) ? withAutomationTags(node, edit.tags) : ['add_to_list', 'remove_from_list'].includes(edit.type) ? withAutomationLists(node, edit.list_ids) : edit.type === 'wait_duration' ? withAutomationWait(node, edit) : {...node, ...patch}) : node);
+    }}}}, () => {
+      this.nodeCommitPending = false;
+      this.setState({
+        nodeSaving: false,
+        nodeEdit: committed ? null : edit,
+        nodeEditError: committed ? '' : 'This step changed. Close and reopen the dialog before saving.',
+      });
+    });
+  }
+
+  renderNodeEditor() {
+    const edit = this.state.nodeEdit;
+    const isWait = !edit || edit.type === 'wait_duration';
+    const label = edit ? automationNodeTypeLabel(edit.type) : 'Wait';
+    const fieldError = edit && this.nodeFieldError(edit);
+    const targetError = edit && (this.nodeTargetError(edit, this.props.nodes) || this.state.nodeEditError);
+    const isAutomationTarget = edit && ['enrol_automation', 'remove_automation'].includes(edit.type);
+    const isEmail = edit && edit.type === 'send_email';
+    const isList = edit && _.contains(['add_to_list', 'remove_from_list'], edit.type);
+    const fieldId = isAutomationTarget ? 'automation-target-modal' : isList ? 'automation-list-modal' : isWait ? 'automation-wait-modal' : isEmail ? 'automation-email-modal' : 'automation-tag-modal';
+    return (
+      <Modal show={!!edit} onHide={this.closeNodeEditor} aria-labelledby="automation-node-title">
+        <Modal.Header closeButton>
+          <Modal.Title id="automation-node-title">Edit {label} step</Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          {edit && <div>
+            <p>{(edit.original || {}).label || label}</p>
+            {targetError && <p className="help-block text-danger" role="alert">{targetError}</p>}
+            {isAutomationTarget ? <AutomationTargetField
+              action={edit.type} id={fieldId} value={edit.automation_id} options={this.targetAutomationOptions(edit.type)} invalid={!!fieldError}
+              onChange={event => {
+                const value = getvalue(event);
+                this.setState({nodeEdit: {...edit, automation_id: value}, nodeEditError: ''});
+              }}
+            /> : isWait ? <AutomationWaitFields
+              duration={edit.duration}
+              waitUntil={edit.wait_until}
+              onModeChange={mode => this.setState({nodeEdit: {...edit, wait_until: mode === 'until' ? '' : undefined}})}
+              onDateChange={value => this.setState({nodeEdit: {...edit, wait_until: value}})}
+              idPrefix={fieldId}
+              invalid={!!fieldError}
+              onChange={this.waitDurationChange}
+            /> : isList ? <AutomationListField
+              id={fieldId}
+              multiple
+              value={edit.list_ids}
+              options={automationListOptions(this.props.lists || [])}
+              onChange={this.modalListChange}
+              invalid={!!fieldError}
+            /> : isEmail ? <AutomationEmailField
+              id={fieldId}
+              value={edit.automation_email_id}
+              options={automationEmailOptions(this.props.emails || [])}
+              onChange={this.modalEmailChange}
+              invalid={!!fieldError}
+            /> : <AutomationTagsField
+              id={fieldId}
+              value={edit.tags}
+              data={this.tagData()}
+              onChange={this.modalTagChange}
+              invalid={!!fieldError}
+              inModal
+            />}
+            {fieldError && <p id={fieldId + '-error'} className="help-block text-danger" role="alert">{fieldError}</p>}
+            <p className="help-block">Save applies this configuration to the draft. Use the page Save button to persist the automation.</p>
+          </div>}
+        </Modal.Body>
+        <Modal.Footer>
+          <Button type="button" onClick={this.closeNodeEditor}>Cancel</Button>
+          <Button type="button" bsStyle="primary" disabled={!!fieldError || !!targetError || this.state.nodeSaving} onClick={this.saveNodeEditor}>Save</Button>
+        </Modal.Footer>
+      </Modal>
+    );
+  }
+
   renderNodeConfig(node, index) {
-    if (node.type === 'add_tag' || node.type === 'remove_tag' || node.type === 'if_has_tag' || node.type === 'if_missing_tag') {
+    if (['enrol_automation', 'remove_automation'].includes(node.type)) {
+      return <AutomationTargetField action={node.type} id="automation_id" value={node.automation_id}
+        options={this.targetAutomationOptions(node.type)} onChange={this.nodeTargetChange.bind(this, index)} />;
+    }
+    if (node.type === 'add_tag' || node.type === 'remove_tag') {
+      return <AutomationTagsField id={'node-tag-' + node.id} inModal={!!this.props.configurationOnly}
+        data={this.tagData()} value={automationTags(node)} onChange={this.nodeTagChange.bind(this, index)} />;
+    }
+    if (node.type === 'if_has_tag' || node.type === 'if_missing_tag') {
       return (
         <div style={{minWidth: '220px'}}>
-          <Select2
+          <AutomationTagField
+            id={'node-tag-' + node.id}
+            inModal={!!this.props.configurationOnly}
             data={this.tagData()}
             value={node.draft_tag || ''}
-            onSelect={this.nodeTagChange.bind(this, index)}
-            style={{width:'100%'}}
-            options={{
-              placeholder: 'Select or create tag',
-              tags: true,
-              createTag: function (params) {
-                const fixed = fixTag(params.term);
-                if (!fixed) {
-                  return null;
-                }
-                return {
-                  id: fixed,
-                  text: fixed,
-                };
-              }
-            }}
+            onChange={this.nodeTagChange.bind(this, index)}
           />
-          <span className="help-block">Draft-only configuration. This is not validated or executable yet.</span>
+          <span className="help-block">Draft configuration. The complete workflow is validated when you publish.</span>
           {
-            node.type === 'if_has_tag' || node.type === 'if_missing_tag' ?
+            !this.props.hideBranchTargets && (node.type === 'if_has_tag' || node.type === 'if_missing_tag') ?
               <div className="space-top-sm">
                 <SelectLabel
                   id="yes_node_id"
@@ -1193,41 +1467,20 @@ class AutomationWorkflowEditor extends Component {
     }
 
     if (node.type === 'wait_duration') {
-      const duration = node.duration || {};
       return (
-        <div className="form-inline" style={{minWidth: '280px'}}>
-          <FormControl
-            id="days"
-            type="number"
-            min="0"
-            value={duration.days || 0}
-            onChange={this.nodeDurationChange.bind(this, index)}
-            style={{width: '70px'}}
-          />
-          {' '}days{' '}
-          <FormControl
-            id="hours"
-            type="number"
-            min="0"
-            value={duration.hours || 0}
-            onChange={this.nodeDurationChange.bind(this, index)}
-            style={{width: '70px'}}
-          />
-          {' '}hours{' '}
-          <FormControl
-            id="minutes"
-            type="number"
-            min="0"
-            value={duration.minutes || 0}
-            onChange={this.nodeDurationChange.bind(this, index)}
-            style={{width: '70px'}}
-          />
-          {' '}minutes
-        </div>
+        <AutomationWaitFields
+          duration={node.duration}
+          waitUntil={node.wait_until}
+          onModeChange={mode => this.props.update({draft: {nodes: {[index]: {$apply: current => withAutomationWait(current, mode === 'until' ? {wait_until: ''} : {duration: {days: 0, hours: 0, minutes: 5}})}}}})}
+          onDateChange={value => this.props.update({draft: {nodes: {[index]: {$apply: current => withAutomationWait(current, {wait_until: value})}}}})}
+          idPrefix={'wait-' + node.id}
+          onChange={this.nodeDurationChange.bind(this, index)}
+        />
       );
     }
 
     if (node.type === 'go_to') {
+      if (this.props.hideBranchTargets) return <p className="help-block">After saving this step, click its card to choose a destination visually.</p>;
       return (
         <div style={{minWidth: '220px'}}>
           <SelectLabel
@@ -1243,25 +1496,13 @@ class AutomationWorkflowEditor extends Component {
     }
 
     if (node.type === 'send_email') {
-      const options = automationEmailOptions(this.props.emails || []);
-      if (!options.length) {
-        return (
-          <div style={{minWidth: '260px'}}>
-            <p className="help-block">Create an automation email before configuring this step.</p>
-          </div>
-        );
-      }
       return (
-        <div style={{minWidth: '320px'}}>
-          <SelectLabel
-            id="automation_email_id"
-            label="Automation email"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={options}
-            emptyVal="Select email"
-          />
-        </div>
+        <AutomationEmailField
+          id="automation_email_id"
+          value={node.automation_email_id}
+          options={automationEmailOptions(this.props.emails || [])}
+          onChange={this.nodeTargetChange.bind(this, index)}
+        />
       );
     }
 
@@ -1371,7 +1612,7 @@ class AutomationWorkflowEditor extends Component {
             :
               null
           }
-          <SelectLabel
+          {!this.props.hideBranchTargets && <div><SelectLabel
             id="yes_node_id"
             label="Yes target"
             obj={node}
@@ -1387,6 +1628,7 @@ class AutomationWorkflowEditor extends Component {
             options={this.nodeTargetOptions(node)}
             emptyVal="Select target"
           />
+          </div>}
         </div>
       );
     }
@@ -1418,7 +1660,7 @@ class AutomationWorkflowEditor extends Component {
           >
             Add condition
           </Button>
-          <div className="space-top-sm">
+          {!this.props.hideBranchTargets && <div className="space-top-sm">
             <SelectLabel
               id="yes_node_id"
               label="Yes target"
@@ -1435,31 +1677,20 @@ class AutomationWorkflowEditor extends Component {
               options={this.nodeTargetOptions(node)}
               emptyVal="Select target"
             />
-          </div>
+          </div>}
         </div>
       );
     }
 
     if (node.type === 'add_to_list' || node.type === 'remove_from_list') {
-      const options = automationListOptions(this.props.lists || []);
-      if (!options.length) {
-        return (
-          <div style={{minWidth: '220px'}}>
-            <p className="help-block">Create a contact list before selecting this node.</p>
-          </div>
-        );
-      }
-
       return (
-        <div style={{minWidth: '220px'}}>
-          <SelectLabel
-            id="list_id"
-            obj={node}
-            onChange={this.nodeTargetChange.bind(this, index)}
-            options={options}
-            emptyVal="Select list"
-          />
-        </div>
+        <AutomationListField
+          id="list_id"
+          multiple
+          value={automationLists(node)}
+          options={automationListOptions(this.props.lists || [])}
+          onChange={ids => this.props.update({draft: {nodes: {[index]: {$set: withAutomationLists(node, ids)}}}})}
+        />
       );
     }
 
@@ -1495,12 +1726,10 @@ class AutomationWorkflowEditor extends Component {
               value={item.type || 'has_tag'}
               onChange={this.conditionItemTypeChange.bind(this, index, itemIndex)}
             >
-              <option value="clicked_email">Clicked email</option>
-              <option value="has_tag">Has tag</option>
-              <option value="in_list">In list</option>
-              <option value="missing_tag">Missing tag</option>
-              <option value="not_in_list">Not in list</option>
-              <option value="opened_email">Opened email</option>
+              {['has_tag', 'missing_tag', 'in_list', 'not_in_list', 'opened_email', 'not_opened_email', 'clicked_email', 'not_clicked_email']
+                .map(type => ({type, label: automationConditionItemTypeLabel(type)}))
+                .sort((a, b) => a.label.localeCompare(b.label))
+                .map(option => <option key={option.type} value={option.type}>{option.label}</option>)}
             </FormControl>
           </div>
           <div className="col-sm-7">
@@ -1524,65 +1753,39 @@ class AutomationWorkflowEditor extends Component {
 
   renderConditionItemFields(index, itemIndex, item, emailOptions, listOptions, clickMatch, discoveredLinks, selectedDiscoveredLink) {
     if (item.type === 'has_tag' || item.type === 'missing_tag') {
-      return (
-        <div>
-          <label className="control-label">Tag</label>
-          <Select2
-            data={this.tagData()}
-            value={item.tag || ''}
-            onSelect={this.conditionItemTagChange.bind(this, index, itemIndex)}
-            style={{width:'100%'}}
-            options={{
-              placeholder: 'Select or create tag',
-              tags: true,
-              createTag: function (params) {
-                const fixed = fixTag(params.term);
-                if (!fixed) {
-                  return null;
-                }
-                return {
-                  id: fixed,
-                  text: fixed,
-                };
-              }
-            }}
-          />
-        </div>
-      );
+      return <AutomationTagsField id={'condition-tags-' + index + '-' + itemIndex}
+        inModal={!!this.props.configurationOnly} data={this.tagData()}
+        value={item.tags || [item.tag || '']}
+        onChange={tags => this.conditionSelectionsChange(index, itemIndex, item, 'tag', 'tags', tags)} />;
     }
-
     if (item.type === 'in_list' || item.type === 'not_in_list') {
-      if (!listOptions.length) {
-        return <p className="help-block">Create a contact list before configuring this condition.</p>;
-      }
-      return (
-        <SelectLabel
-          id="list_id"
-          label="Contact list"
-          obj={item}
-          onChange={this.conditionItemChange.bind(this, index, itemIndex)}
-          options={listOptions}
-          emptyVal="Select list"
-        />
-      );
+      const selected = item.list_ids || (item.list_id ? [item.list_id] : []);
+      return <div>
+        <label className="control-label">{automationConditionItemTypeLabel(item.type)}</label>
+        <SelectLabel id="condition-list-picker" label="Add a list" obj={{'condition-list-picker': ''}}
+          options={listOptions.filter(option => !selected.includes(option.id))} emptyVal="Select list"
+          onChange={event => {const id = getvalue(event); if (id && !selected.includes(id)) this.conditionSelectionsChange(index, itemIndex, item, 'list_id', 'list_ids', selected.concat(id));}} />
+        <ul className="list-inline color_tag" style={{paddingTop: '12px'}}>{selected.map(id => <li key={id}>
+          <button type="button" className="gray_tag" aria-label={'Remove list ' + (optionName(listOptions, id) || id)}
+            onClick={() => this.conditionSelectionsChange(index, itemIndex, item, 'list_id', 'list_ids', selected.filter(value => value !== id))}>
+            {optionName(listOptions, id) || 'Selected list not found'}
+          </button>
+        </li>)}</ul>
+        {!selected.length && <p className="help-block">Select at least one list.</p>}
+      </div>;
     }
-
-    if (item.type === 'opened_email' || item.type === 'clicked_email') {
-      if (!emailOptions.length) {
-        return <p className="help-block">Create an automation email before configuring this condition.</p>;
-      }
+    if (['opened_email', 'not_opened_email'].includes(item.type) || ['clicked_email', 'not_clicked_email'].includes(item.type)) {
       return (
         <div>
-          <SelectLabel
+          <p className="help-block">Checks tracked activity in the current enrolment only, at the moment this step runs. Add a Wait step first to allow time to respond.</p>
+          <AutomationEmailField
             id="automation_email_id"
-            label="Automation email"
-            obj={item}
+            value={item.automation_email_id}
             onChange={this.conditionItemChange.bind(this, index, itemIndex)}
             options={emailOptions}
-            emptyVal="Select email"
           />
           {
-            item.type === 'clicked_email' ?
+            ['clicked_email', 'not_clicked_email'].includes(item.type) ?
               <div>
                 <label className="control-label" htmlFor="click_match">Click match</label>
                 <FormControl
@@ -1667,6 +1870,7 @@ class AutomationWorkflowEditor extends Component {
           <div className="text-muted" style={{fontSize: '11px', textTransform: 'uppercase', marginBottom: '6px'}}>Label</div>
           <FormControl
             id="label"
+            autoFocus={!!this.props.configurationOnly}
             value={node.label}
             onChange={this.nodeChange.bind(this, index)}
             required={true}
@@ -1675,6 +1879,257 @@ class AutomationWorkflowEditor extends Component {
         {this.renderNodeConfig(node, index)}
       </div>
     );
+  }
+
+  openStructureEditor = (mode, id, field) => {
+    if (mode === 'add') this.structureTrigger = document.activeElement;
+    try {
+      const original = JSON.parse(JSON.stringify(this.props.nodes || []));
+      if (id) uniqueNode(original, id);
+      const draftOnly = !(this.props.publishedNodes || []).some(node => node.id === id);
+      const selected = original.find(node => node.id === id);
+      let replacement = '';
+      if (mode === 'delete' && draftOnly && selected && fallsThrough(selected)) {
+        const next = original[original.indexOf(selected) + 1];
+        if (next) replacement = next.id;
+      }
+      this.structureSaving = false;
+      this.setState({structureEdit: {mode, id, field, original, nodes: original,
+        originalMoves: JSON.parse(JSON.stringify(this.props.moveDecisions || {})),
+        replacement, draftOnly, routing: false, contactAction: '', deleteChoice: ''}, structureEditError: ''});
+    } catch (error) {
+      this.setState({structureEditError: error.message});
+    }
+  }
+
+  startMoving = (id, event) => {
+    if (event && event.dataTransfer) {
+      event.dataTransfer.setData('text/plain', id);
+      event.dataTransfer.effectAllowed = 'move';
+      this.suppressNodeClickUntil = Date.now() + 500;
+    }
+    this.setState({moving: {id, original: JSON.parse(JSON.stringify(this.props.nodes || []))}, structureEditError: ''});
+  }
+
+  dropStep = (id, field, event) => {
+    if (event) {event.preventDefault(); event.stopPropagation();}
+    const moving = this.state.moving;
+    if (!moving) return;
+    try {
+      if (!_.isEqual(this.props.nodes, moving.original)) throw new Error('The workflow changed while moving. Try again.');
+      const result = moveOnPath(moving.original, moving.id, {id, field},
+        type => createAutomationNode(type, {emails: this.props.emails, lists: this.props.lists}));
+      this.structureSaving = false;
+      this.setState({moving: null, structureEditError: '', structureEdit: {mode: 'move', id: moving.id,
+        original: moving.original, originalMoves: JSON.parse(JSON.stringify(this.props.moveDecisions || {})),
+        nodes: result.nodes, routing: result.routing, contactAction: ''}});
+    } catch (error) {this.setState({moving: null, structureEditError: error.message});}
+  }
+
+  chooseStructureType = event => {
+    const edit = this.state.structureEdit;
+    try {
+      const added = insertOnPath(edit.original, {id: edit.id, field: edit.field}, event.target.value,
+        type => createAutomationNode(type, {emails: this.props.emails, lists: this.props.lists}));
+      if (event.target.value === 'go_to') {
+        this.goToTrigger = this.structureTrigger;
+        this.setState({structureEdit: null, goToSelection: {id: added.id, original: edit.original,
+          nodes: added.nodes, target: '', adding: true}, goToError: '', structureEditError: ''}, () => {
+          if (this.goToPrompt) this.goToPrompt.focus();
+        });
+        return;
+      }
+      this.setState({structureEdit: {...edit, ...added, sourceId: edit.id, selected: true}, structureEditError: ''});
+    } catch (error) {
+      this.setState({structureEditError: error.message});
+    }
+  }
+
+  structureFieldError(edit) {
+    if (edit.mode === 'delete') return automationBranchNode(uniqueNode(edit.original, edit.id).type) && !edit.deletePlan ? 'Choose which paths to keep.' : '';
+    if (edit.mode === 'move') return !(this.props.publishedNodes || []).some(node => node.id === edit.id) || edit.contactAction ? '' : 'Choose what happens to contacts at this step when published.';
+    if (edit.mode === 'add' && !edit.selected) return 'Choose a step type.';
+    const node = edit.nodes.find(item => item.id === edit.id);
+    if (!node || !(node.label || '').trim()) return 'Enter a step label.';
+    if (['enrol_automation', 'remove_automation'].includes(node.type)) return automationTargetError(node.automation_id, this.targetAutomationOptions(node.type));
+    if (node.type === 'wait_duration') return automationWaitError(node.duration, node.wait_until);
+    if (['add_tag', 'remove_tag'].includes(node.type)) return automationTagsError(automationTags(node));
+    if (_.contains(['if_has_tag', 'if_missing_tag'], node.type)) {
+      const error = automationTagError(node.draft_tag);
+      if (error) return error;
+    }
+    if (_.contains(['send_email', 'if_opened_email', 'if_clicked_email'], node.type)) {
+      const error = automationEmailSelectionError(node.automation_email_id, automationEmailOptions(this.props.emails || []));
+      if (error) return error;
+    }
+    if (_.contains(['add_to_list', 'remove_from_list'], node.type)) {
+      const error = automationListsError(automationLists(node), automationListOptions(this.props.lists || []));
+      if (error) return error;
+    }
+    if (node.type === 'if_clicked_email' && automationClickMatchValue(node) !== 'any' && !(node.link_url || '').trim()) return 'Enter the clicked URL.';
+    if (node.type === 'if_conditions') {
+      const items = (node.condition || {}).items || [];
+      if (!items.length) return 'Add at least one condition.';
+      for (const item of items) {
+        let error = '';
+        if (item.type === 'has_tag' || item.type === 'missing_tag') error = automationTagsError(item.tags || [item.tag || '']);
+        if (item.type === 'in_list' || item.type === 'not_in_list') {
+          const ids = item.list_ids || (item.list_id ? [item.list_id] : []);
+          error = !ids.length ? 'Select at least one list.' : ids.length > 100 ? 'Select up to 100 lists.' : new Set(ids).size !== ids.length ? 'Select each list only once.' :
+            ids.map(id => automationListSelectionError(id, automationListOptions(this.props.lists || []))).find(Boolean);
+        }
+        if (_.contains(['opened_email', 'not_opened_email', 'clicked_email', 'not_clicked_email'], item.type)) error = automationEmailSelectionError(item.automation_email_id, automationEmailOptions(this.props.emails || []));
+        if (error) return error;
+        if (['clicked_email', 'not_clicked_email'].includes(item.type) && automationClickMatchValue(item) !== 'any' && !(item.link_url || '').trim()) return 'Enter the clicked URL.';
+      }
+    }
+    if (targetFields(node).some(field => !edit.nodes.some(target => target.id === node[field] && target.id !== node.id))) {
+      return 'Choose an existing, different step for each target.';
+    }
+    return '';
+  }
+
+  saveStructureEditor = () => {
+    if (this.structureSaving || !this.state.structureEdit) return;
+    const edit = this.state.structureEdit;
+    try {
+      const fieldError = this.structureFieldError(edit);
+      if (fieldError) throw new Error(fieldError);
+      let next = edit.mode === 'delete' ? (edit.deletePlan ? edit.deletePlan.nodes : removeStep(edit.original, edit.id, edit.replacement)) : edit.nodes;
+      next = next.map(node => node.type === 'wait_duration' && node.id === edit.id ?
+        withAutomationWait(node, node) : node);
+      const error = structureError(next);
+      if (error) throw new Error(error);
+      if (!_.isEqual(this.props.nodes, edit.original)) throw new Error('The workflow changed while this dialog was open. Close and reopen it.');
+      this.structureSaving = true;
+      let committed = false;
+      this.props.update({draft: {$apply: current => {
+        // Structural operations depend on order as well as IDs. Resolve again
+        // inside the canonical update, and reject all concurrent changes.
+        if (!_.isEqual(current.nodes, edit.original) || !_.isEqual(current.moves || {}, edit.originalMoves)) return current;
+        const moves = {...(current.moves || {})};
+        if (edit.mode === 'move' && (this.props.publishedNodes || []).some(node => node.id === edit.id)) {
+          moves[edit.id] = {action: edit.contactAction, published_revision: this.props.publishedRevision,
+            placement: movePlacement(next, edit.id)};
+        }
+        Object.keys(moves).forEach(id => {if (!next.some(node => node.id === id)) delete moves[id];});
+        committed = true;
+        return {...current, nodes: next, ...(Object.keys(moves).length || current.moves ? {moves} : {})};
+      }}}, () => {
+        this.structureSaving = false;
+        this.setState(committed ? {structureEdit: null, structureEditError: ''} :
+          {structureEditError: 'The workflow changed while saving. Close and reopen the dialog.'});
+      });
+    } catch (error) {
+      this.structureSaving = false;
+      this.setState({structureEditError: error.message});
+    }
+  }
+
+  closeStructureEditor = () => {
+    if (!this.structureSaving) this.setState({structureEdit: null, structureEditError: ''});
+  }
+
+  chooseConditionDeletion = event => {
+    const edit = this.state.structureEdit;
+    const deleteChoice = event.target.value;
+    try {
+      const deletePlan = deleteCondition(edit.original, edit.id, deleteChoice,
+        type => createAutomationNode(type, {emails: this.props.emails, lists: this.props.lists}));
+      this.setState({structureEdit: {...edit, deleteChoice, deletePlan}, structureEditError: ''});
+    } catch (error) {
+      this.setState({structureEdit: {...edit, deleteChoice, deletePlan: null}, structureEditError: error.message});
+    }
+  }
+
+  renderStructureEditor() {
+    const edit = this.state.structureEdit;
+    if (!edit) return this.state.structureEditError ? <p role="alert">{this.state.structureEditError}</p> : null;
+    const node = edit.nodes.find(item => item.id === edit.id);
+    const deletingCondition = edit.mode === 'delete' && automationBranchNode(node.type);
+    const incoming = edit.mode === 'delete' && !deletingCondition ? incomingTargets(edit.original, edit.id) : [];
+    if (edit.mode === 'add' && !edit.selected) {
+      return <Modal show className="automation-node-drawer" onHide={this.closeStructureEditor} aria-labelledby="structure-picker-title">
+        <Modal.Header closeButton><Modal.Title id="structure-picker-title">Add a step</Modal.Title></Modal.Header>
+        <Modal.Body>
+          <div className="automation-node-options">
+            {automationAddNodeMenuItems((this.props.emails || []).length, (this.props.lists || []).length).filter(item => item.type !== 'exit').map(item =>
+              <Button key={item.type} data-node-type={item.type} disabled={!!item.disabled} onClick={() => this.chooseStructureType({target: {value: item.type}})}>
+                {item.label}<i className="fa fa-angle-right" aria-hidden="true" />
+              </Button>)}
+          </div>
+          {this.state.structureEditError && <p className="text-danger" role="alert">{this.state.structureEditError}</p>}
+        </Modal.Body>
+        <Modal.Footer><Button onClick={this.closeStructureEditor}>Cancel</Button></Modal.Footer>
+      </Modal>;
+    }
+    return <Modal show onHide={this.closeStructureEditor} bsSize="large" aria-labelledby="structure-edit-title">
+      <Modal.Header closeButton><Modal.Title id="structure-edit-title">
+        {edit.mode === 'delete' ? 'Delete step' : edit.mode === 'add' ? 'Add step' : edit.mode === 'move' ? 'Move step' : 'Edit step'}
+      </Modal.Title></Modal.Header>
+      <Modal.Body>
+        {edit.routing && <p className="help-block">A visible Go to step preserves the other paths into the shared destination.</p>}
+        {edit.mode === 'move' && !(this.props.publishedNodes || []).some(item => item.id === edit.id) && <p>Move “{node.label}”? This draft-only step has no live contacts.</p>}
+        {edit.mode === 'move' && (this.props.publishedNodes || []).some(item => item.id === edit.id) && <div>
+          <p>Move “{node.label}”? Choose what happens to contacts at this live step when you publish.</p>
+          <label htmlFor="move-contact-action">Contacts at this step</label>
+          <FormControl id="move-contact-action" componentClass="select" value={edit.contactAction}
+            onChange={event => this.setState({structureEdit: {...edit, contactAction: event.target.value}, structureEditError: ''})}>
+            <option value="">Choose an option</option>
+            <option value="follow">Follow the step to its new position</option>
+            <option value="exit">Exit the automation when published</option>
+          </FormControl>
+          <p className="help-block">Nothing changes live until publication. This choice applies to everyone at this step then, even if the count changes. Following preserves wait progress and pause state. Moving again asks you to choose again.</p>
+          {!(this.props.publishedNodes || []).some(item => item.id === edit.id) && <p className="help-block">This draft-only step has no live contacts.</p>}
+        </div>}
+        {edit.selected && automationBranchNode(node.type) && <p className="help-block">
+          New Yes and No paths end independently. An existing non-ending continuation is preserved through Go to steps. Use Edit list to inspect target references.
+        </p>}
+        {(edit.mode === 'edit' || edit.selected) && <AutomationWorkflowEditor
+          {...this.props} nodes={edit.nodes} configurationOnly={edit.id}
+          hideBranchTargets={this.state.workflowView === 'preview'}
+          update={spec => this.setState({structureEdit: {...edit, nodes: update({draft: {nodes: edit.nodes}}, spec).draft.nodes}, structureEditError: ''})}
+        />}
+        {edit.mode === 'delete' && <div>
+          {deletingCondition ? <div>
+            <p>Delete “{node.label}”? Choose which path to keep. Shared continuations and steps referenced from elsewhere are preserved.</p>
+            <label htmlFor="condition-delete-choice">Paths after deletion</label>
+            <FormControl componentClass="select" id="condition-delete-choice" value={edit.deleteChoice} onChange={this.chooseConditionDeletion}>
+              <option value="">Choose what to keep</option>
+              <option value="yes">Keep the Yes path</option>
+              <option value="no">Keep the No path</option>
+              <option value="both">Delete both paths</option>
+            </FormControl>
+            {edit.deletePlan && <div><p>{edit.deletePlan.removed.length} steps will be removed:</p>
+              <ul>{edit.deletePlan.removed.map(item => <li key={item.id}>{item.label} (step {edit.original.findIndex(original => original.id === item.id) + 1})</li>)}</ul>
+              <p>Other steps remain. {edit.deleteChoice === 'both' ? 'This path will end here.' : 'Incoming paths will continue to the kept branch.'}</p>
+            </div>}
+          </div> : <div>
+            <p>Delete “{node.label}” from the draft? Only this step is removed; downstream steps remain.</p>
+            <p>Ordinary steps before it will continue to the next remaining draft step.</p>
+          </div>}
+          <p>{edit.draftOnly ? 'This step is new to the draft and has no live contacts.' : 'Live contacts stay at their published steps until you publish and review any required migration.'}</p>
+          {incoming.length > 0 && !(edit.draftOnly && edit.replacement) && <div>
+            <p>These incoming paths need an explicit replacement: {incoming.map(ref => ref.label + ' (' + ref.id + ', ' + ref.field + ')').join('; ')}.</p>
+            <label htmlFor="delete-replacement">Replacement for incoming paths</label>
+            <FormControl id="delete-replacement" componentClass="select" value={edit.replacement}
+              onChange={event => this.setState({structureEdit: {...edit, replacement: event.target.value}, structureEditError: ''})}>
+              <option value="">Choose a replacement step</option>
+              {edit.original.filter(item => item.id !== edit.id).map((item) => <option key={item.id} value={item.id}>{item.label} ({item.id})</option>)}
+            </FormControl>
+          </div>}
+        </div>}
+        <p className="help-block">This changes the draft only. Publication validates the complete workflow.</p>
+        {(edit.selected || edit.mode === 'edit') && this.structureFieldError(edit) && <p className="text-danger" role="alert">{this.structureFieldError(edit)}</p>}
+        {this.state.structureEditError && <p className="text-danger" role="alert">{this.state.structureEditError}</p>}
+      </Modal.Body>
+      <Modal.Footer>
+        <Button onClick={this.closeStructureEditor}>Cancel</Button>
+        <Button bsStyle={edit.mode === 'delete' ? 'danger' : 'primary'}
+          disabled={!!this.structureFieldError(edit) || (incoming.length > 0 && !edit.replacement)}
+          onClick={this.saveStructureEditor}>{edit.mode === 'delete' ? 'Delete step' : 'Save step'}</Button>
+      </Modal.Footer>
+    </Modal>;
   }
 
   renderAddNodeDropdown(id, title, afterIndex) {
@@ -1699,6 +2154,43 @@ class AutomationWorkflowEditor extends Component {
         }
       </DropdownButton>
     );
+  }
+
+  renderPendingCard(record) {
+    const node = record.node;
+    return <aside key={node.id} className="automation-pending-removal" data-node-id={node.id}
+      aria-label={'Pending removal: published step ' + record.publishedStep}
+      style={{background: '#f4f5f6', border: '1px dashed #89939f', borderRadius: '6px',
+        color: '#374151', padding: '14px 16px', margin: '12px 0', display: 'flex',
+        alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap'}}>
+      <div style={{flex: '1 1 240px', minWidth: 0}}>
+        <div style={{display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
+          fontSize: '11px', marginBottom: '3px'}}>
+          <span>Published step {record.publishedStep} · {node.label || automationNodeTypeLabel(node.type)}</span>
+          <span>({this.props.renderNodeContactCount(node, {pending: true, countOnly: true})})</span>
+          <span className="label label-default">Pending removal</span>
+        </div>
+        <div style={{display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap'}}>
+          <span style={{display: 'inline-block', padding: '4px 9px', borderRadius: '4px',
+            background: '#e8ebef', fontWeight: 600, fontSize: '13px', lineHeight: '20px'}}>
+            {automationNodeSummary(node, {nodes: this.props.publishedNodes || [],
+              emails: this.props.emails || [], lists: this.props.lists || [],
+              automations: this.props.automations || [], automationId: this.props.automationId})}
+          </span>
+          <span style={{fontSize: '12px', color: '#4b5563'}}>Still live until you publish.</span>
+        </div>
+      </div>
+      {this.props.renderNodeContactCount(node, {pending: true, linkOnly: true})}
+    </aside>;
+  }
+
+  renderPendingFallback(records) {
+    if (!records.length) return null;
+    return <section aria-label="Other pending removals" style={{borderTop: '1px solid #ddd', marginTop: '18px'}}>
+      <h4>Pending removals — published position not shown here</h4>
+      <p>These live steps are outside the draft path shown above.</p>
+      {records.map(record => this.renderPendingCard(record))}
+    </section>;
   }
 
   renderNodeCard(node, index, nodes) {
@@ -1918,9 +2410,11 @@ class AutomationWorkflowEditor extends Component {
       if (!item.terminal_label) {
         return null;
       }
+      const Terminal = _.contains(['wait_duration', 'add_tag', 'remove_tag', 'send_email', 'add_to_list', 'remove_from_list', 'enrol_automation', 'remove_automation'], item.type) ? 'span' : 'div';
       return (
-        <div
+        <Terminal
           style={{
+            display: 'block',
             marginTop: '12px',
             paddingLeft: '46px',
             color: '#6b7280',
@@ -1929,7 +2423,7 @@ class AutomationWorkflowEditor extends Component {
           }}
         >
           {item.terminal_label}
-        </div>
+        </Terminal>
       );
     }
 
@@ -2005,18 +2499,43 @@ class AutomationWorkflowEditor extends Component {
 
   renderPreviewNodeCard(item, options) {
     const opts = options || {};
+    const selection = this.state.goToSelection;
+    const targetId = selection && selection.id === item.id ? selection.target : item.node.target_node_id;
+    const summary = item.type === 'go_to' ? ((selection ? selection.nodes : this.props.nodes || []).find(node => node.id === targetId) || {}).label || 'Select destination' : item.summary;
     const inlineSummary = automationWorkflowPreviewSummaryInline(item.type);
+    const compound = item.type === 'if_conditions';
+    const structural = compound || item.type === 'go_to';
+    const editable = structural || _.contains(['wait_duration', 'add_tag', 'remove_tag', 'send_email', 'add_to_list', 'remove_from_list', 'enrol_automation', 'remove_automation'], item.type);
+    const editLabel = automationNodeTypeLabel(item.type);
+    const Card = editable ? 'button' : 'div';
+    const Content = editable ? 'span' : 'div';
     return (
-      <div
+      <div>
+      <Card
+        type={editable ? 'button' : undefined}
+        className={editable ? (structural ? 'automation-condition-preview-node' : item.type === 'wait_duration' ? 'automation-wait-preview-node' : _.contains(['add_to_list', 'remove_from_list'], item.type) ? 'automation-list-preview-node' : ['enrol_automation', 'remove_automation'].includes(item.type) ? 'automation-target-preview-node' : item.type === 'send_email' ? 'automation-email-preview-node' : 'automation-tag-preview-node') : undefined}
+        aria-label={editable ? 'Edit ' + editLabel + ' step ' + item.step + ': ' + item.summary : undefined}
+        onClick={editable ? event => {
+          if (this.state.goToSelection) return;
+          if (Date.now() < (this.suppressNodeClickUntil || 0)) return;
+          if (item.type === 'go_to') this.openGoToSelection(item.id, event.currentTarget);
+          else if (structural) this.openStructureEditor('edit', item.id);
+          else this.openNodeEditor(item.id, item.type);
+        } : undefined}
         style={{
+          width: editable ? '100%' : undefined,
+          textAlign: editable ? 'left' : undefined,
+          color: editable ? 'inherit' : undefined,
+          font: editable ? 'inherit' : undefined,
+          cursor: editable ? 'pointer' : undefined,
           border: '1px solid ' + (item.warning ? '#ebcccc' : '#dfe5ef'),
           borderRadius: '6px',
           background: item.warning ? '#fffafa' : '#fff',
           boxShadow: '0 1px 2px rgba(18, 32, 58, 0.04)',
-          padding: '14px 16px',
+          padding: '14px 80px 14px 16px',
         }}
       >
-        <div
+        <Content
           style={{
             display: 'flex',
             alignItems: 'flex-start',
@@ -2025,7 +2544,7 @@ class AutomationWorkflowEditor extends Component {
             flexWrap: 'wrap',
           }}
         >
-          <div
+          <Content
             style={{
               display: 'flex',
               alignItems: 'flex-start',
@@ -2034,42 +2553,26 @@ class AutomationWorkflowEditor extends Component {
               minWidth: 0,
             }}
           >
-            <div
-              style={{
-                width: '34px',
-                height: '34px',
-                borderRadius: '17px',
-                background: item.warning ? '#f8eeee' : '#edf3ff',
-                color: item.warning ? '#a94442' : '#3f77ff',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                fontWeight: 700,
-                flex: '0 0 auto',
-              }}
-            >
-              {item.step}
-            </div>
-            <div style={{minWidth: 0}}>
-              <div
+            <Content style={{minWidth: 0}}>
+              <Content
                 className="text-muted"
                 style={{
+                  display: 'block',
                   fontSize: '11px',
                   textTransform: 'uppercase',
                   marginBottom: '5px',
                 }}
               >
-                Step {item.step}
                 {
                   item.contact_count !== null && item.contact_count !== undefined ?
                     <span style={{textTransform: 'none', fontWeight: 400}}>
-                      {' '}({item.contact_count} {item.contact_count === 1 ? 'contact' : 'contacts'})
+                      {item.contact_count} live {item.contact_count === 1 ? 'contact' : 'contacts'}
                     </span>
                   :
                     null
                 }
-              </div>
-              <div
+              </Content>
+              <Content
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -2101,31 +2604,33 @@ class AutomationWorkflowEditor extends Component {
                         wordBreak: 'break-word',
                       }}
                     >
-                      {item.summary}
+                      {summary}
                     </span>
                   :
                     null
                 }
-              </div>
+              </Content>
               {
                 !inlineSummary && item.summary ?
-                  <div
+                  <Content
                     style={{
+                      display: 'block',
                       color: item.warning ? '#a94442' : '#1f2937',
                       fontWeight: 600,
                       lineHeight: '1.45',
                       wordBreak: 'break-word',
                     }}
                   >
-                    {item.summary}
-                  </div>
+                    {summary}
+                  </Content>
                 :
                   null
               }
-            </div>
-          </div>
-        </div>
-        {this.renderPreviewConnectionPanel(item, opts)}
+            </Content>
+          </Content>
+        </Content>
+        {!structural && !item.terminal_label && this.renderPreviewConnectionPanel(item, opts)}
+      </Card>
       </div>
     );
   }
@@ -2162,6 +2667,8 @@ class AutomationWorkflowEditor extends Component {
         }}
       >
         {block.label || 'Continues at'} {target.label}{target.type_label ? ' (' + target.type_label + ')' : ''}
+        {target.id && !target.missing && <Button bsSize="xsmall" style={{marginLeft: 8}}
+          onClick={() => this.jumpToPreviewStep(target.id)}>Show step</Button>}
       </div>
     );
   }
@@ -2180,50 +2687,101 @@ class AutomationWorkflowEditor extends Component {
   renderPreviewBlock(block, index, blocks, options) {
     const opts = options || {};
     let rendered = null;
-    if (block.kind === 'node') {
-      rendered = this.renderPreviewNodeCard(block.item, opts);
+    if (block.kind === 'node' && block.item.type === 'exit') {
+      rendered = <div>
+        {this.renderGoToChoice(block.item.node)}
+        {opts.detached && this.renderPathInsertion('Add before Exit step ' + block.item.step, block.item.id, 'before')}
+        <div className="automation-path-end-label" data-preview-node-id={block.item.id} title={'Step ' + block.item.step + ': ' + block.item.node.label}>
+          <i className="fa fa-ban" aria-hidden="true" /> Automation ends
+          {block.item.contact_count !== null && block.item.contact_count !== undefined &&
+            <span className="automation-end-count"> · {block.item.contact_count} live contacts</span>}
+        </div>
+      </div>;
+    } else if (block.kind === 'node') {
+      rendered = <div className="automation-visual-card" data-preview-node-id={block.item.id} draggable={!this.state.goToSelection && movableNode(block.item.node)}
+        onDragStart={event => {if (movableNode(block.item.node)) this.startMoving(block.item.id, event);}}
+        onDragEnd={() => {this.suppressNodeClickUntil = Date.now() + 300; this.setState({moving: null});}}>
+        {this.renderPreviewNodeCard(block.item, {...opts, suppressBranchPanel: opts.suppressBranchPanel || !!block.branch})}
+        {this.renderGoToChoice(block.item.node)}
+        {!this.state.goToSelection && <div className="automation-visual-card-tools">
+          {block.item.type === 'go_to' && <button type="button" className="automation-node-icon"
+            aria-label={'Show destination of step ' + block.item.step} title="Show destination"
+            onClick={() => this.jumpToPreviewStep(block.item.node.target_node_id)}><i className="fa fa-crosshairs" aria-hidden="true" /></button>}
+          {movableNode(block.item.node) && <button type="button" className="automation-node-icon" aria-label={'Move step ' + block.item.step}
+            title="Move step" onClick={() => this.startMoving(block.item.id)}><i className="fa fa-arrows" aria-hidden="true" /></button>}
+          {(automationBranchNode(block.item.type) && block.item.type !== 'if_conditions') &&
+            <button type="button" className="automation-node-icon" title={'Configure ' + block.item.type_label}
+              onClick={() => this.openStructureEditor('edit', block.item.id)}><i className="fa fa-pencil" aria-hidden="true" /><span className="sr-only">Configure {block.item.type_label}</span></button>}
+          <button type="button" className="automation-node-icon" aria-label={'Delete step ' + block.item.step} title="Delete step"
+            onClick={() => this.openStructureEditor('delete', block.item.id)}><i className="fa fa-trash-o" aria-hidden="true" /></button>
+        </div>}
+        {!this.state.goToSelection && (this.props.moveDecisions || {})[block.item.id] && <button type="button" className="automation-move-decision"
+          onClick={() => this.openStructureEditor('move', block.item.id)}>Review move decision</button>}
+      </div>;
     } else if (block.kind === 'missing') {
       rendered = this.renderPreviewMissingBlock(block);
     } else {
       rendered = this.renderPreviewReferenceBlock(block);
     }
 
-    return (
-      <div key={(block.item || block.target || {}).id || block.kind + '-' + index}>
+    const path = <div>
         {rendered}
-        {
-          index < blocks.length - 1 && this.previewBlockContinues(block) ?
-            <div
-              aria-hidden="true"
-              style={{
-                width: '2px',
-                height: '18px',
-                background: '#dfe5ef',
-                marginLeft: '33px',
-              }}
-            />
-          :
-            null
-        }
-      </div>
-    );
+        {block.branch && this.renderPreviewBranchLanes(block.branch, opts.pendingByBlock || new Map())}
+        {block.kind === 'node' && <div>
+          {fallsThrough(block.item.node) && this.renderPathInsertion('Add after step ' + block.item.step, block.item.id)}
+          {fallsThrough(block.item.node) && block.item.terminal_label &&
+            <div className="automation-path-end-label"><i className="fa fa-ban" aria-hidden="true" /> Automation ends</div>}
+          {block.item.type === 'go_to' && this.renderPathInsertion('Add on Go to path of step ' + block.item.step, block.item.id, 'target_node_id', true)}
+          {automationBranchNode(block.item.type) && !block.branch && !opts.suppressBranchPanel && ['Yes', 'No'].map(label =>
+            <div key={label}>{label}{this.renderPathInsertion('Add on ' + label + ' path', block.item.id, label === 'Yes' ? 'yes_node_id' : 'no_node_id', true)}</div>)}
+        </div>}
+      </div>;
+    return <div key={(block.item || block.target || {}).id || block.kind + '-' + index}>
+      {opts.pending && opts.pending.length ?
+        <div style={{display: 'flex', flexWrap: 'wrap', gap: '14px', alignItems: 'flex-start'}}>
+          <div style={{flex: '1 1 280px', minWidth: 0}}>{path}</div>
+          <div className="automation-pending-annotations" style={{flex: '0 1 300px'}}>
+            <p className="help-block">Live steps near this published position · outside the draft path</p>
+            {opts.pending.map(record => this.renderPendingCard(record))}
+          </div>
+        </div> : path}
+    </div>;
   }
 
-  renderPreviewBranchLanes(branch) {
+  renderPathInsertion(label, id, field, terminal = false) {
+    if (this.state.goToSelection) return <div className="automation-path-insertion" aria-hidden="true" />;
+    const moving = this.state.moving;
+    return <div className={'automation-path-insertion' + (terminal ? ' automation-path-end' : '')}>
+      <button type="button" className={moving ? 'automation-path-drop' : 'automation-path-add'} aria-label={moving ? 'Move here: ' + label : label} title={label}
+        disabled={!!moving && moving.id === id}
+        onDragOver={event => {if (moving && moving.id !== id) {event.preventDefault(); event.dataTransfer.dropEffect = 'move';}}}
+        onDrop={event => this.dropStep(id, field, event)}
+        onKeyDown={event => {if (event.key === 'Escape') this.setState({moving: null});}}
+        onClick={() => moving ? this.dropStep(id, field) : this.openStructureEditor('add', id, field)}>
+        <span aria-hidden="true">{moving ? 'Move here' : '+'}</span></button>
+    </div>;
+  }
+
+  renderPreviewBranchLanes(branch, pendingByBlock) {
     if (!branch) {
       return null;
     }
     const connectorColor = '#cfd8e6';
+    const widths = branch.lanes.map(lane => automationPreviewPathWidth(lane.blocks));
     const laneGridStyle = {
       display: 'grid',
-      gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-      gap: '14px',
+      gridTemplateColumns: widths.map(width => width + 'px').join(' '),
+      gap: '32px',
     };
 
     return (
       <div
+        className="automation-branch-subtree"
         style={{
           marginTop: '0',
+          width: automationPreviewBranchWidth(branch),
+          marginLeft: 'auto',
+          marginRight: 'auto',
         }}
       >
         <div
@@ -2248,8 +2806,8 @@ class AutomationWorkflowEditor extends Component {
             aria-hidden="true"
             style={{
               position: 'absolute',
-              left: 'calc(25% - 3.5px)',
-              right: 'calc(25% - 3.5px)',
+              left: widths[0] / 2,
+              right: widths[1] / 2,
               top: '31px',
               height: '2px',
               background: connectorColor,
@@ -2309,9 +2867,13 @@ class AutomationWorkflowEditor extends Component {
                   padding: '0',
                 }}
               >
+                {this.renderPathInsertion('Add on ' + lane.label + ' path of step ' + branch.item.step, branch.item.id, lane.label === 'Yes' ? 'yes_node_id' : 'no_node_id')}
+                {branchFallsIntoSibling(this.props.nodes || [], branch.item.node, lane.label === 'Yes' ? 'yes_node_id' : 'no_node_id') &&
+                  <p className="text-warning" role="note">This saved path continues into the other branch by step order. Add an Exit at the end of this path to separate them.</p>}
                 {
                   lane.blocks.length ?
-                    _.map(lane.blocks, (block, index) => this.renderPreviewBlock(block, index, lane.blocks, {suppressBranchPanel: false}))
+                    _.map(lane.blocks, (block, index) => this.renderPreviewBlock(block, index, lane.blocks,
+                      {suppressBranchPanel: false, pending: pendingByBlock.get(block), pendingByBlock}))
                   :
                     this.renderPreviewMissingBlock({
                       kind: 'missing',
@@ -2328,32 +2890,117 @@ class AutomationWorkflowEditor extends Component {
     );
   }
 
-  renderWorkflowPreview(nodes) {
+  jumpToPreviewStep = id => {
+    const error = this.navigationViewport ? this.navigationViewport.jumpTo(id) : 'The preview is unavailable. Use Edit list.';
+    if (error || this.state.navigationError) this.setState({navigationError: error});
+  }
+
+  renderWorkflowPreview(nodes, pending) {
     const flow = automationWorkflowPreviewFlow(nodes, {
       emails: this.props.emails || [],
       lists: this.props.lists || [],
+      automations: this.props.automations || [], automationId: this.props.automationId,
       nodeContactCount: this.props.nodeContactCount,
     });
 
+    // Attach once to a rendered anchor. Shared branch nodes can appear more
+    // than once; annotations never become blocks or executable connections.
+    const firstBlocks = new Map();
+    const visit = blocks => blocks.forEach(block => {
+      if (block.kind === 'node' && !firstBlocks.has(block.item.id)) firstBlocks.set(block.item.id, block);
+      if (block.branch) block.branch.lanes.forEach(lane => visit(lane.blocks));
+    });
+    visit(flow.main);
+    if (flow.branch) flow.branch.lanes.forEach(lane => visit(lane.blocks));
+    const otherNodes = nodes.filter(node => !firstBlocks.has(node.id));
+    const previewItems = new Map();
+    firstBlocks.forEach((block, id) => previewItems.set(id, block.item));
+    const previewItem = node => {
+      if (!previewItems.has(node.id)) previewItems.set(node.id, automationWorkflowPreviewItemForNode(nodes, node, {
+        emails: this.props.emails || [], lists: this.props.lists || [],
+        automations: this.props.automations || [], automationId: this.props.automationId, nodeContactCount: this.props.nodeContactCount,
+      }));
+      return previewItems.get(node.id);
+    };
+    // Built only when the finder is used, cached for this immutable render.
+    let navigationItems;
+    const getNavigationItems = () => {
+      if (navigationItems) return navigationItems;
+      const counts = new Map();
+      nodes.forEach(node => counts.set(node.id, (counts.get(node.id) || 0) + 1));
+      const seen = new Set();
+      navigationItems = [];
+      nodes.forEach((node, index) => {
+        if (seen.has(node.id)) return;
+        seen.add(node.id);
+        const item = previewItem(node);
+        const ambiguous = typeof node.id !== 'string' || !node.id || counts.get(node.id) !== 1;
+        const warning = ambiguous ? 'Duplicate or invalid step ID.' : this.structureFieldError({mode: 'edit', id: node.id, nodes}) || (item.warning ? item.summary : '');
+        navigationItems.push({id: node.id, label: node.label || 'Untitled step', step: index + 1,
+          type: item.type_label, summary: item.summary, count: item.contact_count, warning,
+          ambiguous, detached: !firstBlocks.has(node.id)});
+      });
+      return navigationItems;
+    };
+    const pendingByBlock = new Map();
+    const fallback = [];
+    pending.forEach(record => {
+      const block = firstBlocks.get(record.anchorId);
+      if (!block) fallback.push(record);
+      else pendingByBlock.set(block, (pendingByBlock.get(block) || []).concat(record));
+    });
+
     return (
-      <div style={{marginTop: '18px'}}>
+      <div style={{marginTop: '18px', paddingBottom: this.state.goToSelection ? '180px' : undefined}}>
         <div className="automation-workflow-visual-preview-narrow-message">
           Visual preview is available on wider screens. Use Edit list on this device.
+          {pending.length > 0 && <div style={{marginTop: '8px'}}>
+            {pending.length} pending {pending.length === 1 ? 'removal' : 'removals'} still live.{' '}
+            <Button bsSize="small" onClick={this.showWorkflowView.bind(this, 'edit')}>View pending removals in Edit list</Button>
+          </div>}
         </div>
         <div className="automation-workflow-visual-preview">
           <div className="help-block" style={{marginBottom: '12px'}}>
-            Read-only preview of the draft workflow. Edit nodes in the list view.
+            Click a step to edit it, or use its pencil where shown. Add steps on the labelled path; shared continuations appear as references. Exit and Go to end a branch path. Scroll sideways to follow wider branches.
           </div>
-          {_.map(flow.main, (block, index) => this.renderPreviewBlock(block, index, flow.main, {suppressBranchPanel: !!flow.branch && block.item === flow.branch.item}))}
-          {this.renderPreviewBranchLanes(flow.branch)}
+          <p className="help-block">Hover over or focus a Go to step to trace its destination while scrolling. Press Escape or click elsewhere to clear the arrow.</p>
+          {this.state.moving && <p role="status">Choose a drop box for this step. <Button bsSize="small" onClick={() => this.setState({moving: null})}>Cancel move</Button></p>}
+          {this.state.navigationError && <p role="alert" className="text-danger">{this.state.navigationError}</p>}
+          <AutomationViewport ref={element => {this.navigationViewport = element;}} getNavigationItems={getNavigationItems}
+            width={Math.max(automationPreviewPathWidth(flow.main), automationPreviewBranchWidth(flow.branch))}>
+          {scale => <AutomationGoToConnections scale={scale} nodes={nodes} disabled={!!this.state.goToSelection || !!this.state.moving}>
+          {this.renderPathInsertion('Add before first step', nodes[0].id, 'entry')}
+          {_.map(flow.main, (block, index) => this.renderPreviewBlock(block, index, flow.main,
+            {suppressBranchPanel: !!flow.branch && block.item === flow.branch.item, pending: pendingByBlock.get(block)}))}
+          {this.renderPreviewBranchLanes(flow.branch, pendingByBlock)}
+          {otherNodes.length > 0 && <section aria-label="Other draft steps" style={{marginTop: '20px'}}>
+            <h4>Other draft steps</h4>
+            <p className="help-block">Steps outside the expanded preview, including unconnected steps and Go to destinations. No execution order is implied here.</p>
+            {otherNodes.map(node => this.renderPreviewBlock({kind: 'node', item: previewItem(node)}, 0, [], {detached: true}))}
+          </section>}
+          </AutomationGoToConnections>}
+          </AutomationViewport>
         </div>
+        {this.renderPendingFallback(fallback)}
       </div>
     );
   }
 
   render() {
-    const nodes = this.props.nodes || [];
-    const workflowView = this.state.workflowView || 'edit';
+    const nodes = this.state.goToSelection ? this.state.goToSelection.nodes : this.props.nodes || [];
+    let goToRemovals = [];
+    if (this.state.goToSelection && !this.goToSelectionError()) {
+      const selection = this.state.goToSelection;
+      goToRemovals = retargetGoTo(selection.nodes, selection.id, selection.target).removed;
+    }
+    if (this.props.configurationOnly) {
+      const index = nodes.findIndex(node => node.id === this.props.configurationOnly);
+      return index < 0 ? null : this.renderNodeDetails(nodes[index], index);
+    }
+    const removedSteps = goToRemovals.filter(node => node.type !== 'exit');
+    const removedEndings = goToRemovals.length - removedSteps.length;
+    const pending = automationPendingRemovals(this.props.publishedNodes || [], nodes);
+    const workflowView = this.state.workflowView || 'preview';
     return (
       <EDFormBox space>
         <div className="flex-items space-between" style={{alignItems: 'center', gap: '12px', flexWrap: 'wrap'}}>
@@ -2363,6 +3010,7 @@ class AutomationWorkflowEditor extends Component {
               <Button
                 bsSize="small"
                 active={workflowView === 'edit'}
+                disabled={!!this.state.goToSelection}
                 onClick={this.showWorkflowView.bind(this, 'edit')}
               >
                 Edit list
@@ -2370,6 +3018,7 @@ class AutomationWorkflowEditor extends Component {
               <Button
                 bsSize="small"
                 active={workflowView === 'preview'}
+                disabled={!!this.state.goToSelection}
                 onClick={this.showWorkflowView.bind(this, 'preview')}
               >
                 Visual preview
@@ -2393,16 +3042,38 @@ class AutomationWorkflowEditor extends Component {
         {
           nodes.length ?
             workflowView === 'preview' ?
-              this.renderWorkflowPreview(nodes)
+              this.renderWorkflowPreview(nodes, pending)
             :
               <div>
-                {_.map(nodes, (node, index) => this.renderNodeCard(node, index, nodes))}
+                {_.map(nodes, (node, index) => <div key={node.id}>
+                  {pending.filter(record => record.anchorId === node.id && record.side === 'before').map(record => this.renderPendingCard(record))}
+                  {this.renderNodeCard(node, index, nodes)}
+                  {pending.filter(record => record.anchorId === node.id && record.side === 'after').map(record => this.renderPendingCard(record))}
+                </div>)}
               </div>
           :
             <div className="text-center space-top-sm">
               <h4>This draft does not have any nodes yet.</h4>
+              {workflowView === 'preview' && this.renderPathInsertion('Add first step', undefined, undefined, true)}
             </div>
         }
+        {workflowView !== 'preview' || !nodes.length ? this.renderPendingFallback(pending.filter(record => record.anchorId === null)) : null}
+        {this.renderNodeEditor()}
+        {this.renderStructureEditor()}
+        {this.state.goToSelection && <div className="automation-go-to-prompt" role="region" aria-label="Select Go to destination"
+          tabIndex="-1" ref={element => {this.goToPrompt = element;}}>
+          <strong>Select which node to go to</strong>
+          <p>Choose one checkbox. A contact returning to a previously visited step without an elapsed wait is held before the action repeats.</p>
+          {goToRemovals.length > 0 && <div role="alert">
+            {removedSteps.length > 0 && <div><strong>Confirming will remove {removedSteps.length} {removedSteps.length === 1 ? 'step' : 'steps'} from this draft path:</strong>
+              <ul>{removedSteps.map(node => <li key={node.id}>{node.label} ({automationNodeTypeLabel(node.type)})</li>)}</ul></div>}
+            {removedEndings > 0 && <p>This replaces the “Automation ends” {removedEndings === 1 ? 'ending' : 'endings'} on this path with a jump to your selected destination.</p>}
+            <p>The destination and shared paths are kept. Live contacts stay at their published steps until you publish and resolve their destinations.</p>
+          </div>}
+          {(this.state.goToError || this.goToSelectionError()) && <p role="alert" className="text-danger">{this.state.goToError || this.goToSelectionError()}</p>}
+          <Button type="button" onClick={this.closeGoToSelection}>Cancel</Button>{' '}
+          <Button type="button" bsStyle="primary" disabled={!!this.goToSelectionError()} onClick={this.confirmGoToSelection}>Confirm</Button>
+        </div>}
       </EDFormBox>
     );
   }

@@ -1,11 +1,15 @@
 const Cdp = require('chrome-remote-interface');
 const express = require('express');
+const browserReady = require('./browser-ready');
 const {spawn} = require('node:child_process');
 
-spawn('/usr/bin/chromium-browser', ["--headless", "--no-sandbox", "--disable-dev-shm-usage",
-  "--remote-debugging-address=0.0.0.0", "--remote-debugging-port=9222",
+spawn('/usr/bin/chromium-browser', ["--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer",
+  "--disable-extensions", "--disable-component-extensions-with-background-pages",
+  "--disable-background-networking", "--no-first-run", "--no-default-browser-check",
+  "--user-data-dir=/tmp/edcom-chromium", "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=9222",
   "about:blank"], {
-  detached: true
+  detached: true,
+  stdio: ["ignore", "ignore", "inherit"]
 });
 
 function sleep (miliseconds = 100) {
@@ -25,7 +29,7 @@ async function captureScreenshotOfUrl (url, mobile = false, width = 580) {
     }
   }
 
-  const [tab] = await Cdp.List()
+  const [tab] = await browserReady(() => Cdp.List({host: '127.0.0.1'}))
   const client = await Cdp({ host: '127.0.0.1', target: tab })
 
   const {
@@ -124,6 +128,8 @@ app.post('/', (req, res) => {
     });
 });
 
-app.listen(port, () => {
-  console.log(`Listening on port ${port}`)
-});
+// Do not advertise HTTP readiness while the browser is still starting.
+// Startup gets a bounded allowance; ordinary requests retain the short wait.
+browserReady(() => Cdp.List({host: '127.0.0.1'}), {timeout: 120000})
+  .then(() => app.listen(port, () => console.log(`Listening on port ${port}`)))
+  .catch(error => { console.error('Chromium startup failed:', error); process.exit(1); });

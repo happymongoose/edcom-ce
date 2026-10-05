@@ -21,6 +21,7 @@ import boto3
 
 from .falcon_swagger_ui import register_swaggerui_app  # type: ignore
 
+from .automation_subject_tests import SubjectTests
 from .shared import config
 
 from .shared.db import open_db, json_obj, DB, JsonObj
@@ -4075,8 +4076,10 @@ app.add_route("/api/automations/{id}/emails/{email_id}/duplicate", automations.A
 app.add_route("/api/automations/{id}/emails/{email_id}/test", automations.AutomationEmailTest())
 app.add_route("/api/automations/{id}/emails/{email_id}/links", automations.AutomationEmailLinks())
 app.add_route("/api/automations/{id}/emails/{email_id}", automations.AutomationEmail())
+app.add_route("/api/automations/{id}/emails/{email_id}/subject-tests", SubjectTests())
 app.add_route("/api/automations/{id}/preflight", automations.AutomationPreflight())
 app.add_route("/api/automations/{id}/publish", automations.AutomationPublish())
+app.add_route("/api/automations/{id}/publish-impact", automations.AutomationPublishImpact())
 app.add_route("/api/automations/{id}/pause", automations.AutomationPause())
 app.add_route("/api/automations/{id}/resume", automations.AutomationResume())
 app.add_route("/api/automations/{id}/enrolments", automations.AutomationEnrolments())

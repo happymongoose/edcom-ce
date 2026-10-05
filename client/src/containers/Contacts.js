@@ -11,6 +11,7 @@ import MenuNavbar from "../components/MenuNavbar";
 import notify from "../utils/notify";
 import { EDTableSection, EDTable, EDTableRow, EDTabs } from "../components/EDDOM";
 import TablePie from "../components/TablePie";
+import ContactsAll from './ContactsAll';
 
 import "./Contacts.css";
 
@@ -37,12 +38,15 @@ class Contacts extends Component {
       bulkAutomationId: '',
       bulkEnrolling: false,
       bulkResult: null,
+      showingSearchResults: false,
     };
   }
 
   createClicked = () => {
     this.props.history.push("/contacts/add?id=new");
   }
+
+  searchVisibilityChange = showingSearchResults => this.setState({showingSearchResults});
 
   deleteConfirmClicked = async id => {
     await axios.delete('/api/lists/' + id);
@@ -338,7 +342,8 @@ class Contacts extends Component {
               </Nav>
             </EDTabs>
           }/>
-          <LoaderPanel isLoading={this.props.isLoading}>
+          <ContactsAll embedded loggedInImpersonate={this.props.loggedInImpersonate} onResultsVisibilityChange={this.searchVisibilityChange} />
+          {!this.state.showingSearchResults && <LoaderPanel isLoading={this.props.isLoading}>
             <EDTableSection>
             {
               this.props.data.length ?
@@ -504,7 +509,7 @@ class Contacts extends Component {
                 </div>
             }
             </EDTableSection>
-          </LoaderPanel>
+          </LoaderPanel>}
         </MenuNavbar>
       </div>
     );

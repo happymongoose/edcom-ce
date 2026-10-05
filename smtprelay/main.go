@@ -331,8 +331,10 @@ func main() {
 		MaxConnections: 500,
 		Handler:        mailHandler,
 		Authenticator:  authHandler,
-		ForceTLS:       false,
-		TLSConfig:      &tls.Config{Certificates: []tls.Certificate{cer}},
+		// DATA handler validates an API key supplied by header or SMTP password.
+		AllowUnauthenticated: true,
+		ForceTLS:             false,
+		TLSConfig:            &tls.Config{Certificates: []tls.Certificate{cer}},
 	}
 
 	trace.Printf("Starting...")

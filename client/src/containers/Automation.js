@@ -15,7 +15,11 @@ import getvalue from "../utils/getvalue";
 import notify from "../utils/notify";
 import copyText from "../utils/clipboard";
 import { canViewAutomationDiagnostics } from "../utils/automationDiagnostics";
+import AutomationPublishReview from "./AutomationPublishReview";
+import AutomationExitRules from "./AutomationExitRules";
+import AutomationSaveReminder, {shouldRemindAfterSave} from './AutomationSaveReminder';
 import AutomationWorkflowEditor, { automationEditorTypeLabel, automationListOptions } from "./AutomationWorkflowEditor";
+import {automationTags} from './AutomationTagsField';
 
 import "react-select2-wrapper/css/select2.css";
 
@@ -144,8 +148,10 @@ function patchPayload(data) {
     name: data.name,
     entry: entryPayload(data.entry),
     reentry: data.reentry || 'once',
+    ...(data.exit_rules !== undefined ? {exit_rules: data.exit_rules} : {}),
     draft: {
       nodes: data.draft.nodes,
+      ...(data.draft.moves ? {moves: data.draft.moves} : {}),
     },
   };
 }
@@ -185,40 +191,26 @@ export function automationImpersonatedHref(path, impersonateId) {
   return path + (path.indexOf('?') === -1 ? '?' : '&') + 'impersonate=' + encodeURIComponent(impersonateId);
 }
 
-export function automationNodeContactIds(node, draftNodes, publishedNodes) {
-  const index = _.findIndex(draftNodes || [], item => item.id === node.id);
-  const publishedNode = index >= 0 ? (publishedNodes || [])[index] : null;
-  return _.uniq(_.compact([node.id, publishedNode && publishedNode.id]));
+export function automationNodeContactIds(node) {
+  // Enrolments retain the stable ID from the published workflow. Draft order is
+  // presentation-only and must never be used to associate live occupancy.
+  return node && node.id ? [node.id] : [];
 }
 
 export function automationNodeContactCount(node, draftNodes, publishedNodes, summary) {
   const counts = (summary && summary.nodes) || {};
-  const positionCounts = (summary && summary.node_positions) || {};
-  const index = _.findIndex(draftNodes || [], item => item.id === node.id);
-  if (index >= 0 && positionCounts[String(index + 1)] !== undefined) {
-    return positionCounts[String(index + 1)] || 0;
-  }
   return _.reduce(
-    automationNodeContactIds(node, draftNodes, publishedNodes),
+    automationNodeContactIds(node),
     (total, nodeId) => total + (counts[nodeId] || 0),
     0
   );
 }
 
 export function automationNodeContactFilterId(node, draftNodes, publishedNodes) {
-  const ids = automationNodeContactIds(node, draftNodes, publishedNodes);
-  return ids.length > 1 ? ids[1] : ids[0];
+  return automationNodeContactIds(node)[0];
 }
 
 export function automationNodeContactFilterParam(node, draftNodes, publishedNodes, summary) {
-  const index = _.findIndex(draftNodes || [], item => item.id === node.id);
-  const positionCounts = (summary && summary.node_positions) || {};
-  if (index >= 0 && positionCounts[String(index + 1)] !== undefined) {
-    return {
-      key: 'node_position',
-      value: String(index + 1),
-    };
-  }
   return {
     key: 'node_id',
     value: automationNodeContactFilterId(node, draftNodes, publishedNodes),
@@ -277,6 +269,9 @@ export function automationHistoryLog(history, options) {
       if (event.remaining_seconds !== undefined && event.remaining_seconds !== null) {
         parts.push('remaining_seconds=' + event.remaining_seconds);
       }
+    } else if (event.type === 'rule_exit') {
+      parts.push('exited by rule ' + (event.rule_index + 1) + ' (' + event.rule_type + ')');
+      parts.push('source=' + event.source);
     } else if (event.type === 'engagement') {
       parts.push('engagement ' + (event.event_type || ''));
       if (event.automation_email_id) {
@@ -313,7 +308,10 @@ export function automationHistoryLog(history, options) {
       }
       if (event.tag) {
         parts.push('tag=' + event.tag);
+      } else if (event.tags && event.tags.length) {
+        parts.push('tags=' + event.tags.join(', '));
       }
+      if (event.wait_until) parts.push('wait_until=' + event.wait_until);
       if (event.list_id) {
         parts.push('list=' + event.list_id);
       }
@@ -358,6 +356,12 @@ export function automationHistoryLog(history, options) {
       }
       if (event.sent !== undefined && event.sent !== null) {
         parts.push('sent=' + event.sent);
+      }
+      if (event.throttled) {
+        parts.push('Email skipped: already sent to this contact in the last 24 hours');
+      }
+      if (event.email_delivery_status) {
+        parts.push('delivery=' + event.email_delivery_status);
       }
       parts.push('status=' + (event.status || ''));
       if (event.error) {
@@ -495,6 +499,7 @@ class Automation extends Component {
 
     this.state = {
       isPublishing: false,
+      saveReminder: null,
       isPausing: false,
       isEnrolling: false,
       runningEnrolmentId: null,
@@ -520,6 +525,7 @@ class Automation extends Component {
   }
 
   goBack = () => {
+    if (this.state.isPublishing) return;
     this.props.history.push('/automations');
   }
 
@@ -651,7 +657,7 @@ class Automation extends Component {
   tagData() {
     const tags = this.props.tags || [];
     const nodes = (this.props.data.draft && this.props.data.draft.nodes) || [];
-    const draftTags = _.pluck(_.filter(nodes, node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type) && node.draft_tag), 'draft_tag');
+    const draftTags = _.flatten(nodes.filter(node => _.contains(['add_tag', 'remove_tag', 'if_has_tag'], node.type)).map(automationTags)).filter(Boolean);
     const entryTags = entryTagValues(this.props.data.entry);
 
     return _.map(_.uniq(tags.concat(draftTags).concat(entryTags)), tag => ({id: tag, text: tag}));
@@ -769,25 +775,7 @@ class Automation extends Component {
     }
   }
 
-  publish = async () => {
-    this.setState({isPublishing: true});
-
-    try {
-      const saved = await this.save();
-      if (!saved) {
-        return;
-      }
-
-      await axios.post('/api/automations/' + this.props.id + '/publish');
-      notify.show('Automation published', 'success');
-      await this.props.reload();
-      await this.props.reloadExtra();
-    } catch (error) {
-      notify.show(errorMessage(error, 'Unable to publish automation'), 'error');
-    } finally {
-      this.setState({isPublishing: false});
-    }
-  }
+  publish = () => { if (!this.state.exitRuleEditing) this.publishReview.begin(); };
 
   pause = async () => {
     this.setState({isPausing: true});
@@ -821,6 +809,7 @@ class Automation extends Component {
 
   enrolContact = async event => {
     event.preventDefault();
+    event.stopPropagation();
 
     const email = this.state.enrolEmail.trim();
     if (!email) {
@@ -1053,7 +1042,7 @@ class Automation extends Component {
                     <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.contact_email}</h4>
                   </td>
                   <td>
-                    <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.status}</h4>
+                    <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.subject_gate && ['ready', 'paused_ready', 'held'].indexOf(enrolment.status) >= 0 ? 'Waiting for subject-test winner (' + enrolment.status + ')' : enrolment.status}</h4>
                   </td>
                   <td>
                     <h4 style={{whiteSpace: 'nowrap'}}>{enrolment.current_node_id}</h4>
@@ -1131,16 +1120,28 @@ class Automation extends Component {
     const data = this.props.data || {};
     const nodes = (data.draft && data.draft.nodes) || [];
     const publishedNodes = (data.published && data.published.nodes) || [];
-    const count = automationNodeContactCount(node, nodes, publishedNodes, summary);
+    const countMap = summary.nodes;
+    const available = countMap && typeof countMap === 'object' && !Array.isArray(countMap);
+    const storedCount = available && Object.prototype.hasOwnProperty.call(countMap, node.id) ? countMap[node.id] : 0;
+    const count = opts.pending ? (available && typeof storedCount === 'number' && Number.isFinite(storedCount) && storedCount >= 0 ? storedCount : null) :
+      automationNodeContactCount(node, nodes, publishedNodes, summary);
     const filter = automationNodeContactFilterParam(node, nodes, publishedNodes, summary);
     const href = this.impersonatedHref(
       '/automations/' + this.props.id + '/enrolments?view=active&' + filter.key + '=' + encodeURIComponent(filter.value)
     );
 
+    if (opts.countOnly) {
+      return <span>{count === null ? 'Live contact count unavailable' :
+        count + ' live ' + (count === 1 ? 'contact' : 'contacts')}</span>;
+    }
+    if (opts.linkOnly) {
+      return <Button bsSize="small" href={href} target="_blank" rel="noopener noreferrer">View contacts</Button>;
+    }
+
     if (opts.compact) {
       return (
         <span style={{textTransform: 'none', fontWeight: 400}}>
-          ({count} {count === 1 ? 'contact' : 'contacts'}
+          ({count} live {count === 1 ? 'contact' : 'contacts'}
           {
             count ?
               <span>
@@ -1157,13 +1158,14 @@ class Automation extends Component {
 
     return (
       <div style={{minWidth: '150px'}}>
-        <h4 style={{whiteSpace: 'nowrap'}}>{count} {count === 1 ? 'contact' : 'contacts'}</h4>
+        <h4 style={{whiteSpace: 'nowrap'}}>{count === null ? 'Live contact count unavailable' :
+          count + ' live ' + (count === 1 ? 'contact' : 'contacts')}</h4>
         <Button
           bsSize="small"
           href={href}
           target="_blank"
           rel="noopener noreferrer"
-          disabled={!count}
+          disabled={opts.pending ? false : !count}
         >
           View contacts
         </Button>
@@ -1173,12 +1175,26 @@ class Automation extends Component {
 
   handleSubmit = async event => {
     const isclose = this.props.formClose(event);
-
-    const saved = await this.save();
-
-    if (saved && isclose) {
-      this.goBack();
+    if (this.state.isPublishing || this.state.exitRuleEditing || this.state.saveReminder || this.savingDraft) return;
+    this.savingDraft = true;
+    try {
+      const saved = await this.save();
+      if (saved && shouldRemindAfterSave(this.props.id)) {
+        this.setState({saveReminder: {closeAfter: isclose}});
+      } else if (saved && isclose) {
+        this.goBack();
+      }
+    } finally {
+      this.savingDraft = false;
     }
+  }
+
+  finishSaveReminder = publish => {
+    const reminder = this.state.saveReminder;
+    this.setState({saveReminder: null}, () => {
+      if (publish) this.publish();
+      else if (reminder && reminder.closeAfter) this.goBack();
+    });
   }
 
   navbarButtons = () => {
@@ -1186,10 +1202,10 @@ class Automation extends Component {
       <div>
         <Button
           bsStyle="primary"
-          disabled={this.props.isSaving || this.state.isPublishing || this.state.isPausing}
+          disabled={this.props.isLoading || this.props.isSaving || this.state.isPublishing || this.state.exitRuleEditing || this.state.isPausing}
           onClick={this.publish}
         >
-          {this.state.isPublishing ? 'Publishing...' : 'Publish'}
+          {this.state.isPublishing ? 'Publish review…' : 'Publish'}
         </Button>
         {
           this.props.data.published_at ?
@@ -1216,11 +1232,11 @@ class Automation extends Component {
           text="Save"
           loadingText="Saving..."
           className="green"
-          disabled={this.props.isSaving || this.state.isPublishing}
+          disabled={this.props.isSaving || this.state.isPublishing || this.state.exitRuleEditing}
           onClick={this.props.formSubmit}
           splitItems={[
-            { text: 'Save and Close', onClick: this.props.formSubmit.bind(null, true) },
-            { text: 'Cancel', onClick: this.goBack }
+            { text: 'Save and Close', disabled: this.state.isPublishing, onClick: this.props.formSubmit.bind(null, true) },
+            { text: 'Cancel', disabled: this.state.isPublishing, onClick: this.goBack }
           ]}
         />
       </div>
@@ -1974,6 +1990,7 @@ class Automation extends Component {
       <SaveNavbar title={'Edit Automation'} user={this.props.user} isSaving={this.props.isSaving}
         onBack={this.goBack} buttons={this.navbarButtons()} id={this.props.id}
         loggedInImpersonate={this.props.loggedInImpersonate}>
+        <fieldset disabled={this.state.isPublishing || !!this.state.saveReminder} style={{minWidth: 0, pointerEvents: this.state.isPublishing || this.state.saveReminder ? 'none' : undefined}}>
         <LoaderPanel isLoading={this.props.isLoading}>
           <EDFormSection onSubmit={this.handleSubmit} formRef={this.props.formRef}>
             <EDFormBox>
@@ -2029,11 +2046,21 @@ class Automation extends Component {
                 space
               />
             </EDFormBox>
+            <EDFormBox space>
+              <AutomationExitRules value={data.exit_rules || []} lists={this.listOptions()} tags={this.tagData()}
+                disabled={this.state.isPublishing || this.props.isSaving}
+                onEditingChange={exitRuleEditing => this.setState({exitRuleEditing})}
+                onChange={rules => this.props.update({exit_rules: {$set: rules}})} />
+            </EDFormBox>
             {this.renderEmails()}
             {this.renderPreflight()}
             <AutomationWorkflowEditor
               automationId={this.props.id}
+              automations={this.props.automations || []}
               nodes={nodes}
+              publishedNodes={(data.published && data.published.nodes) || []}
+              publishedRevision={data.published_revision || 0}
+              moveDecisions={data.draft.moves || {}}
               emails={this.props.emails || []}
               lists={this.props.lists || []}
               tags={this.props.tags || []}
@@ -2051,6 +2078,12 @@ class Automation extends Component {
             {canViewAutomationDiagnostics(this.props) ? this.renderHistory() : null}
           </EDFormSection>
         </LoaderPanel>
+        </fieldset>
+        {this.state.saveReminder && <AutomationSaveReminder id={this.props.id} onChoose={this.finishSaveReminder} />}
+        <AutomationPublishReview key={this.props.id} ref={value => {this.publishReview = value;}}
+          id={this.props.id} data={data} isSaving={this.props.isSaving}
+          save={this.save} reload={this.props.reload}
+          onActiveChange={isPublishing => this.setState({isPublishing})} />
       </SaveNavbar>
     );
   }
@@ -2072,6 +2105,7 @@ export default withLoadSave({
   get: async ({id}) => normalizeAutomation((await axios.get('/api/automations/' + id)).data),
   patch: ({id, data}) => axios.patch('/api/automations/' + id, patchPayload(data)),
   extra: {
+    automations: async () => (await axios.get('/api/automations')).data,
     tags: async () => (await axios.get('/api/recenttags')).data,
     emails: async ({id}) => (await axios.get('/api/automations/' + id + '/emails')).data,
     lists: async () => _.sortBy((await axios.get('/api/lists')).data, l => (l.name || '').toLowerCase()),

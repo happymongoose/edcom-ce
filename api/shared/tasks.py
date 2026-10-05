@@ -29,7 +29,26 @@ tasks = Celery(
     ),
 )
 
+# Independent opt-ins until dedicated consumers are running. Tasks outside
+# these explicit routes retain the default queue, including unknown future types.
+INTERACTIVE_TASKS = frozenset({"api.lists.list_find_start", "api.lists.list_find"})
+
+
+def route_transactional_task(name, args, kwargs, options, task=None, **extra):
+    # Route the orchestration task, not shared provider adapters used by broadcasts.
+    if os.environ.get("transactional_task_queue", "").lower() in ("true", "1") and name == "api.transactional.send_txn":
+        return {"queue": "transactional"}
+    return None
+
+
+def route_interactive_task(name, args, kwargs, options, task=None, **extra):
+    if os.environ.get("interactive_task_queue", "").lower() in ("true", "1") and name in INTERACTIVE_TASKS:
+        return {"queue": "interactive"}
+    return None
+
+
 tasks.conf.update(
+    task_routes=(route_transactional_task, route_interactive_task),
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     broker_transport_options={

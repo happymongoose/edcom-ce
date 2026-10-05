@@ -790,50 +790,52 @@ class ContactsAll(object):
         page = max(req.get_param_as_int("page") or 1, 1)
         page_size = max(1, min(req.get_param_as_int("page_size") or 50, 100))
         search = (req.get_param("search") or "").strip().lower()[:255]
+        include_unlisted = req.get_param_as_bool("include_unlisted") or False
 
         params = []
         filters = []
         if search:
-            filters.append("lower(email) like %s")
-            params.append("%%%s%%" % search)
+            filters.append("""(lower(email) like %s or lower(concat_ws(' ',
+                props->>'First Name', props->>'Last Name', props->>'Name', props->>'Full Name')) like %s)""")
+            pattern = "%%%s%%" % search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.extend([pattern, pattern])
         filter_clause = ("and " + " and ".join(filters)) if filters else ""
+        membership_clause = "true" if include_unlisted else f"""exists (
+            select 1 from contacts."contact_lists_{cid}" cl
+            join lists l on l.cid = %s and l.id = cl.list_id
+            where cl.contact_id = c.contact_id
+        )"""
+        scope_params = [] if include_unlisted else [cid]
 
         total = db.single(
             f"""
             select count(*)
             from contacts."contacts_{cid}" c
-            where exists (
-                select 1
-                from contacts."contact_lists_{cid}" cl
-                join lists l on l.cid = %s and l.id = cl.list_id
-                where cl.contact_id = c.contact_id
-            )
+            where {membership_clause}
             {filter_clause}
             """,
-            *([cid] + params),
+            *(scope_params + params),
         ) or 0
 
         rows = [
             {
                 "contact_id": contact_id,
                 "email": email,
+                "name": name,
                 "added": datetime.utcfromtimestamp(added).isoformat() + "Z" if added else None,
             }
-            for contact_id, email, added in db.execute(
+            for contact_id, email, added, name in db.execute(
                 f"""
-                select contact_id, email, added
+                select contact_id, email, added,
+                    coalesce(nullif(concat_ws(' ', nullif(props->>'First Name', ''),
+                        nullif(props->>'Last Name', '')), ''), props->>'Full Name', props->>'Name', '')
                 from contacts."contacts_{cid}" c
-                where exists (
-                    select 1
-                    from contacts."contact_lists_{cid}" cl
-                    join lists l on l.cid = %s and l.id = cl.list_id
-                    where cl.contact_id = c.contact_id
-                )
+                where {membership_clause}
                 {filter_clause}
                 order by lower(email), contact_id
                 limit %s offset %s
                 """,
-                *([cid] + params + [page_size, (page - 1) * page_size]),
+                *(scope_params + params + [page_size, (page - 1) * page_size]),
             )
         ]
 

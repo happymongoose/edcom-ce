@@ -173,7 +173,7 @@ class TestSegmentContacts(test_base.TestBase):
         assert first_page["total"] == 2
         assert first_page["total_pages"] == 2
         assert len(first_page["contacts"]) == 1
-        assert set(first_page["contacts"][0].keys()) == {"contact_id", "email", "added"}
+        assert set(first_page["contacts"][0].keys()) == {"contact_id", "email", "name", "added"}
         assert first_page["contacts"][0]["added"].endswith("Z")
 
         searched = self.user_get(
@@ -181,6 +181,29 @@ class TestSegmentContacts(test_base.TestBase):
         )
         assert searched["total"] == 1
         assert searched["contacts"][0]["email"] == second_email
+
+        # The overview search can also find contacts with no surviving list.
+        global_search = self.user_get("/api/contacts?include_unlisted=true&search=" + orphan_email)
+        assert global_search["total"] == 1
+        assert global_search["contacts"][0]["email"] == orphan_email
+
+    def test_all_contacts_searches_names_across_lists_with_literal_input(self):
+        from urllib.parse import quote
+        suffix = shortuuid.uuid().lower()
+        first, second = self.create_contact_list(), self.create_contact_list()
+        for index, contact_list in enumerate((first, second)):
+            email = "name-search-%s-%s@example.com" % (suffix, index)
+            self.add_contact(contact_list["id"], email)
+            self.db.execute(f'''update contacts."contacts_{self.user_cookie['cid']}" set props = %s where email = %s''',
+                            {"First Name": "Alice", "Last Name": "O'Neil_" + suffix}, email)
+        search = quote(" ALICE O'NEIL_" + suffix.upper() + " ")
+        result = self.user_get("/api/contacts?include_unlisted=true&search=" + search)
+        assert result["total"] == 2
+        assert all(row["name"] == "Alice O'Neil_" + suffix for row in result["contacts"])
+        partial = self.user_get("/api/contacts?include_unlisted=true&search=" + quote("o'neil_" + suffix))
+        assert partial["total"] == 2
+        # SQL wildcard characters are literal input, not a request for everyone.
+        assert self.user_get("/api/contacts?search=" + quote("%" + suffix))["total"] == 0
 
     def test_contact_memberships_include_lists_and_matching_segments(self):
         suffix = shortuuid.uuid().lower()

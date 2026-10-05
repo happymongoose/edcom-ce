@@ -6,7 +6,10 @@
 * * * * * /scripts/cron.py api.transactional check_txns 14
 * * * * * /scripts/cron.py api.campaigns check_camps 16
 * * * * * /scripts/cron.py api.automations check_automation_enrolments 18
+* * * * * /scripts/cron.py api.automations check_automation_exit_events 28
 */5 * * * * /scripts/cron.py api.automations check_automation_segment_triggers 26
 30 * * * * /scripts/cron.py api.lists refresh_active_counts 20
 * * * * * /scripts/cron.py api.lists check_list_validations 24
 0 0 * * * /usr/sbin/logrotate /etc/logrotate.conf -s /config/logrotate.status
+
+* * * * * /scripts/cron.py api.automations check_automation_subject_tests 30

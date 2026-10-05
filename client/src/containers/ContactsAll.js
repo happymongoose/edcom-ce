@@ -28,10 +28,25 @@ export default class ContactsAll extends Component {
     search: "",
     appliedSearch: "",
     isLoading: false,
+    hasSearched: false,
   }
 
   componentDidMount() {
-    this.reload();
+    if (!this.props.embedded) this.reload();
+  }
+
+  componentWillUnmount() { this.request = (this.request || 0) + 1; }
+
+  componentDidUpdate(previousProps, previousState) {
+    if (previousState.hasSearched !== this.state.hasSearched && this.props.onResultsVisibilityChange) {
+      this.props.onResultsVisibilityChange(this.state.hasSearched);
+    }
+  }
+
+  clearSearch = () => {
+    this.request = (this.request || 0) + 1;
+    this.setState({search: '', appliedSearch: '', contacts: [], page: 1, total: 0, totalPages: 1,
+      hasSearched: false, isLoading: false});
   }
 
   contactHref(email) {
@@ -42,6 +57,7 @@ export default class ContactsAll extends Component {
   }
 
   reload = async () => {
+    const request = this.request = (this.request || 0) + 1;
     this.setState({isLoading: true});
     try {
       const data = (await axios.get("/api/contacts", {
@@ -49,9 +65,12 @@ export default class ContactsAll extends Component {
           page: this.state.page,
           page_size: this.state.pageSize,
           search: this.state.appliedSearch,
+          ...(this.props.embedded ? {include_unlisted: true} : {}),
         },
       })).data;
+      if (request !== this.request) return;
       this.setState({
+        hasSearched: true,
         contacts: data.contacts || [],
         page: data.page || 1,
         pageSize: data.page_size || 50,
@@ -59,9 +78,11 @@ export default class ContactsAll extends Component {
         totalPages: data.total_pages || 1,
       });
     } catch (error) {
+      if (request !== this.request) return;
+      this.setState({hasSearched: false});
       notify.show(errorMessage(error, "Unable to load contacts"), "error");
     } finally {
-      this.setState({isLoading: false});
+      if (request === this.request) this.setState({isLoading: false});
     }
   }
 
@@ -71,6 +92,7 @@ export default class ContactsAll extends Component {
 
   submitSearch = event => {
     event.preventDefault();
+    if (this.props.embedded && !this.state.search.trim()) return;
     this.setState({appliedSearch: this.state.search.trim(), page: 1}, this.reload);
   }
 
@@ -82,7 +104,7 @@ export default class ContactsAll extends Component {
     if (!this.state.contacts.length) {
       return (
         <tr>
-          <td colSpan="3" className="text-center">No contacts match this search.</td>
+          <td colSpan="4" className="text-center">No contacts match this search.</td>
         </tr>
       );
     }
@@ -91,24 +113,25 @@ export default class ContactsAll extends Component {
         <td>
           <a href={this.contactHref(contact.email)}>{contact.email}</a>
         </td>
+        <td>{contact.name || ''}</td>
         <td>{contact.contact_id}</td>
         <td>{contact.added ? moment(contact.added).format("lll") : ""}</td>
       </tr>
     ));
   }
 
-  render() {
+  renderSearch() {
     return (
-      <MenuNavbar {...this.props}>
-        <TitlePage title="All Contacts" />
         <EDTableSection className="white-table-section">
           <LoaderPanel isLoading={this.state.isLoading}>
+            {this.props.embedded && <h4>Find a contact across all lists</h4>}
             <form className="form-inline" onSubmit={this.submitSearch} style={{marginBottom: "14px"}}>
               <FormControl
-                type="email"
+                type="search"
+                aria-label="Search contacts by email or name"
                 value={this.state.search}
                 onChange={this.searchChange}
-                placeholder="Search by email"
+                placeholder="Search by email or name"
                 style={{width: "280px"}}
               />
               {" "}
@@ -118,8 +141,11 @@ export default class ContactsAll extends Component {
                 text="Search"
                 loadingText="Searching..."
                 isLoading={this.state.isLoading}
+                disabled={this.props.embedded && !this.state.search.trim()}
               />
+              {this.props.embedded && this.state.hasSearched && <Button type="button" onClick={this.clearSearch} style={{marginLeft: '8px'}}>Back to lists</Button>}
             </form>
+            {this.state.hasSearched && <div>
             <p>
               Showing {this.state.total ? (((this.state.page - 1) * this.state.pageSize) + 1) : 0}
               -
@@ -130,6 +156,7 @@ export default class ContactsAll extends Component {
               <thead>
                 <tr>
                   <th>Email</th>
+                  <th>Name</th>
                   <th>Contact ID</th>
                   <th>Added</th>
                 </tr>
@@ -156,8 +183,18 @@ export default class ContactsAll extends Component {
               :
                 null
             }
+            </div>}
           </LoaderPanel>
         </EDTableSection>
+    );
+  }
+
+  render() {
+    if (this.props.embedded) return this.renderSearch();
+    return (
+      <MenuNavbar {...this.props}>
+        <TitlePage title="All Contacts" />
+        {this.renderSearch()}
       </MenuNavbar>
     );
   }

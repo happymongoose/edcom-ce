@@ -1289,7 +1289,8 @@ def check_txns() -> None:
                         ):
                             requesting = min(cnt, 1000)
                             cnt = check_send_limit(
-                                company, route, domain, domainthrottles, requesting
+                                company, route, domain, domainthrottles, requesting,
+                                transactional=True,
                             )
                             if cnt > 0:
                                 log.debug(

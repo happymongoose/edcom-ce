@@ -321,6 +321,29 @@ class TestAutomationCRUD(test_base.TestBase):
         self.assertEqual(result.status_code, 400)
         self.assertIn(message, result.text)
 
+    def test_plural_tag_schema_preserves_legacy_and_rejects_ambiguous_values(self):
+        for action in ("add_tag", "remove_tag"):
+            for config, expected in (({"draft_tag": "legacy"}, 200), ({"draft_tags": ["one", "two"]}, 200),
+                                     ({"draft_tag": "one", "draft_tags": ["two"]}, 400),
+                                     ({"draft_tags": ["one", "one"]}, 400), ({"draft_tags": [1]}, 400)):
+                with self.subTest(action=action, config=config):
+                    a = self.create_tracked_automation("Tag schema")
+                    node = {"id": "tag", "type": action, "label": "Tags", **config}
+                    result = self.simulate_patch("/api/automations/%s" % a["id"], json=self.workflow_with_nodes([node]), headers={"X-Auth-UID":self.user_cookie["uid"], "X-Auth-Cookie":self.user_cookie["id"]})
+                    self.assertEqual(result.status_code, expected, result.text)
+                    if expected == 200:
+                        self.assertEqual(self.user_publish(a["id"])["published"]["nodes"][0], node)
+        self.assert_publish_fails(self.workflow_with_nodes([{"id":"tag","type":"add_tag","label":"Tags","draft_tags":[]}]), "tag configuration")
+        self.assert_publish_fails(self.workflow_with_nodes([{"id":"tag","type":"add_tag","label":"Tags","draft_tags":["valid", ""]}]), "tag configuration")
+
+    def test_date_wait_requires_an_exact_offset_and_preserves_incomplete_drafts(self):
+        for value in ("", "not a date", "2026-10-25T01:30:00"):
+            self.assert_publish_fails(self.workflow_with_nodes([{"id":"wait","type":"wait_duration","label":"Wait","wait_until":value}]), "UTC offset")
+        a = self.create_tracked_automation("Exact deadline")
+        node = {"id":"wait","type":"wait_duration","label":"Wait","wait_until":"2026-10-25T01:30:00+01:00"}
+        self.user_patch("/api/automations/%s" % a["id"], json=self.workflow_with_nodes([node]))
+        self.assertEqual(self.user_publish(a["id"])["published"]["nodes"][0], node)
+
     def test_draft_lifecycle(self):
         created = self.user_post("/api/automations", json={"name": "Welcome Series"})
 
@@ -1310,6 +1333,36 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.assert_publish_fails(workflow, "Remove tag nodes must have draft tag configuration.")
 
+    def test_plural_list_schema_and_publish_ownership(self):
+        from jsonschema import validate, ValidationError
+        from api import automations
+        ids = [self.create_contact_list("plural_one")["id"], self.create_contact_list("plural_two")["id"]]
+        for action, schema in (("add_to_list", automations.ADD_TO_LIST_NODE_SCHEMA), ("remove_from_list", automations.REMOVE_FROM_LIST_NODE_SCHEMA)):
+            node = {"id": "lists", "type": action, "label": "Lists", "list_ids": ids}
+            validate(node, schema)
+            for fields in ({"list_ids": [ids[0], ids[0]]}, {"list_ids": [7]}, {"list_ids": [""]}, {"list_ids": ids, "list_id": ids[0]}, {"list_ids": [str(i) for i in range(101)]}):
+                with self.subTest(action=action, fields=fields), self.assertRaises(ValidationError):
+                    validate({**node, **fields}, schema)
+            created = self.user_post("/api/automations", json={"name": "Plural lists"})
+            self.addCleanup(self.db.automations.remove, created["id"])
+            for fields in ({"list_ids": [ids[0], ids[0]]}, {"list_ids": [7]}, {"list_ids": ids, "list_id": ids[0]}):
+                result = self.simulate_patch("/api/automations/" + created["id"],
+                    headers={"X-Auth-UID": self.user_cookie["uid"], "X-Auth-Cookie": self.user_cookie["id"]},
+                    json=self.workflow_with_nodes([{**node, **fields}]))
+                self.assertEqual(result.status_code, 400, result.text)
+                self.assertEqual(automations._action_lists({**node, **fields}), [])
+            self.user_patch("/api/automations/" + created["id"], json=self.workflow_with_nodes([node]))
+            published = self.user_publish(created["id"])
+            self.assertEqual(published["published"]["nodes"][0], node)
+            self.assert_publish_fails(self.workflow_with_nodes([{**node, "list_ids": []}]), "must select a contact list")
+            self.assert_publish_fails(self.workflow_with_nodes([{**node, "list_ids": [ids[0], "missing-list"]}]), "from this account")
+        foreign = self.create_contact_list("plural_foreign")["id"]
+        self.db.execute("update lists set cid = 'other-account' where id = %s", foreign)
+        try:
+            self.assert_publish_fails(self.workflow_with_nodes([{**node, "list_ids": [ids[0], foreign]}]), "from this account")
+        finally:
+            self.db.execute("update lists set cid = %s where id = %s", self.user_cookie["cid"], foreign)
+
     def test_valid_add_to_list_node_publishes(self):
         lst = self.create_contact_list("automation_crud_add_to_list")
         created = self.user_post("/api/automations", json={"name": "Add To List"})
@@ -1761,7 +1814,7 @@ class TestAutomationCRUD(test_base.TestBase):
         }
         self.assert_email_engagement_condition_publish_fails(condition, "cannot target themselves")
 
-    def test_email_engagement_condition_branch_cycle_fails_publish_validation(self):
+    def test_email_engagement_condition_branch_cycle_publishes_for_runtime_guard(self):
         automation = self.create_tracked_automation("Email Engagement Cycle")
         email = self.create_automation_email(automation["id"])
         workflow = self.workflow_with_nodes([
@@ -1795,10 +1848,8 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         )
 
-        self.assertEqual(result.status_code, 400)
-        self.assertIn("Workflow contains a cycle", result.text)
-        self.assertIn("Step 1 Add before condition", result.text)
-        self.assertIn("Step 2 If opened email", result.text)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["published"]["nodes"], workflow["draft"]["nodes"])
 
     def test_condition_branch_target_can_point_to_go_to_node(self):
         created = self.user_post("/api/automations", json={"name": "Condition Go To Target"})
@@ -1859,7 +1910,13 @@ class TestAutomationCRUD(test_base.TestBase):
         self.user_delete("/api/automations/%s" % automation_id)
         return result
 
-    def test_condition_yes_branch_cycle_fails_publish_validation(self):
+    def assert_loop_publishes(self, workflow):
+        automation = self.create_tracked_automation("Runtime guarded loop")
+        self.user_patch("/api/automations/%s" % automation["id"], json=workflow)
+        result = self.user_publish(automation["id"])
+        self.assertEqual(result["published"]["nodes"], workflow["draft"]["nodes"])
+
+    def test_condition_yes_branch_cycle_publishes_for_runtime_guard(self):
         workflow = self.workflow_with_nodes([
             {
                 "id": "node_add_tag_1",
@@ -1882,11 +1939,9 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         ])
 
-        result = self.assert_publish_fails(workflow, "Workflow contains a cycle")
-        self.assertIn("Step 1 Add before condition", result.text)
-        self.assertIn("Step 2 If contact has tag", result.text)
+        self.assert_loop_publishes(workflow)
 
-    def test_condition_no_branch_cycle_fails_publish_validation(self):
+    def test_condition_no_branch_cycle_publishes_for_runtime_guard(self):
         workflow = self.workflow_with_nodes([
             {
                 "id": "node_add_tag_1",
@@ -1909,19 +1964,15 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         ])
 
-        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+        self.assert_loop_publishes(workflow)
 
-    def test_linear_progression_is_counted_in_cycle_detection(self):
+    def test_linear_cycle_publishes_for_runtime_guard(self):
         workflow = self.workflow_with_nodes([
             {
                 "id": "node_wait_1",
-                "type": "wait_duration",
-                "label": "Wait before condition",
-                "duration": {
-                    "days": 0,
-                    "hours": 0,
-                    "minutes": 5,
-                },
+                "type": "add_tag",
+                "label": "Action before condition",
+                "draft_tag": "before-condition",
             },
             {
                 "id": "node_condition_1",
@@ -1938,9 +1989,9 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         ])
 
-        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+        self.assert_loop_publishes(workflow)
 
-    def test_remove_tag_linear_progression_is_counted_in_cycle_detection(self):
+    def test_remove_tag_cycle_publishes_for_runtime_guard(self):
         workflow = self.workflow_with_nodes([
             {
                 "id": "node_remove_tag_1",
@@ -1963,9 +2014,9 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         ])
 
-        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+        self.assert_loop_publishes(workflow)
 
-    def test_list_action_linear_progression_is_counted_in_cycle_detection(self):
+    def test_list_action_cycle_publishes_for_runtime_guard(self):
         lst = self.create_contact_list("automation_crud_cycle_list")
         workflow = self.workflow_with_nodes([
             {
@@ -1989,7 +2040,7 @@ class TestAutomationCRUD(test_base.TestBase):
             },
         ])
 
-        self.assert_publish_fails(workflow, "Workflow contains a cycle")
+        self.assert_loop_publishes(workflow)
 
     def test_exit_breaks_cycle_detection_paths(self):
         created = self.user_post("/api/automations", json={"name": "Exit Breaks Paths"})
@@ -2094,14 +2145,34 @@ class TestAutomationCRUD(test_base.TestBase):
         }
         self.assert_go_to_publish_fails(go_to, "cannot target themselves")
 
-    def test_go_to_backward_target_fails_publish_validation(self):
+    def test_go_to_backward_cycle_without_wait_publishes_for_runtime_guard(self):
         go_to = {
             "id": "node_go_to_1",
             "type": "go_to",
             "label": "Go to previous step",
             "target_node_id": "node_add_tag_1",
         }
-        self.assert_go_to_publish_fails(go_to, "later node")
+        self.assert_loop_publishes(self.go_to_workflow(go_to))
+
+    def test_backward_cross_branch_go_to_publishes(self):
+        automation = self.create_tracked_automation("Cross branch Go to")
+        nodes = [
+            {"id": "if", "type": "if_has_tag", "label": "Branch", "draft_tag": "vip", "yes_node_id": "yes", "no_node_id": "no"},
+            {"id": "yes", "type": "add_tag", "label": "Yes", "draft_tag": "yes"},
+            {"id": "end", "type": "exit", "label": "End"},
+            {"id": "no", "type": "go_to", "label": "Join Yes", "target_node_id": "yes"},
+        ]
+        self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow_with_nodes(nodes))
+        published = self.user_post("/api/automations/%s/publish" % automation["id"])
+        self.assertEqual(published["published"]["nodes"], nodes)
+
+    def test_loop_bypassing_a_wait_publishes_for_runtime_guard(self):
+        nodes = [
+            {"id": "if", "type": "if_has_tag", "label": "Branch", "draft_tag": "vip", "yes_node_id": "wait", "no_node_id": "go"},
+            {"id": "wait", "type": "wait_duration", "label": "Wait", "duration": {"days": 0, "hours": 0, "minutes": 5}},
+            {"id": "go", "type": "go_to", "label": "Repeat", "target_node_id": "if"},
+        ]
+        self.assert_loop_publishes(self.workflow_with_nodes(nodes))
 
     def assert_condition_publish_fails(self, condition, message):
         created = self.user_post("/api/automations", json={"name": "Invalid Condition"})
@@ -2198,3 +2269,86 @@ class TestAutomationCRUD(test_base.TestBase):
 
         self.assertEqual(result.status_code, 400)
         self.user_delete("/api/automations/%s" % automation_id)
+
+    def test_duplicate_node_ids_rejected_on_draft_save(self):
+        automation = self.create_tracked_automation("Node ID integrity")
+        path = "/api/automations/%s" % automation["id"]
+        saved = self.user_patch(path, json=self.valid_workflow())
+        variants = [
+            {"type": "add_tag", "draft_tag": "private-tag-value"},
+            {"type": "if_has_tag", "draft_tag": "private-tag-value", "yes_node_id": "", "no_node_id": "missing"},
+            {"type": "go_to", "target_node_id": ""},
+            {"type": "exit"},
+        ]
+        for variant in variants:
+            with self.subTest(node_type=variant["type"]):
+                nodes = [
+                    {"id": "duplicate_1", "label": "private-label-value", **variant},
+                    {"id": "duplicate_1", "type": "exit", "label": "private-other-label"},
+                ]
+                result = self.simulate_patch(path, json=self.workflow_with_nodes(nodes), headers={
+                    "X-Auth-UID": self.user_cookie["uid"], "X-Auth-Cookie": self.user_cookie["id"],
+                })
+                self.assertEqual(result.status_code, 400, result.text)
+                self.assertEqual(result.json["title"], "Input validation error")
+                self.assertIn('"duplicate_1"', result.json["description"])
+                self.assertNotIn("private-", result.text)
+                self.assertEqual(self.user_get(path), saved)
+
+    def test_unique_node_ids_remain_exact_case_sensitive_strings(self):
+        automation = self.create_tracked_automation("Exact node IDs")
+        nodes = [{"id": node_id, "type": "exit", "label": "Exit"}
+                 for node_id in ("Node_A", "node_a", "007", "7")]
+        saved = self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow_with_nodes(nodes))
+        self.assertEqual(saved["draft"]["nodes"], nodes)
+        self.assertEqual(self.user_publish(automation["id"])["published"]["nodes"], nodes)
+
+    def test_unique_incomplete_draft_and_duplicate_repair_remain_saveable(self):
+        automation = self.create_tracked_automation("Repair node IDs")
+        path = "/api/automations/%s" % automation["id"]
+        nodes = [
+            {"id": "condition", "type": "if_has_tag", "label": "Condition", "draft_tag": "",
+             "yes_node_id": "", "no_node_id": "deleted-target"},
+            {"id": "jump", "type": "go_to", "label": "Jump", "target_node_id": ""},
+            {"id": "end", "type": "exit", "label": "Exit"},
+        ]
+        self.assertEqual(self.user_patch(path, json=self.workflow_with_nodes(nodes))["draft"]["nodes"], nodes)
+        # Historical corruption remains readable, but even metadata-only saves
+        # must not persist an effective draft with duplicate IDs.
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation["id"], {"draft": {"nodes": nodes + [dict(nodes[-1])]}})
+        result = self.simulate_patch(path, json={"name": "Changed"}, headers={
+            "X-Auth-UID": self.user_cookie["uid"], "X-Auth-Cookie": self.user_cookie["id"],
+        })
+        self.assertEqual(result.status_code, 400)
+        self.assertIn('"end"', result.json["description"])
+        self.assertEqual(self.user_get(path)["name"], "Repair node IDs")
+        # Equivalent to deleting one duplicate array entry in the existing editor.
+        repaired = self.user_patch(path, json={"draft": {"nodes": nodes}})
+        self.assertEqual(repaired["draft"]["nodes"], nodes)
+
+    def test_publish_independently_rejects_duplicate_ids_before_target_validation(self):
+        automation = self.create_tracked_automation("Historical duplicate IDs")
+        path = "/api/automations/%s" % automation["id"]
+        self.user_patch(path, json=self.valid_workflow())
+        nodes = [
+            {"id": "stop", "type": "exit", "label": "Exit"},
+            # Unreachable duplicates must be rejected too. Without the ID check,
+            # this would first fail as a self-targeting Go to node.
+            {"id": "ambiguous", "type": "go_to", "label": "private-label", "target_node_id": "ambiguous"},
+            {"id": "ambiguous", "type": "exit", "label": "private-label"},
+            {"id": "another", "type": "exit", "label": "Exit"},
+            {"id": "another", "type": "exit", "label": "Exit"},
+        ]
+        self.db.set_cid(self.user_cookie["cid"])
+        self.db.automations.patch(automation["id"], {"draft": {"nodes": nodes}})
+        before = self.user_get(path)
+        result = self.simulate_post(path + "/publish", headers={
+            "X-Auth-UID": self.user_cookie["uid"], "X-Auth-Cookie": self.user_cookie["id"],
+        })
+        self.assertEqual(result.status_code, 400, result.text)
+        self.assertEqual(result.json["title"], "Automation publish validation failed")
+        self.assertIn('"ambiguous"', result.json["description"])
+        self.assertIn('"another"', result.json["description"])
+        self.assertNotIn("private-label", result.text)
+        self.assertEqual(self.user_get(path), before)

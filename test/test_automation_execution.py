@@ -1,4 +1,5 @@
 import os
+import json
 import shortuuid
 import dateutil.parser
 import falcon
@@ -1703,6 +1704,77 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
+    def test_plural_lists_membership_counters_events_history_and_noops(self):
+        from unittest.mock import patch
+        for action, event in (("add_to_list", "list_joined"), ("remove_from_list", "list_left")):
+            with self.subTest(action=action):
+                email, contact_id = self.create_contact()
+                existing = self.contact_list_ids(contact_id)[0]
+                empty = self.create_empty_list()["id"]
+                ids = [existing, empty]
+                a = self.create_automation(nodes=[{"id": "lists", "type": action, "label": "Lists", "list_ids": ids}, {"id": "end", "type": "exit", "label": "End"}])
+                self.addCleanup(self.cleanup, a["id"])
+                self.assertEqual(a["published"]["nodes"][0]["list_ids"], ids)
+                e = self.enrol(a["id"], email)
+                self.patch_enrolment_data(e["id"], {"trigger_correlation_id": "list-batch", "trigger_depth": 2})
+                self.addCleanup(self.db.execute, "delete from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id)
+                with patch.dict(os.environ, {"automation_trigger_emission_enabled": "true"}), patch.object(automations.contacts, "matching_list_trigger_automation_exists", return_value=True):
+                    result = self.run_next(a["id"], e["id"])
+                self.assertEqual(result.status_code, 200, result.text)
+                for value in ids:
+                    self.assertEqual(self.is_in_list(contact_id, value), action == "add_to_list")
+                    self.assertEqual(self.list_count(value), 1 if action == "add_to_list" else 0)
+                    self.assertEqual(self.list_domain_count(value), 1 if action == "add_to_list" else None)
+                changed = empty if action == "add_to_list" else existing
+                self.assertEqual(result.json["step_run"]["changed_list_ids"], [changed])
+                self.assertEqual(result.json["step_run"]["list_ids"], ids)
+                self.assertEqual(result.json["enrolment"]["current_node_id"], "end")
+                rows = self.db.execute("select data from automation_trigger_events where cid = %s and contact_id = %s and event_type = %s", self.user_cookie["cid"], contact_id, event).fetchall()
+                self.assertEqual([row[0]["list_id"] for row in rows], [changed])
+                self.assertEqual(rows[0][0]["correlation_id"], "list-batch")
+                self.assertEqual(rows[0][0]["depth"], 3)
+
+    def test_plural_lists_later_trigger_failure_rolls_back_membership_counters_events_and_claim(self):
+        from unittest.mock import patch
+        for action, event in (("add_to_list", "list_joined"), ("remove_from_list", "list_left")):
+            email, contact_id = self.create_contact()
+            ids = sorted([self.create_empty_list()["id"], self.create_empty_list()["id"]])
+            if action == "remove_from_list":
+                for value in ids:
+                    automations._add_contact_to_list(self.db, self.user_cookie["cid"], contact_id, email, value)
+            a = self.create_automation(nodes=[{"id": "lists", "type": action, "label": "Lists", "list_ids": ids}])
+            self.addCleanup(self.cleanup, a["id"])
+            e = self.enrol(a["id"], email)
+            original = automations.contacts.maybe_insert_list_trigger_event
+            def fail_second(*args, **kwargs):
+                if args[5] == ids[1]:
+                    raise ValueError("Injected second-list event failure")
+                return original(*args, **kwargs)
+            with patch.dict(os.environ, {"automation_trigger_emission_enabled": "true"}), patch.object(automations.contacts, "matching_list_trigger_automation_exists", return_value=True), patch.object(automations.contacts, "maybe_insert_list_trigger_event", side_effect=fail_second):
+                result = self.run_next(a["id"], e["id"])
+            self.assertEqual(result.status_code, 400, result.text)
+            for value in ids:
+                self.assertEqual(self.is_in_list(contact_id, value), action == "remove_from_list")
+                self.assertEqual(self.list_count(value), 1 if action == "remove_from_list" else 0)
+                self.assertEqual(self.list_domain_count(value), 1 if action == "remove_from_list" else None)
+            self.assertEqual(self.db.single("select count(*) from automation_trigger_events where cid = %s and contact_id = %s and event_type = %s", self.user_cookie["cid"], contact_id, event), 0)
+            state = self.enrolment_data(e["id"])
+            self.assertEqual(state["status"], "held")
+            self.assert_claim_cleared(state)
+
+    def test_plural_lists_missing_runtime_list_prevents_all_changes(self):
+        email, contact_id = self.create_contact()
+        ids = [self.create_empty_list()["id"], self.create_empty_list()["id"]]
+        a = self.create_automation(nodes=[{"id": "lists", "type": "add_to_list", "label": "Lists", "list_ids": ids}])
+        self.addCleanup(self.cleanup, a["id"])
+        e = self.enrol(a["id"], email)
+        self.db.lists.remove(ids[1])
+        result = self.run_next(a["id"], e["id"])
+        self.assertEqual(result.status_code, 400, result.text)
+        self.assertFalse(self.is_in_list(contact_id, ids[0]))
+        self.assertEqual(self.list_count(ids[0]), 0)
+        self.assert_claim_cleared(self.enrolment_data(e["id"]))
+
     def test_add_to_list_adds_membership_and_updates_count(self):
         email, contact_id = self.create_contact()
         target_list = self.create_empty_list()
@@ -3201,7 +3273,7 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_if_missing_tag_cycle_detection_includes_branch_targets(self):
+    def test_if_missing_tag_cycle_publishes_for_runtime_guard(self):
         automation = self.user_post(
             "/api/automations",
             json={"name": "automation_execution_missing_tag_cycle_%s" % self.unique()},
@@ -3235,8 +3307,8 @@ class TestAutomationExecution(test_base.TestBase):
             "/api/automations/%s/publish" % automation["id"],
             headers=self.headers(),
         )
-        self.assertEqual(result.status_code, 400)
-        self.assertIn("Workflow contains a cycle", result.text)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["published"]["nodes"], nodes)
 
         self.cleanup(automation["id"])
 
@@ -3353,7 +3425,7 @@ class TestAutomationExecution(test_base.TestBase):
 
         self.cleanup(automation["id"])
 
-    def test_if_conditions_branch_target_validation_and_cycle_detection(self):
+    def test_if_conditions_branch_target_validation_and_cycle_acceptance(self):
         automation = self.user_post(
             "/api/automations",
             json={"name": "automation_execution_compound_target_validation_%s" % self.unique()},
@@ -3401,8 +3473,8 @@ class TestAutomationExecution(test_base.TestBase):
         ]
         self.user_patch("/api/automations/%s" % automation["id"], json=self.workflow(nodes=nodes))
         result = self.simulate_post("/api/automations/%s/publish" % automation["id"], headers=self.headers())
-        self.assertEqual(result.status_code, 400)
-        self.assertIn("Workflow contains a cycle", result.text)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["published"]["nodes"], nodes)
 
         self.cleanup(automation["id"])
 
@@ -4517,6 +4589,469 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(second.json["enrolment"]["status"], "exited")
 
         self.cleanup(automation["id"])
+
+    def test_wait_guarded_loop_starts_a_fresh_wait_on_each_visit(self):
+        email, _ = self.create_contact()
+        nodes = [
+            {"id": "wait", "type": "wait_duration", "label": "Wait", "duration": {"days": 0, "hours": 0, "minutes": 5}},
+            {"id": "go", "type": "go_to", "label": "Repeat", "target_node_id": "wait"},
+        ]
+        automation = self.create_automation(nodes=nodes)
+        self.assertIn("published", automation)
+        self.addCleanup(self.cleanup, automation["id"])
+        enrolment = self.enrol(automation["id"], email)
+        first = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json["enrolment"]["status"], "waiting")
+        # Simulate an actually elapsed wait, without sleeping or skipping it.
+        past = (datetime.utcnow() - timedelta(minutes=6)).isoformat() + "Z"
+        state = first.json["enrolment"]
+        state["wait"]["started_at"] = past
+        state["wake_at"] = past
+        state["transitions_without_wait"] = 1000
+        self.db.execute("update automation_enrolments set data = data || %s where id = %s", state, enrolment["id"])
+        complete = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(complete.status_code, 200, complete.text)
+        self.assertEqual(complete.json["enrolment"]["transitions_without_wait"], 1)
+        self.assertEqual(complete.json["enrolment"]["visited_node_ids"], [])
+        self.assertIsNone(complete.json["enrolment"]["wait"])
+        self.assertEqual(self.run_next(automation["id"], enrolment["id"]).json["enrolment"]["current_node_id"], "wait")
+        repeated = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(repeated.json["enrolment"]["status"], "waiting")
+        self.assertGreater(repeated.json["enrolment"]["wait"]["started_at"], past)
+        self.assertGreater((dateutil.parser.parse(repeated.json["enrolment"]["wake_at"]) - dateutil.parser.parse(repeated.json["enrolment"]["wait"]["started_at"])).total_seconds(), 299)
+
+    def test_runtime_holds_before_repeating_action_and_releases_claim(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        self.addCleanup(self.cleanup, automation["id"])
+        nodes = automation["published"]["nodes"]
+        nodes[-1] = {"id": nodes[-1]["id"], "type": "go_to", "label": "Malformed loop", "target_node_id": nodes[0]["id"]}
+        self.db.automations.patch(automation["id"], {"published": {**automation["published"], "nodes": nodes}})
+        enrolment = self.enrol(automation["id"], email)
+        self.assertEqual(self.run_next(automation["id"], enrolment["id"]).status_code, 200)
+        self.assertEqual(self.run_next(automation["id"], enrolment["id"]).status_code, 200)
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("loop detected", result.text)
+        state = self.enrolment_data(enrolment["id"])
+        self.assertEqual(state["status"], "held")
+        self.assertFalse(state.get("claim_token"))
+        self.assertEqual(len(self.step_runs(automation["id"], enrolment["id"])), 2)
+        self.assertTrue(all(row[7]["status"] == "succeeded" for row in self.step_runs(automation["id"], enrolment["id"])))
+
+    def test_visit_guard_catches_inner_loops_and_both_condition_outcomes_across_ticks(self):
+        for kind in ("if_has_tag", "if_missing_tag", "if_conditions"):
+            for yes in (False, True):
+                with self.subTest(kind=kind, yes=yes):
+                    email, contact_id = self.create_contact()
+                    if yes != (kind == "if_missing_tag"):
+                        self.add_existing_tag(contact_id, "vip")
+                    condition = {"id": "branch", "type": kind, "label": "Branch", "yes_node_id": "left", "no_node_id": "right"}
+                    if kind == "if_conditions":
+                        condition["condition"] = {"mode": "all", "items": [{"type": "has_tag", "tag": "vip"}]}
+                    else:
+                        condition["draft_tag"] = "vip"
+                    nodes = [{"id": "entry", "type": "add_tag", "label": "Once", "draft_tag": "once"}, condition,
+                             {"id": "left", "type": "go_to", "label": "Left", "target_node_id": "branch"},
+                             {"id": "right", "type": "go_to", "label": "Right", "target_node_id": "branch"}]
+                    a = self.create_automation(nodes=nodes)
+                    self.addCleanup(self.cleanup, a["id"])
+                    e = self.enrol(a["id"], email)
+                    for expected in ("branch", "left" if yes else "right", "branch"):
+                        result = self.run_next(a["id"], e["id"])
+                        self.assertEqual(result.status_code, 200, result.text)
+                        self.assertEqual(result.json["enrolment"]["current_node_id"], expected)
+                    # The loop never returns to the enrolment's entry node.
+                    self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 400)
+                    state = self.enrolment_data(e["id"])
+                    self.assertEqual(state["status"], "held")
+                    self.assert_claim_cleared(state)
+                    self.assertEqual(len(self.step_runs(a["id"], e["id"])), 3)
+
+    def test_visit_history_survives_pause_resume_and_publication(self):
+        email, _ = self.create_contact()
+        a = self.create_automation(nodes=[
+            {"id": "tag", "type": "add_tag", "label": "Tag", "draft_tag": "once"},
+            {"id": "go", "type": "go_to", "label": "Again", "target_node_id": "tag"}])
+        self.addCleanup(self.cleanup, a["id"])
+        e = self.enrol(a["id"], email)
+        self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+        self.user_post("/api/automations/%s/pause" % a["id"])
+        self.user_post("/api/automations/%s/publish" % a["id"])
+        self.assertEqual(self.enrolment_data(e["id"])["visited_node_ids"], ["tag"])
+        self.user_post("/api/automations/%s/resume" % a["id"])
+        self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+        self.assertIn("loop detected", self.run_next(a["id"], e["id"]).text)
+
+    def test_skipped_or_instantly_elapsed_wait_does_not_clear_visits(self):
+        for instant in (False, True):
+            with self.subTest(instant=instant):
+                email, _ = self.create_contact()
+                a = self.create_automation(nodes=[
+                    {"id": "wait", "type": "wait_duration", "label": "Wait", "duration": {"days": 0, "hours": 0, "minutes": 5}},
+                    {"id": "go", "type": "go_to", "label": "Again", "target_node_id": "wait"}])
+                self.addCleanup(self.cleanup, a["id"])
+                e = self.enrol(a["id"], email)
+                start = self.run_next(a["id"], e["id"])
+                self.assertEqual(start.json["enrolment"]["visited_node_ids"], ["wait"])
+                if instant:
+                    self.patch_enrolment_data(e["id"], {"wake_at": (datetime.utcnow() - timedelta(seconds=1)).isoformat() + "Z"})
+                    complete = self.run_next(a["id"], e["id"])
+                else:
+                    complete = self.run_next_skip_wait(a["id"], e["id"])
+                self.assertEqual(complete.status_code, 200, complete.text)
+                self.assertEqual(complete.json["enrolment"]["visited_node_ids"], ["wait"])
+                self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+                self.assertIn("loop detected", self.run_next(a["id"], e["id"]).text)
+
+    def test_malformed_visit_history_fails_closed_without_action(self):
+        for invalid in ("tag", [1], None):
+            with self.subTest(invalid=invalid):
+                email, contact_id = self.create_contact()
+                a = self.create_automation(tag="must-not-run")
+                self.addCleanup(self.cleanup, a["id"])
+                e = self.enrol(a["id"], email)
+                self.patch_enrolment_data(e["id"], {"visited_node_ids": invalid})
+                result = self.run_next(a["id"], e["id"])
+                self.assertEqual(result.status_code, 400)
+                self.assertFalse(self.has_tag(contact_id, "must-not-run"))
+                self.assert_claim_cleared(self.enrolment_data(e["id"]))
+
+    def test_email_throttle_spans_nodes_and_reenrolments_but_not_contacts(self):
+        self.assign_single_debug_route()
+        email, _ = self.create_contact()
+        other_email, _ = self.create_contact()
+        a = self.create_send_email_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        first = a["published"]["nodes"][0]
+        nodes = [first, {**first, "id": "second"}, a["published"]["nodes"][-1]]
+        self.user_patch("/api/automations/%s" % a["id"], json=self.workflow(nodes=nodes, reentry="multiple"))
+        self.user_post("/api/automations/%s/publish" % a["id"])
+        e = self.enrol(a["id"], email)
+        sent = self.run_next(a["id"], e["id"])
+        self.assertTrue(sent.json["step_run"]["sent"])
+        skipped = self.run_next(a["id"], e["id"])
+        self.assertFalse(skipped.json["step_run"]["sent"])
+        self.assertTrue(skipped.json["step_run"]["throttled"])
+        self.assertEqual(skipped.json["enrolment"]["current_node_id"], "node_exit_1")
+        self.run_next(a["id"], e["id"])
+        again = self.enrol(a["id"], email)
+        self.assertTrue(self.run_next(a["id"], again["id"]).json["step_run"]["throttled"])
+        other = self.enrol(a["id"], other_email)
+        self.assertTrue(self.run_next(a["id"], other["id"]).json["step_run"]["sent"])
+        self.assertEqual(len(self.debug_email_logs(a["id"])), 2)
+
+    def test_two_email_loop_resets_visits_after_wait_but_throttles_both_emails(self):
+        self.assign_single_debug_route()
+        email, _ = self.create_contact()
+        a = self.create_send_email_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        second = self.user_post("/api/automations/%s/emails" % a["id"], json={
+            "name": "Second", "subject": "Second", "rawText": "<p>Second</p>",
+            "fromname": "Automation Sender", "returnpath": "automation-sender@example.com"})
+        first = a["published"]["nodes"][0]
+        nodes = [first, {**first, "id": "second", "automation_email_id": second["id"]},
+                 {"id": "wait", "type": "wait_duration", "label": "Wait", "duration": {"days": 0, "hours": 0, "minutes": 10}},
+                 {"id": "go", "type": "go_to", "label": "Repeat", "target_node_id": first["id"]}]
+        self.user_patch("/api/automations/%s" % a["id"], json=self.workflow(nodes=nodes))
+        self.user_post("/api/automations/%s/publish" % a["id"])
+        e = self.enrol(a["id"], email)
+        for _ in range(2):
+            self.assertTrue(self.run_next(a["id"], e["id"]).json["step_run"]["sent"])
+        waiting = self.run_next(a["id"], e["id"]).json["enrolment"]
+        waiting["wait"]["started_at"] = (datetime.utcnow() - timedelta(minutes=11)).isoformat() + "Z"
+        waiting["wake_at"] = (datetime.utcnow() - timedelta(minutes=1)).isoformat() + "Z"
+        self.patch_enrolment_data(e["id"], waiting)
+        self.assertEqual(self.run_next(a["id"], e["id"]).json["enrolment"]["visited_node_ids"], [])
+        self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+        for _ in range(2):
+            result = self.run_next(a["id"], e["id"])
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertTrue(result.json["step_run"]["throttled"])
+        self.assertEqual(self.run_next(a["id"], e["id"]).json["enrolment"]["status"], "waiting")
+        self.assertEqual(len(self.debug_email_logs(a["id"])), 2)
+
+    def test_email_throttle_expires_after_rolling_24_hours(self):
+        self.assign_single_debug_route()
+        email, _ = self.create_contact()
+        a = self.create_send_email_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        first = a["published"]["nodes"][0]
+        nodes = [first, {**first, "id": "second"}, a["published"]["nodes"][-1]]
+        self.user_patch("/api/automations/%s" % a["id"], json=self.workflow(nodes=nodes))
+        self.user_post("/api/automations/%s/publish" % a["id"])
+        e = self.enrol(a["id"], email)
+        sent = self.run_next(a["id"], e["id"])
+        old = (datetime.utcnow() - timedelta(hours=24, seconds=1)).isoformat() + "Z"
+        automations._patch_step_run(self.db, self.user_cookie["cid"], sent.json["step_run"]["id"], {"email_sent_at": old})
+        result = self.run_next(a["id"], e["id"])
+        self.assertTrue(result.json["step_run"]["sent"])
+        self.assertFalse(result.json["step_run"]["throttled"])
+        self.assertEqual(len(self.debug_email_logs(a["id"])), 2)
+
+    def test_uncertain_email_send_holds_and_retry_does_not_send_again(self):
+        from unittest.mock import patch
+        self.assign_single_debug_route()
+        email, _ = self.create_contact()
+        a = self.create_send_email_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        e = self.enrol(a["id"], email)
+        with patch.object(automations, "send_backend_mail", side_effect=TimeoutError("Ambiguous delivery")) as send:
+            result = self.run_next(a["id"], e["id"])
+            self.assertEqual(result.status_code, 400)
+            self.assertIn("delivery uncertain", result.text)
+            state = self.enrolment_data(e["id"])
+            self.assertEqual(state["status"], "held")
+            self.assert_claim_cleared(state)
+            self.assertFalse(state.get("visited_node_ids"))
+            # Even an operator reactivation cannot accidentally retry an uncertain send.
+            self.patch_enrolment_data(e["id"], {"status": "ready"})
+            self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 400)
+            self.assertEqual(send.call_count, 1)
+        self.assertEqual(self.debug_email_logs(a["id"]), [])
+
+    def test_plural_tags_add_remove_atomically_and_preserve_singular_nodes(self):
+        for action in ("add_tag", "remove_tag"):
+            with self.subTest(action=action):
+                email, contact_id = self.create_contact()
+                tags = ["customer", "paid", "active"]
+                if action == "remove_tag":
+                    for tag in tags: self.add_existing_tag(contact_id, tag)
+                a = self.create_automation(nodes=[{"id": "tags", "type": action, "label": "Tags", "draft_tags": tags}, {"id": "end", "type": "exit", "label": "End"}])
+                self.addCleanup(self.cleanup, a["id"])
+                self.assertEqual(a["published"]["nodes"][0]["draft_tags"], tags)
+                e = self.enrol(a["id"], email)
+                result = self.run_next(a["id"], e["id"])
+                self.assertEqual(result.status_code, 200, result.text)
+                for tag in tags: self.assertEqual(self.has_tag(contact_id, tag), action == "add_tag")
+                self.assertEqual(result.json["step_run"]["tags"], tags)
+                self.assertEqual(result.json["enrolment"]["current_node_id"], "end")
+
+    def test_plural_tag_failure_rolls_back_entire_batch_and_releases_claim(self):
+        from unittest.mock import patch
+        for action in ("add_tag", "remove_tag"):
+            with self.subTest(action=action):
+                email, contact_id = self.create_contact()
+                if action == "remove_tag":
+                    for tag in ("first", "second"): self.add_existing_tag(contact_id, tag)
+                a = self.create_automation(nodes=[{"id": "tags", "type": action, "label": "Tags", "draft_tags": ["first", "second"]}])
+                self.addCleanup(self.cleanup, a["id"])
+                e = self.enrol(a["id"], email)
+                helper = getattr(automations.contacts, action)
+                def failing(*args, **kwargs):
+                    if args[4] == "second": raise ValueError("Injected batch failure")
+                    return helper(*args, **kwargs)
+                with patch.object(automations.contacts, action, side_effect=failing):
+                    result = self.run_next(a["id"], e["id"])
+                self.assertEqual(result.status_code, 400, result.text)
+                for tag in ("first", "second"): self.assertEqual(self.has_tag(contact_id, tag), action == "remove_tag")
+                state = self.enrolment_data(e["id"])
+                self.assertEqual(state["status"], "held")
+                self.assert_claim_cleared(state)
+
+    def test_plural_tags_emit_only_changed_tags_with_shared_correlation_and_depth(self):
+        from unittest.mock import patch
+        for action, event in (("add_tag", "tag_added"), ("remove_tag", "tag_removed")):
+            email, contact_id = self.create_contact()
+            self.add_existing_tag(contact_id, "already")
+            if action == "remove_tag":
+                self.add_existing_tag(contact_id, "second")
+            a = self.create_automation(nodes=[{"id":"tags","type":action,"label":"Tags","draft_tags":["already","second","third"]}])
+            self.addCleanup(self.cleanup, a["id"])
+            e = self.enrol(a["id"], email)
+            self.patch_enrolment_data(e["id"], {"trigger_correlation_id":"tag-batch-test", "trigger_depth":2})
+            with patch.dict(os.environ, {"automation_trigger_emission_enabled":"true"}), patch.object(automations.contacts, "matching_tag_trigger_automation_exists", return_value=True):
+                self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+            rows = self.db.execute("select data from automation_trigger_events where cid = %s and contact_id = %s and event_type = %s", self.user_cookie["cid"], contact_id, event).fetchall()
+            self.addCleanup(self.db.execute, "delete from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id)
+            self.assertEqual(sorted(row[0]["tag"] for row in rows), ["second","third"] if action == "add_tag" else ["already","second"])
+            self.assertTrue(all(row[0]["correlation_id"] == "tag-batch-test" and row[0]["depth"] == 3 for row in rows))
+
+    def test_concurrent_plural_tag_actions_do_not_duplicate_change_events(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from unittest.mock import patch
+        email, contact_id = self.create_contact()
+        nodes = [{"id":"tags", "type":"add_tag", "label":"Tags", "draft_tags":["batch-a", "batch-b"]}]
+        first = self.create_automation(nodes=nodes)
+        second = self.create_automation(nodes=nodes)
+        self.addCleanup(self.cleanup, first["id"], second["id"])
+        one, two = self.enrol(first["id"], email), self.enrol(second["id"], email)
+        db1, db2 = self.publish_safety_db(), self.publish_safety_db()
+        entered, release, second_started = Event(), Event(), Event()
+        original = automations.contacts.add_tag
+        original_execute = db2.execute
+        def observed_execute(sql, *args, **kwargs):
+            if sql.startswith('select contact_id from contacts.') and 'for update' in sql:
+                db2.tag_batch_pid = db2.single("select pg_backend_pid()")
+                second_started.set()
+            return original_execute(sql, *args, **kwargs)
+        db2.execute = observed_execute
+        def blocked(db, *args, **kwargs):
+            if db is db1:
+                db1.tag_batch_pid = db.single("select pg_backend_pid()")
+                entered.set()
+                if not release.wait(5): raise AssertionError("Tag batch was not released")
+            return original(db, *args, **kwargs)
+        def run_second():
+            return automations._run_next_automation_enrolment(db2, self.user_cookie["cid"], second["id"], two["id"])
+        with patch.dict(os.environ, {"automation_trigger_emission_enabled":"true"}), patch.object(automations.contacts, "matching_tag_trigger_automation_exists", return_value=True), patch.object(automations.contacts, "add_tag", side_effect=blocked), ThreadPoolExecutor(2) as pool:
+            f1 = pool.submit(automations._run_next_automation_enrolment, db1, self.user_cookie["cid"], first["id"], one["id"])
+            try:
+                self.assertTrue(entered.wait(4))
+                f2 = pool.submit(run_second)
+                self.assertTrue(second_started.wait(4))
+                import time
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    blockers = self.db.single("select pg_blocking_pids(%s)", db2.tag_batch_pid)
+                    if db1.tag_batch_pid in blockers: break
+                    time.sleep(0.01)
+                self.assertIn(db1.tag_batch_pid, blockers, "The second batch must wait for the first contact lock")
+            finally:
+                release.set()
+            f1.result(timeout=5)
+            f2.result(timeout=5)
+        rows = self.db.execute("select data from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id).fetchall()
+        self.addCleanup(self.db.execute, "delete from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id)
+        self.assertEqual(sorted(row[0]["tag"] for row in rows), ["batch-a", "batch-b"])
+        self.assert_claim_cleared(self.enrolment_data(one["id"]))
+        self.assert_claim_cleared(self.enrolment_data(two["id"]))
+
+    def test_plural_tag_trigger_failure_rolls_back_tags_and_events(self):
+        from unittest.mock import patch
+        for action in ("add_tag", "remove_tag"):
+            email, contact_id = self.create_contact()
+            if action == "remove_tag":
+                for tag in ("first", "second"): self.add_existing_tag(contact_id, tag)
+            a = self.create_automation(nodes=[{"id":"tags", "type":action, "label":"Tags", "draft_tags":["first", "second"]}])
+            self.addCleanup(self.cleanup, a["id"])
+            e = self.enrol(a["id"], email)
+            helper_name = "maybe_insert_tag_added_trigger_event" if action == "add_tag" else "maybe_insert_tag_removed_trigger_event"
+            helper = getattr(automations.contacts, helper_name)
+            calls = []
+            def failing(*args, **kwargs):
+                calls.append(True)
+                if len(calls) == 2: raise ValueError("Injected trigger failure")
+                return helper(*args, **kwargs)
+            with patch.dict(os.environ, {"automation_trigger_emission_enabled":"true"}), patch.object(automations.contacts, "matching_tag_trigger_automation_exists", return_value=True), patch.object(automations.contacts, helper_name, side_effect=failing):
+                result = self.run_next(a["id"], e["id"])
+            self.assertEqual(result.status_code, 400, result.text)
+            self.assertEqual(len(calls), 2)
+            for tag in ("first", "second"): self.assertEqual(self.has_tag(contact_id, tag), action == "remove_tag")
+            self.assertEqual(self.db.execute("select count(*) from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id).fetchone()[0], 0)
+            self.assert_claim_cleared(self.enrolment_data(e["id"]))
+
+    def test_wait_mode_changes_are_blocked_for_waiting_contacts_in_impact_and_publish(self):
+        from copy import deepcopy
+        for absolute in (False, True):
+            for paused in (False, True):
+                nodes = self.wait_nodes()
+                if absolute:
+                    nodes[0].pop("duration")
+                    nodes[0]["wait_until"] = (datetime.utcnow()+timedelta(days=1)).isoformat()+"Z"
+                a = self.create_automation(nodes=nodes)
+                self.addCleanup(self.cleanup, a["id"])
+                email, _ = self.create_contact()
+                e = self.enrol(a["id"], email)
+                self.run_next(a["id"], e["id"])
+                path = "/api/automations/" + a["id"]
+                if paused: self.user_post(path + "/pause")
+                before = self.enrolment_data(e["id"])
+                proposed = deepcopy(nodes)
+                if absolute:
+                    proposed[0].pop("wait_until")
+                    proposed[0]["duration"] = {"days":1,"hours":0,"minutes":0}
+                else:
+                    proposed[0].pop("duration")
+                    proposed[0]["wait_until"] = (datetime.utcnow()+timedelta(days=1)).isoformat()+"Z"
+                self.user_patch(path, json={"draft":{"nodes":proposed}})
+                saved = self.user_get(path)
+                impact = self.user_get(path + "/publish-impact")
+                self.assertIn("incompatible_retained_wait", [item["code"] for item in impact["blockers"]])
+                self.assertEqual(self.simulate_post(path + "/publish", headers=self.headers()).status_code, 409)
+                self.assertEqual(self.user_get(path), saved)
+                self.assertEqual(self.enrolment_data(e["id"]), before)
+
+    def test_date_wait_waits_until_exact_instant_and_resume_does_not_move_deadline(self):
+        email, _ = self.create_contact()
+        deadline = (datetime.utcnow() + timedelta(hours=2)).isoformat() + "Z"
+        a = self.create_automation(nodes=[{"id": "wait", "type": "wait_duration", "label": "Date wait", "wait_until": deadline}, {"id": "end", "type": "exit", "label": "End"}])
+        self.addCleanup(self.cleanup, a["id"])
+        e = self.enrol(a["id"], email)
+        first = self.run_next(a["id"], e["id"])
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json["enrolment"]["wake_at"], deadline)
+        self.user_post("/api/automations/%s/pause" % a["id"])
+        self.user_post("/api/automations/%s/resume" % a["id"])
+        self.assertEqual(self.enrolment_data(e["id"])["wake_at"], deadline)
+        self.assertIn("Wait has not elapsed", self.run_next(a["id"], e["id"]).text)
+        self.user_post("/api/automations/%s/pause" % a["id"])
+        from unittest.mock import patch
+        with patch.object(automations, "datetime", wraps=datetime) as clock:
+            clock.utcnow.return_value = datetime.utcnow() + timedelta(hours=3)
+            self.user_post("/api/automations/%s/resume" % a["id"])
+            self.assertEqual(self.enrolment_data(e["id"])["wake_at"], deadline)
+            result = self.run_next(a["id"], e["id"])
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "end")
+
+    def test_expired_date_wait_advances_without_resetting_loop_guard(self):
+        email, _ = self.create_contact()
+        a = self.create_automation(nodes=[{"id": "wait", "type": "wait_duration", "label": "Past date", "wait_until": "2020-01-01T12:00:00Z"}, {"id": "go", "type": "go_to", "label": "Repeat", "target_node_id": "wait"}])
+        self.addCleanup(self.cleanup, a["id"])
+        e = self.enrol(a["id"], email)
+        result = self.run_next(a["id"], e["id"])
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "go")
+        self.assertEqual(result.json["enrolment"]["visited_node_ids"], ["wait"])
+        self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+        self.assertIn("loop detected", self.run_next(a["id"], e["id"]).text)
+
+    def test_date_wait_elapsed_after_entry_clears_visits(self):
+        email, _ = self.create_contact()
+        a = self.create_automation(nodes=[{"id": "wait", "type": "wait_duration", "label": "Date", "wait_until": (datetime.utcnow()+timedelta(hours=1)).isoformat()+"Z"}, {"id": "end", "type": "exit", "label": "End"}])
+        self.addCleanup(self.cleanup, a["id"])
+        e = self.enrol(a["id"], email)
+        state = self.run_next(a["id"], e["id"]).json["enrolment"]
+        state["wait"]["started_at"] = (datetime.utcnow()-timedelta(minutes=2)).isoformat()+"Z"
+        state["wake_at"] = (datetime.utcnow()-timedelta(minutes=1)).isoformat()+"Z"
+        state["wait"]["wait_until"] = state["wake_at"]
+        self.patch_enrolment_data(e["id"], state)
+        result = self.run_next(a["id"], e["id"])
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json["enrolment"]["visited_node_ids"], [])
+
+    def test_transition_budget_holds_before_action(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation()
+        self.addCleanup(self.cleanup, automation["id"])
+        enrolment = self.enrol(automation["id"], email)
+        self.db.execute("update automation_enrolments set data = data || %s where id = %s", {"transitions_without_wait": 1000}, enrolment["id"])
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("safety limit", result.text)
+        self.assertEqual(self.enrolment_data(enrolment["id"])["status"], "held")
+        self.assertEqual(self.step_runs(automation["id"], enrolment["id"]), [])
+
+    def test_skipping_a_loop_wait_does_not_reset_transition_budget(self):
+        email, _ = self.create_contact()
+        automation = self.create_automation(nodes=[
+            {"id": "wait", "type": "wait_duration", "label": "Wait", "duration": {"days": 0, "hours": 0, "minutes": 5}},
+            {"id": "go", "type": "go_to", "label": "Repeat", "target_node_id": "wait"},
+        ])
+        self.addCleanup(self.cleanup, automation["id"])
+        enrolment = self.enrol(automation["id"], email)
+        self.assertEqual(self.run_next(automation["id"], enrolment["id"]).status_code, 200)
+        self.db.execute("update automation_enrolments set data = data || %s where id = %s", {"transitions_without_wait": 999}, enrolment["id"])
+        skipped = self.run_next_skip_wait(automation["id"], enrolment["id"])
+        self.assertEqual(skipped.status_code, 200, skipped.text)
+        self.assertEqual(skipped.json["enrolment"]["transitions_without_wait"], 1000)
+        self.assertEqual(self.run_next(automation["id"], enrolment["id"]).status_code, 400)
+        state = self.enrolment_data(enrolment["id"])
+        self.assertEqual(state["status"], "held")
+        self.assertFalse(state.get("claim_token"))
 
     def test_go_to_target_missing_is_rejected_clearly(self):
         email, _ = self.create_contact()
@@ -6171,6 +6706,40 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(result["limit"], 100)
         self.assertEqual(dispatched[0]["limit"], 100)
 
+    def test_processing_budget_drains_backlog_without_executing_waits_early(self):
+        from unittest.mock import patch
+        a = self.create_wait_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        enrolments = [self.enrol(a["id"], self.create_contact()[0]) for _ in range(5)]
+        with patch.dict(os.environ, {"automation_processing_budget_seconds": "10"}):
+            result = self.process_enrolments_task(a["id"], 2)
+        self.assertEqual(result["processed"], 5)
+        self.assertEqual(result["waiting"], 5)
+        for e in enrolments:
+            state = self.enrolment_data(e["id"])
+            self.assertEqual(state["status"], "waiting")
+            self.assertEqual(state["current_node_id"], a["published"]["nodes"][0]["id"])
+
+    def test_processing_budget_deadline_stops_before_another_batch(self):
+        from unittest.mock import patch
+        a = self.create_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        for _ in range(3):
+            self.enrol(a["id"], self.create_contact()[0])
+        with patch.dict(os.environ, {"automation_processing_budget_seconds": "5"}), \
+                patch.object(automations.time, "monotonic", side_effect=[0, 6]):
+            result = self.process_enrolments_task(a["id"], 1)
+        self.assertEqual(result["processed"], 1)
+
+    def test_processing_budget_invalid_setting_keeps_single_batch(self):
+        from unittest.mock import patch
+        a = self.create_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        self.enrol(a["id"], self.create_contact()[0])
+        with patch.dict(os.environ, {"automation_processing_budget_seconds": "invalid"}):
+            result = self.process_enrolments_task(a["id"], 1)
+        self.assertEqual(result["processed"], 1)
+
     def test_scheduler_one_node_only_relies_on_processor_task(self):
         email, contact_id = self.create_contact()
         automation = self.create_automation(
@@ -6201,3 +6770,587 @@ class TestAutomationExecution(test_base.TestBase):
         self.assertEqual(data["current_node_id"], "node_add_tag_2")
 
         self.cleanup(automation["id"])
+
+    def test_duplicate_published_node_ids_hold_before_any_action_or_target_resolution(self):
+        from copy import deepcopy
+        from unittest.mock import patch
+
+        for action in ("add_tag", "send_email"):
+            for duplicate_location in ("current", "unreachable"):
+                with self.subTest(action=action, duplicate_location=duplicate_location):
+                    email, contact_id = self.create_contact()
+                    tag = "duplicate-guard-%s" % self.unique()
+                    automation = self.create_automation(tag=tag) if action == "add_tag" else self.create_send_email_automation()
+                    try:
+                        enrolment = self.enrol(automation["id"], email)
+                        published = deepcopy(automation["published"])
+                        original_node_id = published["nodes"][0]["id"]
+                        duplicate = deepcopy(published["nodes"][0 if duplicate_location == "current" else -1])
+                        duplicate["label"] = "private-duplicate-label"
+                        published["nodes"].append(duplicate)
+                        self.db.set_cid(self.user_cookie["cid"])
+                        self.db.automations.patch(automation["id"], {"published": published})
+                        with patch.object(automations.contacts, "add_tag") as add_tag, \
+                                patch.object(automations, "send_backend_mail") as send_mail, \
+                                patch.object(automations, "_node_by_id") as target_lookup:
+                            result = self.run_next(automation["id"], enrolment["id"])
+                            add_tag.assert_not_called()
+                            send_mail.assert_not_called()
+                            target_lookup.assert_not_called()
+                        self.assertEqual(result.status_code, 400, result.text)
+                        self.assertEqual(result.json["title"], "Duplicate automation node IDs")
+                        self.assertIn(duplicate["id"], result.json["description"])
+                        self.assertNotIn("private-duplicate-label", result.text)
+                        self.assertFalse(self.has_tag(contact_id, tag))
+                        state = self.enrolment_data(enrolment["id"])
+                        self.assertEqual(state["status"], "held")
+                        self.assertEqual(state["current_node_id"], original_node_id)
+                        self.assert_claim_cleared(state)
+                        self.assertFalse(state["last_error"]["retryable"])
+                        self.assertEqual(state["last_error"]["failure_class"], "configuration")
+                        self.assertEqual(state["last_error"]["title"], "Duplicate automation node IDs")
+                        self.assertNotIn("private-duplicate-label", str(state["last_error"]))
+                        self.assertIsNone(state.get("last_failed_step_run_id"))
+                        self.assertEqual(self.db.single(
+                            "select count(*) from automation_step_runs where cid = %s and enrolment_id = %s",
+                            self.user_cookie["cid"], enrolment["id"],
+                        ), 0)
+                        self.assertEqual(self.db.single(
+                            "select count(*) from alltags where cid = %s and tag = %s",
+                            self.user_cookie["cid"], tag,
+                        ), 0)
+                    finally:
+                        self.cleanup(automation["id"])
+
+
+    def publish_safety_call(self, db, automation_id, handler=None):
+        from types import SimpleNamespace
+        request = SimpleNamespace(context={
+            "db": db, "uid": self.user_cookie["uid"], "admin": False, "api": False,
+        })
+        (handler or automations.AutomationPublish()).on_post(request, SimpleNamespace(), automation_id)
+        return request.context["result"]
+
+    def publish_safety_db(self):
+        from api.shared.db import DB
+        db = DB()
+        db.set_cid(self.user_cookie["cid"])
+        original_single = db.single
+        def observed_single(sql, *args, **kwargs):
+            if sql.startswith("select id from automations") and "for update" in sql:
+                # The connection pool's protocol PID is not PostgreSQL's PID.
+                # Capture the real server PID inside the worker transaction.
+                db.publish_safety_pid = original_single("select pg_backend_pid()")
+                db.execute("set local statement_timeout = '8s'")
+            return original_single(sql, *args, **kwargs)
+        db.single = observed_single
+        self.addCleanup(db.close)
+        return db
+
+    def assert_publish_worker_waiting(self, observer, worker):
+        import time
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            server_pid = worker.__dict__.get("publish_safety_pid")
+            if server_pid and observer.single("select pg_backend_pid() = any(pg_blocking_pids(%s))", server_pid):
+                return
+            time.sleep(0.01)
+        self.fail("Independent connection did not block on the automation row lock")
+
+    def test_publish_safety_occupied_deletion_is_atomic_across_states(self):
+        states = ("ready", "waiting", "held", "paused_ready", "paused_waiting", "running", "unknown")
+        for status in states:
+            with self.subTest(status=status):
+                email, _ = self.create_contact()
+                a = self.create_automation()
+                self.addCleanup(self.cleanup, a["id"])
+                e = self.enrol(a["id"], email)
+                self.patch_enrolment_data(e["id"], {"status": status, "retry_count": 2})
+                path = "/api/automations/" + a["id"]
+                self.user_patch(path, json={"draft": {"nodes": a["published"]["nodes"][1:]}})
+                before = self.user_get(path)
+                enrolment_before = self.enrolment_data(e["id"])
+                result = self.simulate_post(path + "/publish", headers=self.headers())
+                self.assertEqual(result.status_code, 409, result.text)
+                self.assertIn("execution" if status == "running" else "node_add_tag_1", result.text)
+                self.assertNotIn(email, result.text)
+                self.assertEqual(self.user_get(path), before)
+                self.assertEqual(self.enrolment_data(e["id"]), enrolment_before)
+
+    def test_publish_safety_unoccupied_and_terminal_nodes_can_be_removed(self):
+        for status in (None,) + automations.TERMINAL_ENROLMENT_STATUSES:
+            with self.subTest(status=status):
+                a = self.create_automation()
+                self.addCleanup(self.cleanup, a["id"])
+                if status:
+                    email, _ = self.create_contact()
+                    e = self.enrol(a["id"], email)
+                    self.patch_enrolment_data(e["id"], {"status": status})
+                    before = self.enrolment_data(e["id"])
+                path = "/api/automations/" + a["id"]
+                self.user_patch(path, json={"draft": {"nodes": a["published"]["nodes"][1:]}})
+                self.assertEqual(self.user_post(path + "/publish")["published_revision"], 2)
+                if status:
+                    self.assertEqual(self.enrolment_data(e["id"]), before)
+
+    def test_publish_safety_paused_publish_preserves_wait_and_resume(self):
+        a = self.create_automation(nodes=self.wait_nodes())
+        self.addCleanup(self.cleanup, a["id"])
+        email, _ = self.create_contact()
+        e = self.enrol(a["id"], email)
+        self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+        path = "/api/automations/" + a["id"]
+        self.user_post(path + "/pause")
+        before = self.enrolment_data(e["id"])
+        self.assertEqual(before["status"], "paused_waiting")
+        self.assertEqual(self.user_post(path + "/publish")["status"], "paused")
+        self.assertEqual(self.enrolment_data(e["id"]), before)
+        email2, _ = self.create_contact()
+        held = self.enrol(a["id"], email2)
+        self.assertEqual(held["status"], "held")
+        self.user_post(path + "/resume")
+        after = self.enrolment_data(e["id"])
+        self.assertEqual(after["status"], "waiting")
+        self.assertEqual(after["wait"]["last_remaining_seconds"], before["wait"]["remaining_seconds"])
+        self.assertEqual(self.enrolment_data(held["id"])["status"], "ready")
+
+    def test_publish_safety_wait_type_and_duration_compatibility(self):
+        from copy import deepcopy
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                a = self.create_automation(nodes=self.wait_nodes())
+                self.addCleanup(self.cleanup, a["id"])
+                email, _ = self.create_contact()
+                e = self.enrol(a["id"], email)
+                self.run_next(a["id"], e["id"])
+                path = "/api/automations/" + a["id"]
+                if paused:
+                    self.user_post(path + "/pause")
+                nodes = deepcopy(a["published"]["nodes"])
+                before = self.enrolment_data(e["id"])
+                nodes[0] = {"id": nodes[0]["id"], "type": "exit", "label": "Exit"}
+                self.user_patch(path, json={"draft": {"nodes": nodes}})
+                automation_before = self.user_get(path)
+                result = self.simulate_post(path + "/publish", headers=self.headers())
+                self.assertEqual(result.status_code, 409, result.text)
+                self.assertIn("remain Wait steps", result.text)
+                self.assertEqual(self.user_get(path), automation_before)
+                self.assertEqual(self.enrolment_data(e["id"]), before)
+                nodes = deepcopy(a["published"]["nodes"])
+                nodes[0]["duration"] = {"days": 3, "hours": 0, "minutes": 0}
+                self.user_patch(path, json={"draft": {"nodes": nodes}})
+                self.user_post(path + "/publish")
+                self.assertEqual(self.enrolment_data(e["id"]), before)
+
+    def test_publish_safety_old_action_blocks_publish_until_finished(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from unittest.mock import patch
+        a = self.create_automation(tag="publish-safety-action")
+        self.addCleanup(self.cleanup, a["id"])
+        email, _ = self.create_contact()
+        e = self.enrol(a["id"], email)
+        path = "/api/automations/" + a["id"]
+        self.user_patch(path, json={"draft": {"nodes": a["published"]["nodes"][1:]}})
+        worker = self.publish_safety_db()
+        entered, release = Event(), Event()
+        original = automations.contacts.add_tag
+        def blocked_action(*args, **kwargs):
+            self.assertFalse(worker.conn.autocommit, "The tag batch owns a short transaction, separate from the released claim lock")
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("Test did not release action")
+            return original(*args, **kwargs)
+        with patch.object(automations.contacts, "add_tag", side_effect=blocked_action), ThreadPoolExecutor(1) as pool:
+            future = pool.submit(automations._run_next_automation_enrolment, worker, self.user_cookie["cid"], a["id"], e["id"])
+            try:
+                self.assertTrue(entered.wait(4))
+                before = self.user_get(path)
+                claimed = self.enrolment_data(e["id"])
+                response = self.simulate_post(path + "/publish", headers=self.headers())
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(self.user_get(path), before)
+                self.assertEqual(self.enrolment_data(e["id"]), claimed)
+            finally:
+                release.set()
+            future.result(timeout=5)
+        self.assertEqual(self.enrolment_data(e["id"])["current_node_id"], "node_exit_1")
+        self.assertEqual(self.user_post(path + "/publish")["published_revision"], 2)
+
+    def test_publish_safety_executor_waits_for_publish_and_reads_new_snapshot(self):
+        from concurrent.futures import ThreadPoolExecutor
+        a = self.create_automation(tag="old-publish-tag")
+        self.addCleanup(self.cleanup, a["id"])
+        email, contact_id = self.create_contact()
+        e = self.enrol(a["id"], email)
+        worker = self.publish_safety_db()
+        publisher = self.publish_safety_db()
+        stale = worker.automations.get(a["id"])
+        with ThreadPoolExecutor(1) as pool:
+            with automations._locked_automation(publisher, self.user_cookie["cid"], a["id"]):
+                future = pool.submit(automations._run_next_automation_enrolment, worker, self.user_cookie["cid"], a["id"], e["id"])
+                self.assert_publish_worker_waiting(publisher, worker)
+                node = dict(stale["published"]["nodes"][0], draft_tag="new-publish-tag")
+                publisher.automations.patch(a["id"], {"draft": {"nodes": [node]}})
+                self.publish_safety_call(publisher, a["id"])
+            result = future.result(timeout=5)
+        self.assertTrue(self.has_tag(contact_id, "new-publish-tag"))
+        self.assertFalse(self.has_tag(contact_id, "old-publish-tag"))
+        self.assertEqual(result["step_run"]["published_revision"], 2)
+        self.assertEqual(self.enrolment_data(e["id"])["status"], "completed")
+
+    def test_publish_safety_concurrent_enrolment_uses_new_first_node(self):
+        from concurrent.futures import ThreadPoolExecutor
+        for reentry in (False, True):
+            with self.subTest(reentry=reentry):
+                a = self.create_automation(reentry="multiple" if reentry else "once")
+                self.addCleanup(self.cleanup, a["id"])
+                email, contact_id = self.create_contact()
+                if reentry:
+                    e = self.enrol(a["id"], email)
+                    self.patch_enrolment_data(e["id"], {"status": "completed"})
+                worker, publisher = self.publish_safety_db(), self.publish_safety_db()
+                stale = worker.automations.get(a["id"])
+                with ThreadPoolExecutor(1) as pool:
+                    with automations._locked_automation(publisher, self.user_cookie["cid"], a["id"]):
+                        future = pool.submit(automations._create_enrolment_for_contact, worker, self.user_cookie["cid"], a["id"], stale, contact_id, email, "manual")
+                        self.assert_publish_worker_waiting(publisher, worker)
+                        publisher.automations.patch(a["id"], {"draft": {"nodes": a["published"]["nodes"][1:]}})
+                        self.publish_safety_call(publisher, a["id"])
+                    outcome = future.result(timeout=5)
+                state = self.enrolment_data(outcome["enrolment_id"])
+                self.assertEqual(state["current_node_id"], "node_exit_1")
+                self.assertEqual(state["published_revision"], 2)
+
+    def test_publish_safety_publish_waits_for_new_enrolment(self):
+        from concurrent.futures import ThreadPoolExecutor
+        a = self.create_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        email, contact_id = self.create_contact()
+        creator, publisher = self.publish_safety_db(), self.publish_safety_db()
+        self.user_patch("/api/automations/" + a["id"], json={"draft": {"nodes": a["published"]["nodes"][1:]}})
+        with ThreadPoolExecutor(1) as pool:
+            with automations._locked_automation(creator, self.user_cookie["cid"], a["id"]):
+                outcome = automations._create_enrolment_for_contact(creator, self.user_cookie["cid"], a["id"], a, contact_id, email, "manual")
+                future = pool.submit(self.publish_safety_call, publisher, a["id"])
+                self.assert_publish_worker_waiting(creator, publisher)
+            with self.assertRaises(falcon.HTTPConflict):
+                future.result(timeout=5)
+        self.assertEqual(self.enrolment_data(outcome["enrolment_id"])["current_node_id"], "node_add_tag_1")
+        self.assertEqual(publisher.automations.get(a["id"])["published_revision"], 1)
+
+    def test_publish_safety_serializes_publishers_and_resume(self):
+        from concurrent.futures import ThreadPoolExecutor
+        for handler in (automations.AutomationPublish, automations.AutomationResume):
+            with self.subTest(handler=handler.__name__):
+                a = self.create_automation()
+                self.addCleanup(self.cleanup, a["id"])
+                email, _ = self.create_contact()
+                e = self.enrol(a["id"], email)
+                self.user_post("/api/automations/" + a["id"] + "/pause")
+                publisher, worker = self.publish_safety_db(), self.publish_safety_db()
+                with ThreadPoolExecutor(1) as pool:
+                    with automations._locked_automation(publisher, self.user_cookie["cid"], a["id"]):
+                        future = pool.submit(self.publish_safety_call, worker, a["id"], handler())
+                        self.assert_publish_worker_waiting(publisher, worker)
+                        self.assertEqual(self.publish_safety_call(publisher, a["id"])["status"], "paused")
+                    result = future.result(timeout=5)
+                if handler is automations.AutomationPublish:
+                    self.assertEqual(result["published_revision"], 3)
+                    self.assertEqual(result["status"], "paused")
+                else:
+                    self.assertEqual(result["published_revision"], 2)
+                    self.assertEqual(result["status"], "published")
+                    self.assertEqual(self.enrolment_data(e["id"])["status"], "ready")
+
+    def test_publish_safety_stale_claim_requires_explicit_recovery(self):
+        a = self.create_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        email, _ = self.create_contact()
+        e = self.enrol(a["id"], email)
+        self.patch_enrolment_data(e["id"], {
+            "status": "running", "running_status": "ready", "claim_token": "stale-publish-claim",
+            "claimed_at": (datetime.utcnow() - timedelta(hours=2)).isoformat() + "Z",
+        })
+        path = "/api/automations/" + a["id"]
+        before = self.enrolment_data(e["id"])
+        response = self.simulate_post(path + "/publish", headers=self.headers())
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("recovery", response.text)
+        self.assertEqual(self.enrolment_data(e["id"]), before)
+        from concurrent.futures import ThreadPoolExecutor
+        self.db.set_cid(self.user_cookie["cid"])
+        recovery = self.publish_safety_db()
+        # Recovery already locks the joined automation/enrolment rows with
+        # SKIP LOCKED; it must not clear claims across a publication boundary.
+        with ThreadPoolExecutor(1) as pool:
+            with automations._locked_automation(self.db, self.user_cookie["cid"], a["id"]):
+                future = pool.submit(
+                    automations.recover_stale_automation_enrolment_claims,
+                    recovery, self.user_cookie["cid"], dry_run=False, automation_id=a["id"],
+                )
+                self.assertEqual(future.result(timeout=5)["changed_count"], 0)
+        self.assertEqual(self.enrolment_data(e["id"]), before)
+        result = automations.recover_stale_automation_enrolment_claims(
+            self.db, self.user_cookie["cid"], dry_run=False, automation_id=a["id"],
+        )
+        self.assertEqual(result["changed_count"], 1)
+        self.assertEqual(self.user_post(path + "/publish")["published_revision"], 2)
+
+    def test_publish_safety_audit_failure_rolls_back_snapshot(self):
+        from unittest.mock import patch
+        a = self.create_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        path = "/api/automations/" + a["id"]
+        before = self.user_get(path)
+        db = self.publish_safety_db()
+        with patch.object(automations, "user_log", side_effect=RuntimeError("audit unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.publish_safety_call(db, a["id"])
+        self.assertEqual(self.user_get(path), before)
+
+    def test_negative_conditions_plural_none_match_and_group_modes(self):
+        email, contact_id = self.create_contact()
+        member_list = self.contact_list_ids(contact_id)[0]
+        other = self.create_empty_list()["id"]
+        automation = self.create_compound_condition_automation(items=[
+            {"type": "missing_tag", "tags": ["blocked", "inactive"]},
+            {"type": "not_in_list", "list_ids": [other]},
+        ])
+        self.addCleanup(self.cleanup, automation["id"])
+        enrolment = self.enrol(automation["id"], email)
+        cid = self.user_cookie["cid"]
+        def evaluate(items, mode="all"):
+            return automations._evaluate_automation_condition_group(
+                self.db, cid, automation["id"], enrolment["id"], contact_id,
+                {"mode": mode, "items": items})["result"]
+        for ids, expected in [([other], True), ([other, member_list], False), ([member_list, other], False)]:
+            self.assertEqual(evaluate([{"type": "not_in_list", "list_ids": ids}]), expected)
+        self.add_existing_tag(contact_id, "blocked")
+        for tags, expected in [(["inactive"], True), (["inactive", "blocked"], False), (["blocked", "inactive"], False)]:
+            self.assertEqual(evaluate([{"type": "missing_tag", "tags": tags}]), expected)
+        items = [{"type": "missing_tag", "tags": ["blocked"]}, {"type": "not_in_list", "list_ids": [other]}]
+        self.assertFalse(evaluate(items, "all"))
+        self.assertTrue(evaluate(items, "any"))
+        # The persisted executable condition uses the same semantics and advances once.
+        result = self.run_next(automation["id"], enrolment["id"])
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.json["step_run"]["result"])
+        self.assertEqual(result.json["enrolment"]["current_node_id"], "node_exit_1")
+
+    def test_negative_conditions_email_scope_and_matching(self):
+        email, contact_id = self.create_contact()
+        a = self.create_compound_condition_automation(reentry="multiple")
+        self.addCleanup(self.cleanup, a["id"])
+        owned = self.user_post("/api/automations/%s/emails" % a["id"], json={
+            "name": "Negative engagement test", "subject": "No delivery", "rawText": "<p>Test</p>"})
+        cid = self.user_cookie["cid"]
+        for kind, event_type in [("not_opened_email", "open"), ("not_clicked_email", "click")]:
+            for match in (["any"] if event_type == "open" else ["any", "url", "url_exact", "url_prefix"]):
+                with self.subTest(kind=kind, match=match):
+                    item = {"type": kind, "automation_email_id": owned["id"]}
+                    if event_type == "click":
+                        item.update(click_match=match, link_url="https://example.com/Offer")
+                    nodes = a["draft"]["nodes"]
+                    nodes[0]["condition"]["items"] = [item]
+                    self.user_patch("/api/automations/" + a["id"], json=self.workflow(nodes=nodes, reentry="multiple"))
+                    result = self.simulate_post("/api/automations/%s/publish" % a["id"], headers=self.headers())
+                    self.assertEqual(result.status_code, 200)
+                    deletion = self.simulate_delete("/api/automations/%s/emails/%s" % (a["id"], owned["id"]), headers=self.headers())
+                    self.assertEqual(deletion.status_code, 400)
+                    e = self.enrol(a["id"], email)
+                    def evaluate():
+                        return automations._evaluate_automation_condition_item(
+                            self.db, cid, a["id"], e["id"], contact_id, item, 0)["result"]
+                    self.assertTrue(evaluate())  # No send/event yet: no implicit wait.
+                    data = {"link_url": "HTTPS://EXAMPLE.COM/Offer", "test_id": self.test_id}
+                    for override in [{"event_enrolment_id": "previous-enrolment"},
+                                     {"event_automation_email_id": "another-email"},
+                                     {"event_contact_id": contact_id + 1000000},
+                                     {"event_cid": "another-account"}]:
+                        self.insert_open_event(a["id"], e["id"], contact_id, email, owned["id"],
+                                               event_type=event_type, event_data=data, **override)
+                        self.assertTrue(evaluate())
+                    if event_type == "click" and match != "any":
+                        self.insert_open_event(a["id"], e["id"], contact_id, email, owned["id"],
+                            event_type="click", event_data={"link_url": "https://example.com/Other"})
+                        self.assertTrue(evaluate())
+                    if match == "url_prefix":
+                        data["link_url"] += "?utm=one"
+                    self.insert_open_event(a["id"], e["id"], contact_id, email, owned["id"], event_type=event_type, event_data=data)
+                    self.assertFalse(evaluate())
+                    outcome = self.run_next(a["id"], e["id"])
+                    self.assertEqual(outcome.status_code, 200)
+                    self.assertFalse(outcome.json["step_run"]["result"])
+                    self.assertEqual(outcome.json["enrolment"]["current_node_id"], "node_exit_1")
+                    self.assertEqual(self.run_next(a["id"], e["id"]).status_code, 200)
+        # A fresh enrolment must not inherit engagement from any previous run.
+        e = self.enrol(a["id"], email)
+        outcome = self.run_next(a["id"], e["id"])
+        self.assertTrue(outcome.json["step_run"]["result"])
+        self.assertEqual(outcome.json["enrolment"]["current_node_id"], "node_add_tag_1")
+
+    def test_negative_conditions_draft_publish_validation(self):
+        a = self.create_compound_condition_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        nodes = a["draft"]["nodes"]
+        def save(item):
+            nodes[0]["condition"]["items"] = [item]
+            return self.simulate_patch("/api/automations/" + a["id"], headers=self.headers(), json=self.workflow(nodes=nodes))
+        for item in [
+            {"type": "missing_tag", "tag": "one", "tags": ["two"]},
+            {"type": "missing_tag", "tags": ["one", "one"]},
+            {"type": "missing_tag", "tags": [1]},
+            {"type": "not_in_list", "list_ids": [1]},
+            {"type": "not_in_list", "list_ids": ["one", "one"]},
+            {"type": "not_in_list", "list_id": "one", "list_ids": ["two"]},
+            {"type": "not_opened_email", "automation_email_id": "one", "link_url": "unexpected"},
+        ]:
+            with self.subTest(item=item): self.assertEqual(save(item).status_code, 400)
+        # Incomplete drafts are editable, but never executable.
+        for item in [
+            {"type": "missing_tag", "tags": []}, {"type": "missing_tag", "tags": [" "]},
+            {"type": "not_in_list", "list_ids": []}, {"type": "not_in_list", "list_ids": ["missing-list"]},
+            {"type": "not_opened_email", "automation_email_id": ""},
+            {"type": "not_clicked_email", "automation_email_id": "missing-email"},
+        ]:
+            with self.subTest(item=item):
+                self.assertEqual(save(item).status_code, 200)
+                result = self.simulate_post("/api/automations/%s/publish" % a["id"], headers=self.headers())
+                self.assertEqual(result.status_code, 400)
+        foreign = self.create_compound_condition_automation()
+        self.addCleanup(self.cleanup, foreign["id"])
+        foreign_email = self.user_post("/api/automations/%s/emails" % foreign["id"], json={
+            "name": "Other owned email", "subject": "No delivery", "rawText": "<p>Test</p>"})
+        for kind in ["not_opened_email", "not_clicked_email"]:
+            self.assertEqual(save({"type": kind, "automation_email_id": foreign_email["id"]}).status_code, 200)
+            result = self.simulate_post("/api/automations/%s/publish" % a["id"], headers=self.headers())
+            self.assertEqual(result.status_code, 400)
+            self.assertIn("email from this automation", result.text)
+        owned = self.user_post("/api/automations/%s/emails" % a["id"], json={
+            "name": "URL validation email", "subject": "No delivery", "rawText": "<p>Test</p>"})
+        self.assertEqual(save({"type": "not_clicked_email", "automation_email_id": owned["id"],
+                               "click_match": "url_exact", "link_url": ""}).status_code, 200)
+        result = self.simulate_post("/api/automations/%s/publish" % a["id"], headers=self.headers())
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("link URL", result.text)
+        foreign_list = self.create_empty_list()["id"]
+        try:
+            self.db.execute("update lists set cid = 'other-account' where id = %s", foreign_list)
+            self.assertEqual(save({"type": "not_in_list", "list_ids": [foreign_list]}).status_code, 200)
+            result = self.simulate_post("/api/automations/%s/publish" % a["id"], headers=self.headers())
+            self.assertEqual(result.status_code, 400)
+            self.assertIn("list from this account", result.text)
+        finally:
+            self.db.execute("update lists set cid = %s where id = %s", self.user_cookie["cid"], foreign_list)
+
+    def test_positive_plural_conditions_save_publish_and_match_any_selection(self):
+        email, contact_id = self.create_contact()
+        member_list = self.contact_list_ids(contact_id)[0]
+        other_list = self.create_empty_list()["id"]
+        self.add_existing_tag(contact_id, "customer")
+        cases = [
+            ({"type": "has_tag", "tags": ["absent", "customer"]}, True),
+            ({"type": "has_tag", "tags": ["customer", "absent"]}, True),
+            ({"type": "has_tag", "tags": ["absent", "another"]}, False),
+            ({"type": "in_list", "list_ids": [other_list, member_list]}, True),
+            ({"type": "in_list", "list_ids": [member_list, other_list]}, True),
+            ({"type": "in_list", "list_ids": [other_list]}, False),
+            ({"type": "has_tag", "tag": "customer"}, True),
+            ({"type": "in_list", "list_id": member_list}, True),
+        ]
+        for item, expected in cases:
+            with self.subTest(item=item):
+                a = self.create_compound_condition_automation(items=[item])
+                self.addCleanup(self.cleanup, a["id"])
+                reloaded = self.user_get("/api/automations/" + a["id"])
+                self.assertEqual(reloaded["draft"]["nodes"][0]["condition"]["items"], [item])
+                self.assertEqual(reloaded["published"]["nodes"][0]["condition"]["items"], [item])
+                e = self.enrol(a["id"], email)
+                result = self.run_next(a["id"], e["id"])
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json["step_run"]["result"], expected)
+                self.assertEqual(result.json["enrolment"]["current_node_id"],
+                                 "node_add_tag_1" if expected else "node_exit_1")
+
+    def test_positive_plural_conditions_validate_like_negative_selections(self):
+        a = self.create_compound_condition_automation()
+        self.addCleanup(self.cleanup, a["id"])
+        nodes = a["draft"]["nodes"]
+        for kind, field, singular in [("has_tag", "tags", "tag"), ("in_list", "list_ids", "list_id")]:
+            for values, draft_status in [([], 200), ([""], 200), ([1], 400), (["x", "x"], 400),
+                                         ([str(i) for i in range(101)], 400)]:
+                with self.subTest(kind=kind, values=values):
+                    nodes[0]["condition"]["items"] = [{"type": kind, field: values}]
+                    result = self.simulate_patch("/api/automations/" + a["id"], headers=self.headers(), json=self.workflow(nodes=nodes))
+                    self.assertEqual(result.status_code, draft_status)
+                    if draft_status == 200:
+                        published = self.simulate_post("/api/automations/%s/publish" % a["id"], headers=self.headers())
+                        self.assertEqual(published.status_code, 400)
+            nodes[0]["condition"]["items"] = [{"type": kind, field: ["x"], singular: "x"}]
+            result = self.simulate_patch("/api/automations/" + a["id"], headers=self.headers(), json=self.workflow(nodes=nodes))
+            self.assertEqual(result.status_code, 400)
+
+    def test_concurrent_plural_list_actions_do_not_duplicate_change_events(self):
+        self.assert_concurrent_list_batch("add_to_list")
+
+    def test_concurrent_plural_list_removals_do_not_duplicate_change_events(self):
+        self.assert_concurrent_list_batch("remove_from_list")
+
+    def assert_concurrent_list_batch(self, action):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from unittest.mock import patch
+        email, contact_id = self.create_contact()
+        ids = [self.create_empty_list()["id"], self.create_empty_list()["id"]]
+        if action == "remove_from_list":
+            for value in ids:
+                automations._add_contact_to_list(self.db, self.user_cookie["cid"], contact_id, email, value)
+        nodes = [{"id":"lists", "type":action, "label":"Lists", "list_ids": ids}]
+        first = self.create_automation(nodes=nodes)
+        second = self.create_automation(nodes=nodes)
+        self.addCleanup(self.cleanup, first["id"], second["id"])
+        one, two = self.enrol(first["id"], email), self.enrol(second["id"], email)
+        db1, db2 = self.publish_safety_db(), self.publish_safety_db()
+        entered, release, second_started = Event(), Event(), Event()
+        helper_name = "_add_contact_to_list" if action == "add_to_list" else "_remove_contact_from_list"
+        original = getattr(automations, helper_name)
+        original_execute = db2.execute
+        def observed_execute(sql, *args, **kwargs):
+            if sql.startswith('select contact_id from contacts.') and 'for update' in sql:
+                db2.list_batch_pid = db2.single("select pg_backend_pid()")
+                second_started.set()
+            return original_execute(sql, *args, **kwargs)
+        db2.execute = observed_execute
+        def blocked(db, *args, **kwargs):
+            if db is db1:
+                db1.list_batch_pid = db.single("select pg_backend_pid()")
+                entered.set()
+                if not release.wait(5): raise AssertionError("List batch was not released")
+            return original(db, *args, **kwargs)
+        def run_second():
+            return automations._run_next_automation_enrolment(db2, self.user_cookie["cid"], second["id"], two["id"])
+        with patch.dict(os.environ, {"automation_trigger_emission_enabled":"true"}), patch.object(automations.contacts, "matching_list_trigger_automation_exists", return_value=True), patch.object(automations, helper_name, side_effect=blocked), ThreadPoolExecutor(2) as pool:
+            f1 = pool.submit(automations._run_next_automation_enrolment, db1, self.user_cookie["cid"], first["id"], one["id"])
+            try:
+                self.assertTrue(entered.wait(4))
+                f2 = pool.submit(run_second)
+                self.assertTrue(second_started.wait(4))
+                import time
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    blockers = self.db.single("select pg_blocking_pids(%s)", db2.list_batch_pid)
+                    if db1.list_batch_pid in blockers: break
+                    time.sleep(0.01)
+                self.assertIn(db1.list_batch_pid, blockers, "The second batch must wait for the first contact lock")
+            finally:
+                release.set()
+            f1.result(timeout=5)
+            f2.result(timeout=5)
+        rows = self.db.execute("select data from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id).fetchall()
+        self.addCleanup(self.db.execute, "delete from automation_trigger_events where cid = %s and contact_id = %s", self.user_cookie["cid"], contact_id)
+        self.assertEqual(sorted(row[0]["list_id"] for row in rows), sorted(ids))
+        for value in ids:
+            self.assertEqual(self.list_count(value), 1 if action == "add_to_list" else 0)
+        self.assert_claim_cleared(self.enrolment_data(one["id"]))
+        self.assert_claim_cleared(self.enrolment_data(two["id"]))

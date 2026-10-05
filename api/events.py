@@ -1,3 +1,4 @@
+from . import automation_subject_tests as subject_tests
 import os
 import json
 import requests
@@ -773,6 +774,7 @@ def write_automation_engagement_event(
         )
         return True
 
+    subject_tests.record_event(db, cid, campid, email, t)
     if not ts:
         event_ts = datetime.utcnow()
     elif not isinstance(ts, datetime):
@@ -925,6 +927,8 @@ class Events(object):
                     clientip = ev.get("p", "")
                     useragent = ev.get("a", "")
 
+                    if t == "send" and c and email:
+                        subject_tests.delivery(db, c, email, sendingsink["cid"], allow_parent=True)
                     if not c:
                         log.info("event error: %s (no campaign id)", ev)
                         continue
@@ -2050,6 +2054,8 @@ def process_ses_webhook(db: DB, jsonobj: JsonObj) -> None:
         return
 
     settingsid, usercid, campid, is_camp, trackingid, msgts = row
+    if eventtype == "Delivery":
+        subject_tests.delivery(db, campid, email, usercid)
 
     co = db.companies.get(usercid)
     if co is None:
@@ -2246,6 +2252,8 @@ def process_sp_webhook(db: DB, rdb: redis.StrictRedis, jsonobj: JsonObj) -> None
     campid = jsonobj["campid"]
     is_camp = jsonobj["is_camp"]
     trackingid = jsonobj["trackingid"]
+    if eventtype == "delivery":
+        subject_tests.delivery(db, campid, email, usercid)
 
     is_new = db.single(
         "insert into sparkpost_events (id) values (%s) on conflict (id) do nothing returning id",
@@ -2503,6 +2511,8 @@ def process_mg_webhook(db: DB, rdb: redis.StrictRedis, jsonobj: JsonObj) -> None
     campid = jsonobj["campid"]
     is_camp = jsonobj["is_camp"]
     trackingid = jsonobj["trackingid"]
+    if eventtype == "delivered":
+        subject_tests.delivery(db, campid, email, usercid)
 
     ts = datetime.utcfromtimestamp(ts)
 
@@ -2738,39 +2748,32 @@ def process_mg_webhook(db: DB, rdb: redis.StrictRedis, jsonobj: JsonObj) -> None
 
 
 def process_webhooks(checkcancel: Callable[[], bool]) -> None:
+    from .shared import webhook_inbox
+
     try:
         with open_db() as db:
-            rdb = redis_connect()
+            # Session lock survives handler transaction boundaries and releases on
+            # connection loss. Other consumers do not steal live processing work.
+            if not db.single("select pg_try_advisory_lock(%s, %s)", *webhook_inbox.LOCK):
+                return
+            try:
+                rdb = redis_connect()
 
-            lname = "webhooks-pending"
+                def dispatch(obj):
+                    db.set_cid(None)
+                    if obj["type"] == "mg":
+                        process_mg_webhook(db, rdb, obj)
+                    elif obj["type"] == "sp":
+                        process_sp_webhook(db, rdb, obj)
+                    else:
+                        process_ses_webhook(db, obj)
 
-            cnt = 0
-
-            while True:
-                jsondata = rdb.rpop(lname)
-                if jsondata is None:
-                    break
-
-                log.info("Got: %s", jsondata)
-                obj = json.loads(jsondata)
-
-                if obj["type"] == "mg":
-                    process_mg_webhook(db, rdb, obj)
-                elif obj["type"] == "sp":
-                    process_sp_webhook(db, rdb, obj)
-                else:
-                    process_ses_webhook(db, obj)
-
-                cnt += 1
-
-                if checkcancel():
-                    log.info("Process terminated")
-                    return
-
-            if cnt > 0:
-                log.info("Processed %s webhooks", cnt)
-    except:
-        log.exception("error")
+                webhook_inbox.consume(rdb, dispatch, checkcancel, log)
+            finally:
+                db.single("select pg_advisory_unlock(%s, %s)", *webhook_inbox.LOCK)
+    except Exception:
+        # Processing copies remain recoverable if the broker/database fails.
+        log.exception("Incoming event processor unavailable; retained work requires recovery")
 
 
 class SPWebHook(object):
